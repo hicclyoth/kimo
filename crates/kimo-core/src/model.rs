@@ -148,7 +148,15 @@ pub struct Audio {
     /// variance already lived inside each clip exactly as it was). 0 = off (default); else the expansion/compression factor passed
     /// straight to `speechnorm` (e=c=this value), so ~1.5-2 is gentle and higher is stronger. Default-serialized away so every
     /// existing project/golden byte stays identical until something actually turns this on.
-    #[serde(default, skip_serializing_if = "is_zero_f64")] pub speech_level: f64 }
+    #[serde(default, skip_serializing_if = "is_zero_f64")] pub speech_level: f64,
+    /// V7.9Q: scales the `compress` acompressor's ratio: ratio = 1.0 + 2.0*this (clamped 0..1), so 0.0 is no
+    /// compression at all (filter skipped) and 1.0 reproduces the exact old fixed ratio=3 threshold=-18dB.
+    /// Default (and what every pre-7.9 saved project loads as, via `one_f64` -- no "compress_amount" key in old
+    /// JSON) is 1.0, so nothing changes until a caller asks for less: measured on real rough-cut interview
+    /// footage, that fixed ratio=3 compressor -- not the per-clip average-matching loop -- was the dominant force
+    /// holding a finished mix's loudness_range near 1.2-1.4 LU regardless of level_dynamics/speech_level. Set by
+    /// finish_audio's compress_strength arg; never by hand-authored projects.
+    #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")] pub compress_amount: f64 }
 fn unity_prop() -> Prop { Prop::new(1.0) }
 fn zero_prop() -> Prop { Prop::new(0.0) }
 /// Accepts either the legacy bare-number `pan` (pre-v7 project format) or a full `Prop` object.
@@ -164,7 +172,9 @@ fn ser_pan<S: serde::Serializer>(p: &Prop, s: S) -> Result<S::Ok, S::Error> {
     if p.keys.is_empty() && p.expr.is_empty() { s.serialize_f64(p.base) } else { p.serialize(s) }
 }
 fn is_zero_f64(v: &f64) -> bool { *v == 0.0 }
-impl Default for Audio { fn default() -> Self { Audio { lead: 0.0, tail: 0.0, effects: vec![], pan: Prop::new(0.0), duck_gain: Prop::new(1.0), mute: false, volume: Prop::new(1.0), fade_in: 0.0, fade_out: 0.0, pitch: 0.0, highpass: 0.0, lowpass: 0.0, denoise: 0.0, compress: false, echo: 0.0, reverse: false, speech_level: 0.0 } } }
+fn one_f64() -> f64 { 1.0 }
+fn is_one_f64(v: &f64) -> bool { *v == 1.0 }
+impl Default for Audio { fn default() -> Self { Audio { lead: 0.0, tail: 0.0, effects: vec![], pan: Prop::new(0.0), duck_gain: Prop::new(1.0), mute: false, volume: Prop::new(1.0), fade_in: 0.0, fade_out: 0.0, pitch: 0.0, highpass: 0.0, lowpass: 0.0, denoise: 0.0, compress: false, echo: 0.0, reverse: false, speech_level: 0.0, compress_amount: 1.0 } } }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transition { pub kind: String, pub duration: f64,

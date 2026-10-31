@@ -75,7 +75,7 @@ auto_captions eb2ea2f83777efbd
 auto_chapters fff8eaf584738d1c
 auto_color 86d35765cf0dcf74
 auto_duck 782881168d8430d5
-auto_edit dad5f13a0091d79e
+auto_edit aa8085bfee10d8dc
 auto_grade 64db55ba3dd926ff
 auto_reframe 62c25d0e6fc84dd1
 auto_rough_cut 0dc325c5f230d88f
@@ -179,7 +179,7 @@ ext_list 83a5db4765dba269
 find b315b9c2a9e7af33
 find_assets d031054230ef3853
 find_by_loudness 8d53a4d617dbd31f
-finish_audio 4d06446706ce7a51
+finish_audio 9c00a6d0e8e6b8a9
 fit_clip_duration 018a469206f430eb
 fit_info adda72ad5a63e40e
 fit_track_homography c5762f693abc9959
@@ -292,7 +292,7 @@ pick_thumbnail a48ee1f3ca782e9e
 pick_white_balance 4e36686f25fac6d1
 pin_layer 141a292e07c94a12
 place_at_track e69bc7f50736dc25
-place_broll a864d0e0263a3d39
+place_broll 5db2fcc545901e17
 preview_material f0654be5429689e8
 preview_range 27365e61d374a963
 preview_subject_match 8fbee66dc3095cb4
@@ -393,7 +393,7 @@ session_stats 08b78ec5daffb184
 set_3d_compositor c3fab2e718ae3113
 set_3d_layer_shadows 872bd4ddb9990918
 set_animator_keyframe 1f7119987f8dc80b
-set_audio 0f4cf15657125b03
+set_audio 6bef2d3579557e56
 set_audio_effect_key 02e5c3c88e7432d6
 set_audio_pan f9b02d2054de6500
 set_audio_pan_key 68c1e6eef9c55534
@@ -481,6 +481,7 @@ template_delete 6b938f0f0f89fa07
 template_describe 6840c663f33496bf
 template_list 0757d10d640959f3
 text_contrast_series d14fc189b362abb4
+tighten_pauses 9e100bd3711e0e69
 timeline_summary 9fdf3526f8d0c28b
 track_beats 91bef51f0456917f
 track_feature_residuals c91589589f2b376d

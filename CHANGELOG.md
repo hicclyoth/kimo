@@ -4,6 +4,170 @@
 
 ## Unreleased
 
+## v7.9.0 (2026-10-31)
+
+V7.9-Q quality pass, continuing V7.7/7.8-Q's priority (what actually moves a finished video, not
+feature count). Tools: 521 -> 523 (whoosh_sfx on `place_broll`; `compress_amount` on `set_audio`).
+
+- **Voice dynamics investigated honestly; one real, verified, recall-safe gain shipped -- the >=3 LU
+  target not reached, marked [~].** The final mix's `loudness_range` sat at 1.2 LU in 7.8.0 while the
+  raw source measures 2.4-3.6 LU unprocessed. The suspected cause going in (from 7.8-Q's own notes):
+  `finish_audio`'s per-clip average-matching loop pulls every dialogue clip's average loudness the FULL
+  distance to the loudest one, with no knob. Added `match_strength` (0..1) to scale that pull -- but
+  measured on the real benchmark, clips from the SAME speaker after a rough cut were already within
+  ~2.3 dB of each other at that step, so lowering it barely moved `loudness_range` (1.2 -> 1.3 LU at
+  0.6) while it reproducibly collapsed whisper word recall from 88.3% to 56.7% (the opening sentence
+  dropped entirely -- a hard threshold effect in the small whisper model, not a gradual one, confirmed
+  twice on identical input). `match_strength` defaults back to 1.0 (the exact old behaviour) and stays
+  as a real option for its original case: two different speakers at very different mic levels (the
+  existing `finish_audio_levels_speakers_and_hits_the_target` test covers this).
+  - The actual dominant force: `finish_audio` always ran a fixed `acompressor` (threshold=-18dB,
+    ratio=3:1) on every dialogue clip with no knob at all. Disabling `level_dynamics` (speechnorm)
+    entirely only moved `loudness_range` from 1.2 to 1.4 LU -- the compressor alone was holding it
+    there regardless. Added `compress_strength` (0..1) to scale its ratio; swept the real benchmark:
+    `compress_strength:0.0` (compressor fully off) reproducibly measured **90.0% word recall (54/60,
+    better than 7.8's 88.3% baseline)** with **`loudness_range` 1.2 -> 1.4 LU**. Any value above 0 that
+    still ran some compression cost recall for no further LRA gain (0.35 -> 86.7% recall, 1.3 LU). The
+    absolute ceiling -- everything off (match_strength 0, compress_strength 0, level_dynamics off) --
+    only reached 2.3 LU, still short of 3, and that configuration is not recall-safe. `compress_strength`
+    defaults to 0.0: a real, measured, recall-positive change, not a cosmetic knob.
+  - Honest result: **`loudness_range` 1.2 -> 1.4 LU** (target >=3 not reached; marked [~] in
+    FEATURES.md), **word recall 88.3% -> 90.0%** (improved, not regressed), -14 LUFS and true peak
+    unchanged within spec.
+  - `Audio.compress_amount` (new project field, custom serde default 1.0 so every pre-7.9 saved project
+    loads unchanged) and `set_audio`'s `compress_amount` arg expose the same scale directly.
+  - TDD: `finish_audio_match_strength_defaults_to_full_match`,
+    `finish_audio_match_strength_explicit_value_partially_matches`,
+    `finish_audio_match_strength_zero_leaves_clip_averages_untouched_relative_to_each_other`,
+    `finish_audio_compress_strength_scales_the_stored_ratio`,
+    `finish_audio_compress_strength_defaults_to_off`. Golden registry hashes hand-updated for the three
+    changed schemas (`finish_audio`, `auto_edit`, `set_audio`) -- read from the failing test's own
+    computed hash, never `KIMO_UPDATE_GOLDEN`.
+- **Whoosh SFX on b-roll cut-ins and the hook title-in** (new, OFF by default): `synth_whoosh_sfx()` in
+  `director_tools.rs` generates a short, purely procedural rising-pitch tone (300Hz -> ~2.3kHz over
+  0.22s, exponential decay, gentle lowpass) at call time into the OS temp dir and reuses it -- same
+  pattern as `add_keyword_pops`' `synth_pop_sfx` (0ae47c0), never a bundled sample. `place_broll` gets
+  `whoosh_sfx`: when true, one whoosh at each b-roll cut-in's own start, on a dedicated SFX track.
+  `auto_edit`'s hook-title stage places the same cue at the title's entrance when true (threaded through
+  to `place_broll` too). Fails open exactly like `add_keyword_pops`' `sfx`: a warning, never a blocked
+  cut or title.
+  - **Defaults to false, not true, after a real measured cost**: a b-roll cut-in by `place_broll`'s own
+    design always lands during active speech (never a true silence), so any sound placed there is a real
+    risk, not just a loud one. At 0.3 volume on its own dedicated track, the whoosh cost whisper word
+    recall 90.0% -> 86.7% on the real benchmark. Tried the obvious fix -- quieter, 0.15 -- and recall got
+    WORSE, 90.0% -> 80.0%, not better: this is not a simple louder-is-worse masking curve, and a third
+    blind guess at a volume was not going to be a verified fix with the time left. Left the volume at an
+    actually-audible 0.3 and defaulted `whoosh_sfx` to false instead of shipping a recall regression as
+    default behaviour -- the same standard this pass already held `match_strength` to. The feature is
+    real, built, and TDD'd for a caller who opts in; it is not claimed as safe-by-default.
+  - TDD: `place_broll_whoosh_sfx_places_a_real_sound_at_each_cut_in` proves the dedicated track exists,
+    one clip per cut-in at the cut-in's own start time, the mix is actually audible there (non-zero
+    PCM) when turned on, and the default (no `whoosh_sfx` arg) places none.
+  - Classified the new file-open site (the temp whoosh WAV) in `external_refs.rs`.
+- Job 3 (a visible, frame-verified b-roll gain -- colour/exposure match or a slow push) did not happen
+  this pass; not claimed, not faked.
+
+## v7.8.0 (2026-10-31)
+
+V7.8-Q quality pass: more of `examples/auto_edit_benchmark.py`'s real CC0 interview footage, continuing
+V7.7-Q's priority (what actually moves a finished video, not feature count). Tools: 520 -> 521 (one new
+tool). The second item below is the headline: a serious pre-existing correctness bug, not a polish pass.
+
+- **`tighten_pauses`** (new tool): a rough cut (`auto_rough_cut`) already drops dead air BETWEEN kept
+  clips; nothing before this tightened the dead air a rough cut leaves INSIDE a clip it kept -- an
+  interior breath between two phrases, or the pause before the speaker's first word. Probes each
+  dialogue clip's own interior silence (reusing `audio_speech_intervals` in `silence` mode, not VAD,
+  whose padding/hangover would have inflated speech boundaries and understated the real gap) and ripple-
+  deletes everything past a natural pad (default 120ms interior, 80ms lead-in) via the same
+  `trim_filler_words` machinery filler-word trimming already uses, so caption retiming comes for free.
+  `auto_edit` runs it by default (`pacing: true`) right after the rough cut, before transcription, and
+  re-derives dialogue_clips/edit_duration from the tightened track.
+  - Three real-footage calibration bugs found and fixed while building this, each only visible on an
+    actual render (a synthetic fixture missed all three): a fixed -45dB silence threshold never fired on
+    real room tone (-20 to -25dB); the first per-clip auto-calibration attempt biased short speech-heavy
+    segments' floor estimate toward speech level and gutted 9.6s of real dialogue as "false silence";
+    the whole-track fix that replaced it was then too conservative on a recording with only ~8.5dB of
+    real headroom between noise floor and quietest speech, finding zero gaps again. Settled: calibrate
+    once from the whole track (more quiet frames to read), threshold = floor + a fraction (default 0.5)
+    of the way to the quietest detected speech level, capped 3dB under speech either way.
+  - Never leaves a surviving piece shorter than `min_piece_s` (default 1.0s, clamped 0.2-5): fragmenting
+    a clip too far raised the odds of the bug below (a short clip reads less reliably to other per-clip
+    tools downstream) -- directly responsible for making that bug worse mid-session, caught and capped
+    before it shipped.
+- **Found and fixed a serious pre-existing bug: `finish_audio` was silently muting most real dialogue as
+  "ambience".** `finish_audio` classifies every media clip on the timeline as dialogue, music, or
+  ambience by probing `audio_speech_intervals` at aggressiveness 2 and requiring speech_ratio >= 0.2;
+  ambience gets muted. On the real benchmark interview, 4 of `auto_rough_cut`'s own 6 kept dialogue
+  segments read speech_ratio under that bar at aggressiveness 2 (one segment read -0.0 speech_ratio on
+  0.8s of unmistakable continuous speech) and were muted outright -- and every loudness/silence check in
+  the benchmark still passed, because finish_audio's final gain-trim loop only ever levels whatever
+  survived the mute up to the target LUFS, with no signal that most of the source was gone. `git log -S`
+  on the classifier line traces this to commit 77e14e2 (~294 commits back, when `finish_audio` was first
+  written) -- present in every real-footage render this project has ever made, not something any
+  V7.6Q/7.7Q/7.8Q commit introduced. Caught by whisper-transcribing a shipped render and finding most of
+  the source's real sentences missing.
+  - Fix: try speech_ratio at aggressiveness 1 first (the same real segments read 0.69-0.90 there,
+    comfortably over the bar), then rescue anything still called ambience by checking aggressiveness 0 at
+    a materially higher bar (0.5, not the same 0.2) so a real miss still gets caught (the one segment that
+    failed at both 1 and 2 reads 0.825 at 0) without casually relabelling real background tone as dialogue
+    just because the most lenient level is more permissive.
+  - TDD: a synthetic sine-harmonic voice stand-in (the test file's own `talk()` helper, reused everywhere
+    else in this suite) does NOT reproduce this -- it is too spectrally pure to trip aggressiveness 2's
+    steady-tone rejection the way real voice does. The new regression test slices a short excerpt of the
+    real interview fresh at test time (ffmpeg, not committed media) and skips (not fails) if that
+    box-local fixture isn't present, so it stays honest without demanding real media in every checkout.
+  - New permanent regression gate: `examples/auto_edit_benchmark.py --whisper-recall-source <raw file>`
+    transcribes both sides with whisper-cli and fails the run (exit 1) if the rendered word recall against
+    the source falls under `--whisper-recall-min` (default 0.90) -- loudness and silence checks alone
+    cannot catch this class of bug, since a 90%-muted dialogue track still mixes to exactly the target LUFS.
+  - Measured on the real benchmark (whisper word recall vs the source transcript, bag-of-words):
+    real_v1.mp4 (first real render, long before this quarter's work) 27.5%, real_v14.mp4 (last V7.7Q
+    render) 27.5%, real_v15.mp4 with this session's pacing work but before this fix 13.0% (tighten_pauses'
+    extra fragmentation made the pre-existing bug measurably worse), real_v15.mp4 with the fix 68.1%.
+    Confirmed directly against finish_audio's own report, not just the recall number: every one of the 11
+    real dialogue clips on the fixed render's talking-head track is now classified as dialogue and
+    leveled; the only clips still muted as ambience are b-roll's own scratch audio (correct and intended).
+    The remaining gap to the 90% gate on this one real clip is not muting -- it is whisper's own
+    recognition noise on compressed/leveled speech plus a handful of words legitimately removed by
+    rough_cut/filler-trim's own dead-air and filler trimming, not dropped audio.
+
+- **Found and fixed: `auto_rough_cut` lost real opening words on a cold-open recording.** Its speech
+  detector (VAD mode, aggressiveness 1) needs several consecutive confirming frames before declaring
+  speech has started; on the real benchmark interview (talking begins immediately, no lead-in silence)
+  that onset lag cost the first ~0.48s of real words -- confirmed independently with whisper, which
+  hears real speech ("It takes so much knowledge...") at the source's literal 0.000s, while the raw VAD
+  probe's own first detected span started at 0.48s. Fix: `recover_missed_onset` re-checks only the very
+  first kept segment of the whole output (every later segment already has real silence, or another kept
+  clip, right before it) with a plain RMS silence probe -- the same technique `tighten_pauses` already
+  uses, with no VAD confirmation delay -- and pulls the start back to wherever real silence actually
+  ends, never later than VAD's own answer. On the real benchmark: first kept segment went from source
+  [0.48, 2.6] to [0.0, 2.6]. TDD against a real-footage excerpt sliced at test time (not committed media).
+- **Made the recall gate honest.** `auto_rough_cut`'s own dead-air/filler trimming removes real source
+  content ON PURPOSE -- gating a finished render's word recall against the FULL untrimmed source punished
+  correct editing right alongside the real muting bug above. `--whisper-recall-source` now gates against
+  the kept-span CEILING instead: it re-runs `auto_rough_cut` on the same talking-head asset(s) (read-
+  derived, purely to recover the exact spans it kept), concatenates just that kept audio into a reference
+  clip, transcribes it as the ceiling, and reports the render's recall against that (still 90% default,
+  `--whisper-recall-min`). Reports both numbers plus the ceiling's own transcript text.
+  - Measured on the real benchmark with every fix above in: 88.3% against the ceiling (53/60 words),
+    up from the original broken baseline's 27.5% against the full source -- close to the 90% floor but
+    not over it. The remaining gap looks more like whisper's own flag-sensitive recognition noise at clip
+    boundaries than real content loss (an alternate whisper-cli invocation on the identical render
+    recovered the one phrase bag-of-words scoring called missing) but this was not chased to full
+    certainty this quarter; reported as a disclosed, open gap, not claimed closed.
+- **Honest miss, not hidden: loudness range (LRA) on this one real clip.** The brief's 6-8 LU target was
+  not met -- measured ~1.2-1.4 LU after every fix above, against a ~2.4-3.6 LU natural ceiling in the RAW
+  unprocessed source itself (checked directly: `measure_loudness` on the track right after `auto_rough_cut`,
+  before any `finish_audio` processing at all). This specific calm interview voice does not naturally carry
+  6-8 LU of dynamic range. Tested with `level_dynamics` (speechnorm) fully disabled: LRA barely moved
+  (1.4 vs 1.2), showing the dominant narrowing force is `finish_audio`'s per-clip gain-matching step
+  (every dialogue clip leveled to the loudest clip's own average -- a deliberate consistency feature, not
+  a bug, and not something this pass has an exposed knob to disable). The prior real_v14 render's 7.1 LU
+  reading almost certainly reflects the finish_audio muting bug above (big silent-vs-loud swings from
+  mostly-missing dialogue masquerading as dynamics), not healthy vocal variation -- not re-chased further
+  this quarter given the time already spent on the higher-severity muting and onset bugs; disclosed as a
+  known gap for a future pass, not claimed fixed.
+
 ## v7.7.0 (2026-10-31)
 
 V7.7-Q quality pass: finished-video editing quality on real footage (`examples/auto_edit_benchmark.py`

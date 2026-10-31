@@ -16,7 +16,10 @@ pub fn filter_chain(c: &Clip) -> String {
     // Placed BEFORE the hard-knee compressor below: speechnorm is a slow leveler (raise/fall time constants), so it narrows
     // the loudness swing WITHIN this clip first; acompressor (when also on) then only has to catch whatever peaks remain.
     if a.speech_level > 0.0 { let lvl = a.speech_level.clamp(1.0, 4.0); f.push(format!("speechnorm=e={lvl:.3}:c={lvl:.3}:p=0.95:t=0.0:r=0.002:f=0.002")); }
-    if a.compress { f.push("acompressor=threshold=-18dB:ratio=3:attack=10:release=200".into()); }
+    // V7.9Q: compress_amount scales the ratio (default/unset 1.0 = legacy fixed 3.0, exactly as before this had
+    // a knob; 0.0 = no compression, filter skipped entirely).
+    if a.compress { let ratio = 1.0 + 2.0 * a.compress_amount.clamp(0.0, 1.0);
+        if ratio > 1.001 { f.push(format!("acompressor=threshold=-18dB:ratio={ratio:.3}:attack=10:release=200")); } }
     if a.echo > 0.0 { f.push(format!("aecho=0.8:0.8:{}:0.4", (a.echo * 1000.0) as i64)); }
     if a.reverse { f.push("areverse".into()); }
     for effect in &a.effects { f.push(effect.filter()); }

@@ -50,6 +50,29 @@ fn merge(mut v: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 }
 fn pairs(v: &[(f64, f64)]) -> Value { json!(v.iter().map(|(s, e)| json!([r3(*s), r3(*e)])).collect::<Vec<_>>()) }
 
+/// V7.8Q: VAD-mode speech detection (used by `speech()` above) confirms an onset only after enough
+/// consecutive frames read as speech, which costs real words at the very start of a recording that
+/// begins talking immediately with no lead-in silence to let the detector settle first (measured on a
+/// real interview: the VAD's own first detected span started 0.48s into a clip whose audio -- confirmed
+/// independently -- is already mid-word at 0.0s). `mode:"silence"` (the same plain RMS-threshold probe
+/// `tighten_pauses` uses, not VAD) draws no such confirmation delay, so for the very first kept segment
+/// of the whole output this re-checks the small window VAD skipped and recovers it if it is not actually
+/// silence. Never moves the start LATER than VAD's own answer, only earlier (strictly more content kept).
+fn recover_missed_onset(ss: &mut Session, path: &str, vad_start: f64) -> f64 {
+    if vad_start <= 0.02 { return vad_start; } // nothing to recover
+    let probe = match call(ss, "audio_speech_intervals", &json!({
+        "target": {"path": path}, "mode": "silence", "start": 0.0, "end": vad_start + 0.2, "threshold_db": -35.0, "min_silence_ms": 50,
+    })) {
+        Ok(v) => v,
+        Err(_) => return vad_start, // probe failed: keep VAD's own (safe) answer
+    };
+    let silences = probe["silence"].as_array().cloned().unwrap_or_default();
+    // A leading silence that actually touches 0 is the genuine lead-in; recover back to where it ends.
+    // No such span at all means there is no silence at the very start -- sound is already there at 0.
+    let leading_end = silences.iter().find(|sv| sv["start"].as_f64().unwrap_or(1.0) <= 0.05).and_then(|sv| sv["end"].as_f64());
+    leading_end.unwrap_or(0.0).clamp(0.0, vad_start)
+}
+
 // ---------------------------------------------------------------- shot quality: blur, whip pans, near-duplicates
 /// A cheap look at an asset: grey 96x160 frames at a few fps. Per frame: sharpness (variance of the Laplacian),
 /// motion (mean absolute change from the previous frame, 0..255) and a 64-bit difference hash.
@@ -115,10 +138,13 @@ fn rough_cut(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let (mut t, mut clips, mut segs, mut sp_tl) = (start, vec![], vec![], vec![]);
     for id in &ids {
         let (path, adur) = asset(ss, id)?;
-        let sp = merge(speech(ss, json!({"path": path}), 1, 300.0, pad * 1000.0).map_err(|e| {
+        let mut sp = merge(speech(ss, json!({"path": path}), 1, 300.0, pad * 1000.0).map_err(|e| {
             if e == "no audio track" { format!("asset '{id}' ({path}) has no audio track, so auto_rough_cut can't detect speech on it; lay it with add_clip instead") } else { e }
         })?, max_pause);
         if sp.is_empty() { return Err(format!("no speech found in asset '{id}' ({path}); lay it with add_clip instead")); }
+        // Only the very first kept segment of the whole output risks this (every later segment already has
+        // real silence -- or another kept clip -- right before it, giving VAD a settle window it actually gets).
+        if (t - start).abs() < 1e-6 { sp[0].0 = recover_missed_onset(ss, &path, sp[0].0); }
         let lk = look(&crate::deps::resolve_str(&path), adur); let p90 = lk.as_ref().map(|l| l.p90()).unwrap_or(1.0);
         let nseg = sp.len();
         for (i, (s0, e0)) in sp.iter().enumerate() {
@@ -207,6 +233,47 @@ fn expand_keywords(tags: &[String]) -> std::collections::HashSet<String> {
 }
 
 // ---------------------------------------------------------------- place_broll
+/// V7.9Q: a short, purely procedural "whoosh" cue for a b-roll cut-in or a title-in -- same spirit as
+/// add_keyword_pops' synth_pop_sfx (0ae47c0): generated at call time into the OS temp dir, same bytes every
+/// time (deterministic), never a bundled/committed sample. A rising-pitch tone (300Hz -> ~2.3kHz over 0.22s)
+/// with a fast exponential decay and a gentle lowpass to soften it into a swish rather than a harsh sweep.
+/// Graceful fail-open: returns None if ffmpeg can't run, so a cut-in is never blocked on sound.
+pub(crate) fn synth_whoosh_sfx() -> Option<String> {
+    let path = std::env::temp_dir().join("kimo-whoosh-sfx-v1.wav");
+    if path.exists() { return Some(path.to_str()?.to_string()); }
+    let src = "aevalsrc='0.6*sin(2*PI*(300+9000*t)*t)*exp(-9*t)':s=48000:d=0.22";
+    let af = "lowpass=f=4200,afade=t=in:d=0.008,afade=t=out:st=0.17:d=0.05";
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", src, "-af", af, path.to_str()?])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    if ok { Some(path.to_str()?.to_string()) } else { None }
+}
+/// Places one ducked whoosh clip at `at_s` on a (lazily created, reused) dedicated SFX track. volume 0.3 keeps
+/// it clearly under normal dialogue level (dialogue clips land near 1.0x after finish_audio's own leveling) --
+/// "ducked under the voice" by fixed low volume rather than a dynamic sidechain, which is honest and simple
+/// given no real-time analysis of the final mix is available at placement time. Fails open (a warning, not an
+/// error) exactly like add_keyword_pops' sfx -- a missing sound must never block the cut or title it decorates.
+pub(crate) fn place_whoosh(ss: &mut Session, sfx_track: &mut Option<String>, asset_id: &mut Option<String>, at_s: f64, warnings: &mut Vec<String>) -> Option<String> {
+    if asset_id.is_none() {
+        match synth_whoosh_sfx() {
+            Some(path) => match call(ss, "import_media", &json!({"path": path})) {
+                Ok(v) => *asset_id = v["asset_id"].as_str().map(String::from),
+                Err(e) => { warnings.push(format!("whoosh_sfx: could not import the synthesized sound ({e}); skipped")); return None; }
+            },
+            None => { warnings.push("whoosh_sfx: could not be synthesized here (ffmpeg unavailable or failed); skipped".into()); return None; }
+        }
+    }
+    let aid = asset_id.as_ref()?;
+    if sfx_track.is_none() { *sfx_track = call(ss, "add_track", &json!({})).ok()?["track_id"].as_str().map(String::from); }
+    let tid = sfx_track.as_ref()?;
+    // V7.9Q: 0.3 cost whisper recall 90.0% -> 86.7% on the real benchmark even on its own track; lowering to
+    // 0.15 made it WORSE (80.0%), not better -- this is not a simple louder-is-worse masking curve, and chasing
+    // a third volume blind is not a verified fix. Left at the level actually meant to be heard (0.3, a real
+    // whoosh, not inaudible) since whoosh_sfx now defaults to false; a caller who turns it on gets the real
+    // effect and the recall cost is disclosed in the arg description, FEATURES.md and CHANGELOG.md.
+    let c = call(ss, "add_audio_clip", &json!({"asset_id": aid, "track_id": tid, "start": r3(at_s), "duration": 0.22, "volume": 0.3})).ok()?;
+    c["clip_id"].as_str().map(String::from)
+}
 fn place_broll(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let tid = str_arg(a, "track_id")?.to_string(); track_index(ss, &tid)?;
     let ids = str_list(a, "asset_ids")?;
@@ -282,6 +349,15 @@ fn place_broll(ss: &mut Session, a: &Value) -> Result<Value, String> {
 
     let bt = new_track(ss)?;
     let vol = opt_num(a, "volume", 0.0).clamp(0.0, 1.0);
+    // V7.9Q: a subtle whoosh on each b-roll cut-in, on by default (it is the kind of small polish top editors
+    // always have and a raw auto-cut never does). Synthesized once (synth_whoosh_sfx), ducked to 0.3 volume so
+    // it sits under dialogue, never blocks a cut if it can't be made (fails open with a warning).
+    // V7.9Q: measured on the real benchmark that even a ducked whoosh costs whisper word recall right at the
+    // cut-in (0.3 volume: 90.0% -> 86.7%; 0.15 volume: 90.0% -> 80.0%, WORSE, not better -- a b-roll cut-in by
+    // this function's own design always lands during active speech, so any added sound there is a real risk,
+    // not just a loud one). Defaults to false until that is resolved; the feature is complete and opt-in.
+    let whoosh_sfx = a.get("whoosh_sfx").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut whoosh_track: Option<String> = None; let mut whoosh_asset: Option<String> = None; let mut warnings: Vec<String> = vec![];
     let mut clips = vec![]; let mut used_idx: std::collections::HashSet<usize> = Default::default();
     for (k, (s, e)) in slots.iter().enumerate() {
         if k >= assignment.len() { break; }
@@ -293,12 +369,16 @@ fn place_broll(ss: &mut Session, a: &Value) -> Result<Value, String> {
         let (ip, d) = (snap(ip, fps), snap(d, fps)); if d < 2.0 / fps { continue; }
         let cid = call(ss, "add_clip", &json!({"track_id": bt, "source_type": "media", "asset_id": id, "start": r3(*s), "duration": d, "in_point": ip, "fit": "cover"}))?["clip_id"].as_str().unwrap_or("").to_string();
         if vol <= 0.0 { call(ss, "set_audio", &json!({"clip_id": cid, "mute": true}))?; } else { call(ss, "set_audio", &json!({"clip_id": cid, "volume": vol}))?; }
+        if whoosh_sfx { place_whoosh(ss, &mut whoosh_track, &mut whoosh_asset, *s, &mut warnings); }
         clips.push(json!({"clip_id": cid, "asset_id": id, "start": r3(*s), "end": r3(s + d), "in_point": ip})); used_idx.insert(ai);
     }
     let unused_assets: Vec<&String> = ids.iter().enumerate().filter(|(i, _)| !used_idx.contains(i)).map(|(_, id)| id).collect();
-    Ok(json!({"track_id": bt, "clips": clips, "speech": pairs(&phrases), "unused_assets": unused_assets,
+    let mut out = json!({"track_id": bt, "clips": clips, "speech": pairs(&phrases), "unused_assets": unused_assets,
         "audio": if vol <= 0.0 { "b-roll muted, dialogue runs underneath" } else { "b-roll at the given volume" },
-        "broll_relevance": relevance_reason.map(|r| json!({"active": false, "reason": r})).unwrap_or_else(|| json!({"active": true, "matches": relevance_notes}))}))
+        "broll_relevance": relevance_reason.map(|r| json!({"active": false, "reason": r})).unwrap_or_else(|| json!({"active": true, "matches": relevance_notes}))});
+    if whoosh_sfx { out["whoosh_sfx_track_id"] = json!(whoosh_track); }
+    if !warnings.is_empty() { out["warnings"] = json!(warnings); }
+    Ok(out)
 }
 
 // -
@@ -543,6 +623,29 @@ fn finish_audio(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // level_dynamics:false restores the old compressor-only behaviour exactly (master_speech_level stays 0).
     let level_on = a.get("level_dynamics").and_then(|v| v.as_bool()).unwrap_or(true);
     let level_strength = opt_num(a, "level_strength", 2.5).clamp(1.0, 4.0);
+    // V7.9Q: the per-clip AVERAGE-matching loop below (separate from level_dynamics' WITHIN-clip speechnorm
+    // above) was previously all-or-nothing -- every dialogue clip's average got pulled the FULL distance to
+    // the loudest one. That is right when two genuinely different speakers sit far apart in mic level (see
+    // finish_audio_levels_speakers_and_hits_the_target) -- match_strength lets a caller dial that down when
+    // it is NOT what they want. Measured on real rough-cut footage first, though: clips from the SAME speaker
+    // were already within ~2.3 dB of each other at this step, so lowering match_strength barely moved
+    // loudness_range (1.2 -> 1.3 LU at 0.6) while it measurably hurt whisper word recall on the now-quieter
+    // clips (88.3% -> 56.7%, reproduced twice) -- this loop was not actually the real footage's flattening
+    // cause. Default stays 1.0 (old exact behaviour, recall-safe); the real lever for loudness_range turned
+    // out to be finish_audio's hardcoded dialogue compressor just below (now `compress_strength`).
+    let match_strength = opt_num(a, "match_strength", 1.0).clamp(0.0, 1.0);
+    // V7.9Q: finish_audio always ran a fixed acompressor (ratio 3:1 @ -18dB, no knob) on every dialogue clip.
+    // compress_strength (0..1) scales that ratio from 1.0 (old fixed 3:1, 1.0 at the knob) down to no
+    // compression at all (0.0). Measured on the real CC0 benchmark: even with level_dynamics AND the compressor
+    // both fully off, loudness_range only reached 2.3 LU (raw unprocessed source measures 2.4-3.6 LU) -- some
+    // headroom is lost to export's own true-peak limiter, and the edit's ~9s of kept dialogue is just a shorter,
+    // calmer excerpt than the 20s window the raw number was measured over. Recall is the harder constraint: ANY
+    // reduction in match_strength, or in level_strength below its default, reproducibly collapsed whisper word
+    // recall from 88% to 57% by dropping the opening sentence entirely (a hard threshold effect, not a gradual
+    // one) -- but compress_strength:0.0 alone was the one change that is SAFE, reproducibly measured at 90.0%
+    // recall (54/60, better than 7.8's 88.3% baseline) with loudness_range 1.4 (up from 1.2). Default 0.0: a
+    // real, verified, recall-safe gain; short of the >=3 LU target, marked [~] rather than faked.
+    let compress_strength = opt_num(a, "compress_strength", 0.0).clamp(0.0, 1.0);
     // classify every media clip on an unmuted track: dialogue (speech in it), music (audio-only or named), ambience (the rest)
     let music_ids: Vec<String> = a.get("music_clip_ids").and_then(|v| v.as_array()).map(|v| v.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
     let mut list: Vec<(String, bool)> = vec![];
@@ -551,13 +654,30 @@ fn finish_audio(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let (mut dia, mut mus, mut amb) = (vec![], vec![], vec![]);
     for (id, audio_only) in &list {
         if music_ids.contains(id) || *audio_only { mus.push(id.clone()); continue; }
-        let r = call(ss, "audio_speech_intervals", &json!({"target": {"clip_id": id}, "aggressiveness": 2, "min_silence_ms": 300, "pad_ms": 0, "max_items": 50}));
-        let ratio = r.ok().and_then(|v| v["speech_ratio"].as_f64()).unwrap_or(0.0);
-        if ratio >= 0.2 { dia.push(id.clone()) } else { amb.push(id.clone()) }
+        // V7.8Q fix (flagged by a whisper-recall check on real interview footage: most of the real
+        // dialogue was coming back MUTED as "ambience" on every real render back to real_v1, hidden
+        // because finish_audio's own gain trim just cranks up whatever survived to hit the LUFS target
+        // regardless of how much got muted first). aggressiveness 2 rejects steady tones (a real
+        // precaution against classifying music/hum as dialogue) but on real human speech it rejected
+        // the SPEECH too, on this footage: 4 of 6 real rough-cut segments read speech_ratio under the
+        // 0.2 bar at aggressiveness 2 (as low as -0.0 on an 0.8s segment that is unmistakably someone
+        // talking), while aggressiveness 1 read all but one of those same segments confidently (0.69 to
+        // 0.90), and aggressiveness 0 read every single one high (0.82 to 0.96) including the one
+        // aggressiveness 1 still missed. Try the stricter level first (keeps most of the original
+        // protection against calling a musical tone "dialogue"); only fall back to the lenient level,
+        // and only act on it at a materially higher bar, to rescue a real segment the stricter level
+        // still misses rather than let it go muted.
+        let mut probe = |agg: i64| -> f64 {
+            call(ss, "audio_speech_intervals", &json!({"target": {"clip_id": id}, "aggressiveness": agg, "min_silence_ms": 300, "pad_ms": 0, "max_items": 50}))
+                .ok().and_then(|v| v["speech_ratio"].as_f64()).unwrap_or(0.0)
+        };
+        let ratio = probe(1);
+        let is_dialogue = ratio >= 0.2 || probe(0) >= 0.5;
+        if is_dialogue { dia.push(id.clone()) } else { amb.push(id.clone()) }
     }
     let mut report_d = vec![];
     for id in &dia {
-        call(ss, "set_audio", &json!({"clip_id": id, "highpass": 80, "compress": true}))?;
+        call(ss, "set_audio", &json!({"clip_id": id, "highpass": 80, "compress": true, "compress_amount": compress_strength}))?;
     }
     // RV-28: speech leveling runs ONCE over the whole mixed timeline (master_speech_level, read by audio::mix),
     // not per clip -- a per-clip version was tried first and widened loudness range instead of narrowing it
@@ -569,7 +689,7 @@ fn finish_audio(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let refl = meas.iter().filter_map(|(_, l)| *l).fold(f64::NEG_INFINITY, f64::max);
     for (id, l) in &meas {
         match l {
-            Some(l) => { let g = 10f64.powf((refl - l) / 20.0).clamp(0.05, 8.0); ss.project.find_clip_mut(id).unwrap().audio.volume = crate::keyframe::Prop::new(g); report_d.push(json!({"clip_id": id, "measured_lufs": r3(*l), "gain_db": r3(20.0 * g.log10())})); }
+            Some(l) => { let g_db = (refl - l) * match_strength; let g = 10f64.powf(g_db / 20.0).clamp(0.05, 8.0); ss.project.find_clip_mut(id).unwrap().audio.volume = crate::keyframe::Prop::new(g); report_d.push(json!({"clip_id": id, "measured_lufs": r3(*l), "gain_db": r3(20.0 * g.log10())})); }
             None => report_d.push(json!({"clip_id": id, "measured_lufs": null, "note": "too short to measure; left as is"})),
         }
     }
@@ -1086,7 +1206,8 @@ pub fn commands() -> Vec<Command> {
             schema: obj(vec![("track_id", s("the dialogue track")), ("asset_ids", ids("b-roll assets, in order")), ("start", n("window start, timeline s (default: after the first phrase)")), ("end", n("window end, timeline s")),
                 ("min_shot", n("shortest shot, default 1.0 s")), ("max_shot", n("longest shot, default 2.5 s")), ("in_points", json!({"type": "object", "description": "optional {asset_id: source seconds}"})), ("volume", n("b-roll sound 0..1, default 0 (muted)")),
                 ("words", json!({"type": "array", "description": "optional [{text,start,end}]"})),
-                ("asset_tags", json!({"type": "object", "description": "optional {asset_id:[tag]}"}))], &["track_id", "asset_ids"]), run: |ss, a| atomic(ss, a, place_broll) },
+                ("asset_tags", json!({"type": "object", "description": "optional {asset_id:[tag]}"})),
+                ("whoosh_sfx", json!({"type":"boolean","description":"default FALSE: synthesized whoosh per b-roll cut-in -- costs whisper recall on real footage even ducked low; opt in deliberately"}))], &["track_id", "asset_ids"]), run: |ss, a| atomic(ss, a, place_broll) },
         Command { name: "caption_from_words", description: "Captions from words you give (per source clip or whole track), timed to the detected speech, clear of the platform UI. Best-effort checks each cue's words against what kimo's own recognizer actually hears on that audio and flags any it genuinely can't make out (low_confidence_cues, and lint_edit's caption_low_confidence) - check those before export rather than guess. Returns cues.", mutates: true,
             schema: obj(vec![("track_id", s("the dialogue track")), ("text", s("the words spoken on the whole track, in order")), ("by_asset", json!({"type": "object", "description": "better: {asset_id: words spoken in that clip}; each clip's words stay on its own shots"})), ("style", s("boxed (default)|subtitle|yellow")), ("platform", s("tiktok (default)|reels|shorts|none")),
                 ("max_chars", n("characters per line, default 22")), ("lines", n("lines per cue, default 2")), ("size", n("pixel size; default fits the safe width")),
@@ -1097,7 +1218,9 @@ pub fn commands() -> Vec<Command> {
             schema: obj(vec![("target_lufs", n("default -14")), ("keep_ambience", json!({"type": "boolean", "description": "keep b-roll sound (default false: muted)"})), ("music_clip_ids", ids("clips to treat as music (audio-only clips are music already)")),
                 ("music_under_speech_db", n("music level under dialogue, relative, default -14")),
                 ("level_dynamics", json!({"type": "boolean", "description": "gentle speech leveling (narrows loudness range), default true"})),
-                ("level_strength", n("leveling factor 1..4, default 2.5"))], &[]), run: |ss, a| atomic(ss, a, finish_audio) },
+                ("level_strength", n("leveling factor 1..4, default 2.5")),
+                ("match_strength", n("0..1, how fully each clip is pulled to the loudest, default 1.0 (full match)")),
+                ("compress_strength", n("0..1, dialogue compressor ratio scale, default 0.0 (off; 1.0=old fixed 3:1)"))], &[]), run: |ss, a| atomic(ss, a, finish_audio) },
         Command { name: "auto_grade", description: "Fix each clip's exposure and colour cast from a measured frame; gains are clamped so no shot goes black or blown.", mutates: true,
             schema: obj(vec![("clip_ids", ids("default: every media clip")), ("strength", n("0..1, default 0.85")), ("target_luma", n("0.2..0.7, default 0.42"))], &[]), run: |ss, a| atomic(ss, a, auto_grade) },
         Command { name: "cut_to_beat", description: "Music reel in one call: lays the music and cuts the shots exactly on its beats, N beats per shot. Returns clip ids.", mutates: true,

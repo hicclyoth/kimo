@@ -12,6 +12,12 @@ use super::kit::*;
 use crate::commands::dispatch_nested as call;
 use crate::model::Source;
 
+/// Same rounding convention `auto_rough_cut`'s own returned "duration"/clip times already use
+/// (director_tools.rs `r3`): re-deriving edit_duration from raw clip floats after pacing must not
+/// introduce sub-millisecond drift relative to what the rest of the pipeline (and lint_edit's own
+/// speech re-detection, which this duration is compared against) treats as "the same" instant.
+fn r3(v: f64) -> f64 { (v * 1000.0).round() / 1000.0 }
+
 fn atomic(ss: &mut Session, a: &Value, f: fn(&mut Session, &Value) -> Result<Value, String>) -> Result<Value, String> {
     let before = ss.project.clone();
     match f(ss, a) { Ok(v) => Ok(v), Err(e) => { ss.project = before; Err(e) } }
@@ -42,6 +48,9 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let target_lufs = opt_num(a, "target_lufs", -14.0);
     let level_dynamics = a.get("level_dynamics").and_then(|v| v.as_bool());
     let level_strength = a.get("level_strength").and_then(|v| v.as_f64());
+    let match_strength = a.get("match_strength").and_then(|v| v.as_f64());
+    let compress_strength = a.get("compress_strength").and_then(|v| v.as_f64());
+    let whoosh_sfx = a.get("whoosh_sfx").and_then(|v| v.as_bool());
     let punch_scale = opt_num(a, "punch_scale", 1.15).clamp(1.01, 3.0);
     let punch_on = a.get("punch_ins").and_then(|v| v.as_bool()).unwrap_or(true);
     let grade_on = a.get("grade").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -51,6 +60,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let end_screen_on = a.get("end_screen").and_then(|v| v.as_bool()).unwrap_or(platform == "none");
     let end_screen_text = a.get("end_screen_text").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("SUBSCRIBE FOR MORE").to_string();
     let end_screen_duration = opt_num(a, "end_screen_duration", 3.0).clamp(2.0, 4.0);
+    let pacing_on = a.get("pacing").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -59,10 +69,33 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // everything else attaches to, so it runs first and un-skippably.
     let rc = call(ss, "auto_rough_cut", &json!({"asset_ids": th_ids}))?;
     let track_id = rc["track_id"].as_str().ok_or("auto_rough_cut returned no track_id")?.to_string();
-    let dialogue_clips: Vec<(String, f64, f64)> = rc["clips"].as_array().map(|v| v.iter().filter_map(|c| Some((c["clip_id"].as_str()?.to_string(), c["start"].as_f64()?, c["end"].as_f64()?))).collect()).unwrap_or_default();
+    let mut dialogue_clips: Vec<(String, f64, f64)> = rc["clips"].as_array().map(|v| v.iter().filter_map(|c| Some((c["clip_id"].as_str()?.to_string(), c["start"].as_f64()?, c["end"].as_f64()?))).collect()).unwrap_or_default();
     if dialogue_clips.is_empty() { return Err("auto_rough_cut kept no speech from talking_head_asset_ids -- check the clips have audible speech".into()); }
-    let edit_duration = rc["duration"].as_f64().unwrap_or(0.0);
+    let mut edit_duration = rc["duration"].as_f64().unwrap_or(0.0);
     stages.insert("rough_cut".into(), json!({"track_id": track_id, "clip_ids": dialogue_clips.iter().map(|(id,_,_)| id).collect::<Vec<_>>(), "duration": edit_duration}));
+
+    // 1a. Pacing: tighten_pauses shrinks the dead air STILL left inside rough_cut's own kept clips (a
+    // breath between two phrases under the merge threshold, or lead-in before the first word) down to a
+    // natural pad. Runs before transcription/b-roll/captions so none of their clip-id bindings ever see a
+    // clip that later gets split -- by the time anything downstream reads dialogue_clips, the track is
+    // already final. Re-derives dialogue_clips and edit_duration from the track afterward since a tightened
+    // clip can split into more than one surviving piece.
+    if pacing_on {
+        match call(ss, "tighten_pauses", &json!({"track_id": track_id})) {
+            Ok(tp) => {
+                stages.insert("pacing".into(), tp);
+                let mut refreshed: Vec<(String, f64, f64)> = ss.project.tracks.iter().find(|t| t.id == track_id)
+                    .map(|t| t.clips.iter().filter(|c| matches!(c.source, Source::Media { .. })).map(|c| (c.id.clone(), r3(c.start), r3(c.start + c.duration))).collect())
+                    .unwrap_or_default();
+                refreshed.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                if !refreshed.is_empty() {
+                    edit_duration = refreshed.iter().map(|(_, _, e)| *e).fold(0.0, f64::max);
+                    dialogue_clips = refreshed;
+                }
+            }
+            Err(e) => warnings.push(format!("pacing tightening skipped: {e}")),
+        }
+    }
 
     // 1b. Transcribe the dialogue ONCE, here, in timeline seconds -- reused by both b-roll relevance (next)
     // and captions (stage 4), instead of each stage running the recognizer separately. When captions are on,
@@ -96,6 +129,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if !broll_ids.is_empty() {
         let mut broll_args = json!({"track_id": track_id, "asset_ids": broll_ids});
         if !transcript_words.is_empty() { broll_args["words"] = json!(transcript_words); }
+        if let Some(v) = whoosh_sfx { broll_args["whoosh_sfx"] = json!(v); }
         let br = call(ss, "place_broll", &broll_args)?;
         if let Some(arr) = br["clips"].as_array() { for c in arr { if let (Some(s), Some(e)) = (c["start"].as_f64(), c["end"].as_f64()) { broll_ranges.push((s, e)); } } }
         stages.insert("broll".into(), br);
@@ -132,8 +166,15 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if let Some(text) = hook_text {
         let tt = new_track(ss)?;
         let dur = edit_duration.min(3.0).max(1.0);
-        let title = call(ss, "add_title", &json!({"track_id": tt, "style": hook_style, "text": text, "start": 0.0, "duration": dur}))?;
+        let mut title = call(ss, "add_title", &json!({"track_id": tt, "style": hook_style, "text": text, "start": 0.0, "duration": dur}))?;
         if let Some(ws) = title["warnings"].as_array() { for w in ws { if let Some(s) = w.as_str() { warnings.push(s.to_string()); } } }
+        // V7.9Q: the same subtle whoosh as a b-roll cut-in, on the title's own entrance -- on by default.
+        // V7.9Q: default false, same reasoning as place_broll's own whoosh_sfx -- see director_tools.rs.
+        if whoosh_sfx.unwrap_or(false) {
+            let mut wt: Option<String> = None; let mut wa: Option<String> = None; let mut wwarn = vec![];
+            if let Some(cid) = crate::ext::director_tools::place_whoosh(ss, &mut wt, &mut wa, 0.0, &mut wwarn) { title["whoosh_sfx_clip_id"] = json!(cid); }
+            warnings.extend(wwarn);
+        }
         stages.insert("hook_title".into(), title);
     } else {
         warnings.push("no hook_text given: the edit opens on the raw first clip with no hook title (pass hook_text for a cold-open line)".into());
@@ -165,6 +206,8 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let mut finish_args = json!({"target_lufs": target_lufs});
     if let Some(v) = level_dynamics { finish_args["level_dynamics"] = json!(v); }
     if let Some(v) = level_strength { finish_args["level_strength"] = json!(v); }
+    if let Some(v) = match_strength { finish_args["match_strength"] = json!(v); }
+    if let Some(v) = compress_strength { finish_args["compress_strength"] = json!(v); }
     let audio = call(ss, "finish_audio", &finish_args)?;
     stages.insert("audio".into(), audio.clone());
 
@@ -264,9 +307,13 @@ pub fn commands() -> Vec<Command> {
                 ("platform", s("passed to lint_edit/apply_review_fixes: tiktok|reels|shorts|none (default none)")),
                 ("level_dynamics", json!({"type": "boolean", "description": "passed to finish_audio: gentle speech leveling, default true"})),
                 ("level_strength", n("passed to finish_audio: leveling factor 1..4, default 2.5")),
+                ("match_strength", n("passed to finish_audio: match_strength 0..1, default 1.0")),
+                ("compress_strength", n("passed to finish_audio: compress_strength 0..1, default 0.0")),
+                ("whoosh_sfx", json!({"type":"boolean","description":"default FALSE: synthesized whoosh on each b-roll cut-in + hook title -- costs whisper recall even ducked low; opt in"})),
                 ("end_screen", json!({"type": "boolean", "description": "a short subscribe-style outro card after the edit; default true when platform is none"})),
                 ("end_screen_text", s("outro card text, default SUBSCRIBE FOR MORE")),
                 ("end_screen_duration", n("outro card seconds, default 3.0, clamped 2..4")),
+                ("pacing", json!({"type": "boolean", "description": "tighten_pauses: shrink the dead air rough_cut leaves inside its own kept clips (a breath between phrases, the lead-in before the first word) down to a natural pad; default true"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }

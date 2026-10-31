@@ -1,5 +1,94 @@
 # kimo features
 
+New in v7.9.0: a real-footage voice-dynamics pass (honest, partial -- see below), plus a new `whoosh_sfx`
+option on `place_broll`'s b-roll cut-ins and `auto_edit`'s hook title, synthesized at call time like the
+existing pop SFX -- built, TDD'd, and left OFF by default after it measurably cost whisper word recall on
+real footage even ducked low. Tools: 521 -> 523.
+
+## v7.9-Q: voice dynamics investigated honestly, whoosh SFX shipped off-by-default, b-roll visual gain not reached
+
+- [~] **Loudness range (LRA): one real, verified gain shipped; the >=3 LU target not reached.** 7.8.0's
+  suspected cause (`finish_audio`'s per-clip average-matching pulling every clip to the loudest) turned
+  out to have only a small effect on this real footage -- clips from the same speaker were already
+  within ~2.3 dB of each other there -- and scaling it down (new `match_strength` option) reproducibly
+  cost whisper word recall (88.3% -> 56.7%, a hard threshold effect dropping the opening sentence
+  entirely, not a gradual one). `match_strength` defaults back to 1.0 (old behaviour, recall-safe) and
+  stays useful for its real case: two different speakers at very different mic levels. The actual
+  dominant force was `finish_audio`'s own hardcoded dialogue compressor (ratio 3:1 @ -18dB, no knob at
+  all) -- new `compress_strength` option scales it, and `compress_strength:0.0` (off) reproducibly
+  measured LRA 1.2 -> 1.4 LU AND word recall 88.3% -> 90.0% (improved). The absolute ceiling (everything
+  off) only reaches 2.3 LU and is not recall-safe. `compress_strength` defaults to 0.0: real, measured,
+  recall-positive. Never faked a number to call this done -- see CHANGELOG.md for the full sweep.
+- [~] **Whoosh SFX on b-roll cut-ins and the hook title-in** (new, off by default): a short procedural
+  rising-pitch tone (ffmpeg-synthesized at call time, same pattern as the existing keyword-pop SFX, no
+  bundled sample), on its own ducked SFX track. Built and TDD'd (real placement, real audibility, a
+  caller can turn it on with `whoosh_sfx: true` on `place_broll` or `auto_edit`), but on the real
+  benchmark it cost whisper word recall even at a low duck level -- 0.3 volume: 90.0% -> 86.7%; 0.15
+  volume (tried as a fix): 90.0% -> 80.0%, WORSE, not better, so this is not a simple louder-is-worse
+  curve and a third blind guess was not going to be a verified fix. Left at an audible 0.3 and defaulted
+  to FALSE rather than ship a recall regression as the default behaviour -- same standard as
+  `match_strength` above. A caller who wants the sound gets the real effect, with the cost disclosed in
+  the tool's own description.
+- [ ] **A visible, frame-verified b-roll gain** (colour/exposure match between the talking head and
+  b-roll, or a slow push on static b-roll) did not happen this pass -- the two audio investigations
+  above used the available time. Not claimed, not faked.
+
+New in v7.8.0: `tighten_pauses` (new tool, 521) shrinks the dead air a rough cut leaves INSIDE its own kept
+clips -- an interior breath between two phrases, or the lead-in pause before the first word -- down to a
+natural pad, auto-calibrating what counts as silence from the real recording's own noise floor rather than a
+fixed dB number (real room tone runs nowhere near a studio's); `auto_edit` runs it by default right after the
+rough cut. Far more consequential: found and fixed a serious pre-existing bug in `finish_audio`'s own
+dialogue-vs-ambience classifier -- real human speech was being misread as "ambience" and muted outright on
+real interview footage, present since finish_audio was first written (294 commits back), affecting every real
+render in this project's history, and invisible to every loudness/silence check because the mix's own gain
+trim just cranks up whatever survived the mute to hit the LUFS target. Caught by transcribing a shipped render
+and finding most of the real sentences missing; fixed, TDD'd against a real-footage excerpt, and given a
+permanent regression gate (`examples/auto_edit_benchmark.py --whisper-recall-source`, word recall vs the
+kept-span ceiling, default floor 90%). Also fixed a smaller real bug the same investigation turned up --
+`auto_rough_cut`'s own speech detector was losing the first ~0.5s of real words on a cold-open recording.
+Honest miss, disclosed not hidden: loudness range still reads ~1.2-1.4 LU against a 6-8 target on this one
+real clip, against a ~2.4-3.6 LU natural ceiling in the raw source itself. See CHANGELOG.md for numbers.
+
+
+## v7.8-Q: real-footage pacing + a serious pre-existing audio bug found and fixed
+
+- [x] `tighten_pauses` (new tool): shrinks interior dead air a rough cut leaves INSIDE its own kept clips
+  (a breath between two phrases, or the lead-in pause before the first word) to a natural pad, without
+  ever cutting mid-word. Auto-calibrates its own silence threshold from the real recording's noise floor
+  and quietest speech level (a fixed dB number missed real room tone entirely on the real benchmark).
+  Never leaves a surviving piece shorter than `min_piece_s` (default 1.0s): a short clip is read less
+  reliably by other per-clip tools downstream, and fragmenting too far raised the odds of exactly the bug
+  below. `auto_edit` runs it by default (new `pacing` option) right after the rough cut.
+- [x] **Found and fixed: `finish_audio` was silently muting most real dialogue as "ambience"** -- its own
+  per-clip speech_ratio classifier (aggressiveness 2) misread real human speech often enough that, on the
+  real benchmark interview, most of the spoken content came back muted while every loudness and silence
+  check still passed (the final gain-trim loop only ever levels whatever survived the mute, so it always
+  measures "on target"). Present since `finish_audio` was first written, confirmed by whisper transcripts
+  of every real render in this project's history reading back only a fraction of the source sentences.
+  Fixed by trying a less strict aggressiveness first (real speech reads confidently there) and rescuing
+  anything still missed at an even less strict level, gated at a higher bar so it doesn't just relabel
+  real background tone as dialogue. TDD against a real-footage excerpt sliced at test time (not committed
+  media). New permanent regression gate: `examples/auto_edit_benchmark.py --whisper-recall-source` fails
+  the run under 90% word recall (whisper) against the source dialogue.
+- [x] **Found and fixed: `auto_rough_cut` lost real opening words on a cold-open recording** -- its speech
+  detector (VAD) needs several consecutive confirming frames before declaring speech has started, costing
+  the first ~0.5s of real words on a recording that begins talking immediately with no lead-in silence
+  (confirmed: whisper hears real speech at the source's literal 0.0s). `recover_missed_onset` re-checks
+  only the very first kept segment of the whole output with a plain RMS silence probe (no VAD confirmation
+  delay) and recovers it when that window is not actually silence.
+- [x] **Made the recall gate honest**: `--whisper-recall-source` now gates word recall against the kept-
+  span CEILING (what `auto_rough_cut` itself decided to keep, re-derived and transcribed fresh), not the
+  full untrimmed source -- dead-air/filler trimming removes real words on purpose, so gating against the
+  untrimmed source punished correct editing alongside a real bug. Reports both numbers.
+- [~] **Loudness range (LRA) still short of the 6-8 LU brief on this one real clip**: measured honestly at
+  ~1.2-1.4 LU after this quarter's fixes, against a ~2.4-3.6 LU natural ceiling in the RAW unprocessed
+  source itself (checked directly, before any finish_audio processing) -- this specific calm interview
+  voice does not naturally carry 6-8 LU of dynamic range, and `finish_audio`'s per-clip gain-matching step
+  (every dialogue clip leveled to the loudest clip's average, a deliberate consistency feature, not
+  `level_dynamics`/speechnorm) is the dominant narrowing force, confirmed by testing with speech leveling
+  fully disabled (LRA barely moves, 1.4 vs 1.2). The prior real_v14 render's 7.1 LU reading almost
+  certainly reflects the finish_audio muting bug above (big silent-vs-loud swings from mostly-missing
+  dialogue), not healthy vocal dynamics -- not re-chased further this quarter; disclosed, not hidden.
 New in v7.7.0: another real-footage quality pass on `auto_edit`, not new tools -- `place_broll` now matches each b-roll cutaway to the words actually being said (a curated keyword table + filename fallback, falls back to given order when nothing matches, not a classifier) instead of just given order; `lint_edit`'s caption-over-face fix now nudges each page of a multi-page caption on its own sampled saliency peak instead of moving the whole group by one page's offset [~: the saliency check is a spectral-residual heuristic, not real face detection, so a busy background can still out-score a face and leave a partial overlap]; `auto_edit` gained a subscribe-style end screen (a pill badge that actually sizes to its own text, over a blurred freeze of the video's last frame, not flat black), on by default for a landscape edit and off for a vertical short. See CHANGELOG.md for the measured before/after on real footage.
 
 New in v7.6.0: a quality pass on `auto_edit`'s real-footage output, not new tools -- a boxed caption's background pill now hugs the actual text width instead of the wrap width; `finish_audio`'s loudness range narrows for real now (a loudness-neutral master-bus speech leveler, opt-out via `level_dynamics`); `add_punch_ins` gained opt-in `variety` so consecutive punch-in zooms don't all land at the exact same amount; `add_keyword_pops`'s `sfx:true` plays a real synthesized pop instead of its old no-op. See CHANGELOG.md for the measured before/after on real footage.
