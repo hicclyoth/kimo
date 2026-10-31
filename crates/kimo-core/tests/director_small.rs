@@ -1093,3 +1093,39 @@ fn pillarboxed_landscape(name: &str, dur: f64, canvas_w: u32, canvas_h: u32, ban
     let first_start = segs[0]["source"][0].as_f64().unwrap();
     assert!(first_start < 0.1, "the first kept segment should start at or near the real audio's own start (0.0s, confirmed real speech there), not {first_start}s: {rc}");
 }
+
+/// V8.0Q: match_shot_look pulls a target clip's own measured look toward a reference clip's -- the
+/// color/exposure MATCH auto_grade (an absolute, fixed-target tool) can't do: two shots that are each
+/// "fine" on their own but clash with each other (a warm-biased shot cut against a cool-biased one).
+#[test] fn match_shot_look_pulls_target_toward_reference() {
+    let mut ss = portrait(); let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let warm = sid(&call(&mut ss, "import_media", json!({"path": broll("msl_warm.mp4", 1.0, "colorchannelmixer=rr=1.35:gg=1.0:bb=0.55")})), "asset_id");
+    let cool = sid(&call(&mut ss, "import_media", json!({"path": broll("msl_cool.mp4", 1.0, "colorchannelmixer=rr=0.55:gg=1.0:bb=1.35")})), "asset_id");
+    let cref = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": warm, "start": 0, "duration": 1, "fit": "cover"})), "clip_id");
+    let ctgt = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": cool, "start": 1, "duration": 1, "fit": "cover"})), "clip_id");
+    let ref_rgb: Vec<f64> = call(&mut ss, "get_scopes", json!({"time": 0.5}))["avg_rgb"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let before_rgb: Vec<f64> = call(&mut ss, "get_scopes", json!({"time": 1.5}))["avg_rgb"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let dist = |a: &[f64], b: &[f64]| -> f64 { (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt() };
+    let gap_before = dist(&ref_rgb, &before_rgb);
+    assert!(gap_before > 0.03, "the two test clips should actually look different before matching: ref {ref_rgb:?} vs target {before_rgb:?}");
+
+    let r = call(&mut ss, "match_shot_look", json!({"reference_clip_ids": [cref.clone()], "target_clip_ids": [ctgt.clone()], "strength": 1.0}));
+    assert!(r["matched"].as_array().unwrap().iter().any(|m| m["clip_id"] == json!(ctgt)), "{r}");
+    let after_rgb: Vec<f64> = call(&mut ss, "get_scopes", json!({"time": 1.5}))["avg_rgb"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let gap_after = dist(&ref_rgb, &after_rgb);
+    assert!(gap_after < gap_before * 0.5, "match_shot_look should have closed most of the color gap: before {gap_before:.4}, after {gap_after:.4} ({r})");
+    // the reference clip itself is untouched.
+    let ref_rgb_after: Vec<f64> = call(&mut ss, "get_scopes", json!({"time": 0.5}))["avg_rgb"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(dist(&ref_rgb, &ref_rgb_after) < 1e-6, "the reference clip should never itself be graded: {ref_rgb:?} -> {ref_rgb_after:?}");
+}
+
+/// A clip named in both reference_clip_ids and target_clip_ids is left alone (it IS the reference look;
+/// grading it against itself would be a no-op at best, a confusing double-count at worst).
+#[test] fn match_shot_look_skips_a_clip_that_is_its_own_reference() {
+    let mut ss = portrait(); let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let a = sid(&call(&mut ss, "import_media", json!({"path": broll("msl_self.mp4", 1.0, "")})), "asset_id");
+    let c = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": a, "start": 0, "duration": 1, "fit": "cover"})), "clip_id");
+    let r = call(&mut ss, "match_shot_look", json!({"reference_clip_ids": [c.clone()], "target_clip_ids": [c.clone()]}));
+    assert!(r["skipped"].as_array().unwrap().iter().any(|s| s["clip_id"] == json!(c)), "{r}");
+    assert!(r["matched"].as_array().unwrap().is_empty(), "{r}");
+}

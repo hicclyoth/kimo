@@ -278,3 +278,38 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(r["ok"] == json!(true), "{r}");
     assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("no music_asset_id given")), "expected a warning that the end card has nothing under it: {r}");
 }
+
+/// V8.0Q: auto_grade alone only pulls each clip toward one fixed absolute target, so a warm-biased talking
+/// head and a cool-biased b-roll can both already be "fine" individually and still clash on the cut.
+/// broll_color_match (default on whenever there is b-roll) runs match_shot_look with the dialogue clips as
+/// the reference and the b-roll clips as the target, closing that gap -- disabled by grade:false here so
+/// this test isolates the new stage instead of measuring auto_grade's own separate effect.
+#[test] fn broll_color_match_runs_by_default_and_can_be_turned_off() {
+    let th_path = dir().join("ccm_th.mp4");
+    if !th_path.exists() {
+        let a = "aevalsrc='(between(t,0,4))*0.6*(0.25*sin(2*PI*140*t)+0.15*sin(2*PI*280*t+1)+0.1*sin(2*PI*420*t+2))*(0.55+0.45*sin(2*PI*4.3*t))':s=48000:d=4";
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4", "-f", "lavfi", "-i", a, "-vf", "colorbalance=rs=0.3:bs=-0.3",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", th_path.to_str().unwrap()]);
+    }
+    let broll_path = dir().join("ccm_broll.mp4");
+    if !broll_path.exists() {
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=3", "-vf", "colorbalance=rs=-0.3:bs=0.3", "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", broll_path.to_str().unwrap()]);
+    }
+
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": th_path.to_str().unwrap()})), "asset_id");
+    let bm = sid(&call(&mut ss, "import_media", json!({"path": broll_path.to_str().unwrap()})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "broll_asset_ids": [bm], "captions": false, "punch_ins": false, "grade": false, "end_screen": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    assert!(r["stages"]["broll_color_match"].is_object(), "b-roll color match should run by default when there is b-roll: {r}");
+    let matched = r["stages"]["broll_color_match"]["matched"].as_array().unwrap();
+    assert!(!matched.is_empty(), "expected at least one b-roll clip matched toward the talking head's look: {r}");
+
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": th_path.to_str().unwrap()})), "asset_id");
+    let bm2 = sid(&call(&mut ss2, "import_media", json!({"path": broll_path.to_str().unwrap()})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "broll_asset_ids": [bm2], "captions": false, "punch_ins": false, "grade": false, "end_screen": false, "broll_color_match": false}));
+    assert!(r2["ok"] == json!(true), "{r2}");
+    assert!(r2["stages"]["broll_color_match"].is_null(), "broll_color_match:false should skip the stage entirely: {r2}");
+}

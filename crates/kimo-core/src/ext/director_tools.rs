@@ -776,6 +776,62 @@ fn auto_grade(ss: &mut Session, a: &Value) -> Result<Value, String> {
     Ok(json!({"graded": out, "skipped": skipped, "note": "per clip: grey-world white balance + exposure toward target_luma, gains clamped; undo reverts all of it"}))
 }
 
+// ---------------------------------------------------------------- match_shot_look
+/// V8.0Q: auto_grade pulls every clip toward one fixed absolute target (target_luma, neutral cast) --
+/// it never looks at what ANOTHER shot in the same edit actually looks like. That is the wrong tool for the
+/// most common real cut: a talking-head shot indoors under warm tungsten light, cut against b-roll shot
+/// outdoors in daylight or at night -- each gets neutralized toward the same generic target but neither is
+/// pulled toward the OTHER, so the cut still reads as two different shoots stitched together (measured on
+/// the real benchmark footage: the talking head reads warm/orange ~2900K, the city b-roll reads cool/blue,
+/// the coffee b-roll reads bright daylight-white -- auto_grade alone does nothing about that mismatch since
+/// both already sit inside its "well exposed and neutral enough" band).
+///
+/// match_shot_look measures a REFERENCE shot's own look (mean RGB, averaged across reference_clip_ids at
+/// each clip's own midpoint) and pulls each target clip's own measured mean RGB a `strength` fraction of the
+/// way toward it -- white balance and exposure together, in one gain, since both the cast mismatch and the
+/// brightness mismatch are part of the same "doesn't match the interview" problem. Reuses mean_rgb/luma (the
+/// exact reader auto_grade already uses, so this measures what fit/crop actually puts on screen, not the raw
+/// source) and set_color_wheels (updating the clip's own primaries grade in place if auto_grade already gave
+/// it one, so the two never stack two separate grades on the same clip -- auto_grade should run first in the
+/// pipeline, matching second, same as any other color pass that needs the base exposure already sane).
+fn match_shot_look(ss: &mut Session, a: &Value) -> Result<Value, String> {
+    let strength = opt_num(a, "strength", 0.6).clamp(0.0, 1.0);
+    let ref_ids = str_list(a, "reference_clip_ids")?;
+    if ref_ids.is_empty() { return Err("reference_clip_ids: give one or more clip ids whose look the target clips should be pulled toward".into()); }
+    let target_ids = str_list(a, "target_clip_ids")?;
+    if target_ids.is_empty() { return Err("target_clip_ids: give one or more clip ids to pull toward the reference look".into()); }
+    let read = |ss: &Session, id: &str| -> Result<[f64; 3], String> {
+        let c = ss.project.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| &c.id == id).cloned().ok_or_else(|| format!("unknown clip '{id}'"))?;
+        let Source::Media { asset: aid } = &c.source else { return Err(format!("clip '{id}' is not a media clip")) };
+        let asset = ss.project.assets.get(aid).cloned().ok_or_else(|| format!("clip '{id}': unknown asset"))?;
+        let fit = c.props.get("fit").map(|q| q.at(0.0)).unwrap_or(0.0);
+        mean_rgb(&crate::deps::resolve_str(&asset.path), c.in_point + c.duration * c.speed / 2.0, fit, ss.project.width, ss.project.height)
+            .ok_or_else(|| format!("clip '{id}': could not read a frame"))
+    };
+    let mut ref_sum = [0.0; 3]; let mut ref_n = 0usize;
+    for id in &ref_ids { let m = read(ss, id)?; for k in 0..3 { ref_sum[k] += m[k]; } ref_n += 1; }
+    let ref_mean = [ref_sum[0] / ref_n as f64, ref_sum[1] / ref_n as f64, ref_sum[2] / ref_n as f64];
+    let mut out = vec![]; let mut skipped = vec![];
+    for id in &target_ids {
+        if ref_ids.contains(id) { skipped.push(json!({"clip_id": id, "why": "also a reference clip; left as the reference look itself"})); continue; }
+        let m = match read(ss, id) { Ok(v) => v, Err(e) => { skipped.push(json!({"clip_id": id, "why": e})); continue; } };
+        let l_before = luma(m);
+        // Pull each channel's own measured mean a `strength` fraction of the way toward the reference's
+        // mean (white balance and exposure together, since the gap between two different shoots is both at
+        // once); clamped the same as auto_grade's own per-channel bound so this can never crush or blow a
+        // shot even when the reference is very different (a bright daylight b-roll against a dim interview).
+        let ch: Vec<f64> = (0..3).map(|k| (ref_mean[k] / m[k].max(1e-3)).powf(strength).clamp(0.5, 2.0)).collect();
+        let c = ss.project.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| &c.id == id).unwrap();
+        let mut wargs = json!({"clip_id": id, "gain": [r3(ch[0]), r3(ch[1]), r3(ch[2]), 1.0]});
+        if let Some(fx) = c.effects.iter().find(|e| e.kind == "primaries") { wargs["effect_id"] = json!(fx.id); }
+        call(ss, "set_color_wheels", &wargs)?;
+        let bal = [m[0] * ch[0], m[1] * ch[1], m[2] * ch[2]];
+        out.push(json!({"clip_id": id, "luma_before": r3(l_before), "luma_after_expected": r3(luma(bal).min(1.0)), "gain": [r3(ch[0]), r3(ch[1]), r3(ch[2])]}));
+    }
+    Ok(json!({"reference_mean_rgb": ref_mean.map(r3), "matched": out, "skipped": skipped, "strength": strength,
+        "note": "each target clip's own measured mean pulled `strength` of the way toward the reference clips' averaged look; undo reverts all of it"}))
+}
+
 // ---------------------------------------------------------------- cut_to_beat
 fn cut_to_beat(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let music = str_arg(a, "music_asset_id")?.to_string(); let (mpath, mdur) = asset(ss, &music)?;
@@ -1223,6 +1279,8 @@ pub fn commands() -> Vec<Command> {
                 ("compress_strength", n("0..1, dialogue compressor ratio scale, default 0.0 (off; 1.0=old fixed 3:1)"))], &[]), run: |ss, a| atomic(ss, a, finish_audio) },
         Command { name: "auto_grade", description: "Fix each clip's exposure and colour cast from a measured frame; gains are clamped so no shot goes black or blown.", mutates: true,
             schema: obj(vec![("clip_ids", ids("default: every media clip")), ("strength", n("0..1, default 0.85")), ("target_luma", n("0.2..0.7, default 0.42"))], &[]), run: |ss, a| atomic(ss, a, auto_grade) },
+        Command { name: "match_shot_look", description: "Pull each target clip's own measured white balance and exposure a `strength` fraction toward a reference shot's measured look -- the color match a cut needs when b-roll was shot in different light than the talking head (auto_grade alone only neutralizes each clip toward one fixed absolute target, never toward another shot in the same edit). Run after auto_grade.", mutates: true,
+            schema: obj(vec![("reference_clip_ids", ids("clip(s) whose averaged look is the target")), ("target_clip_ids", ids("clip(s) to pull toward it")), ("strength", n("0..1, default 0.6 (a tasteful nudge, not a full equalize)"))], &["reference_clip_ids", "target_clip_ids"]), run: |ss, a| atomic(ss, a, match_shot_look) },
         Command { name: "cut_to_beat", description: "Music reel in one call: lays the music and cuts the shots exactly on its beats, N beats per shot. Returns clip ids.", mutates: true,
             schema: obj(vec![("music_asset_id", s("imported music")), ("asset_ids", ids("shots in order (reused in turn if more shots are needed)")), ("beats_per_shot", n("default 4")), ("duration", n("target seconds (default: one shot per asset)")),
                 ("start", n("timeline seconds, default 0")), ("in_points", json!({"type": "object", "description": "optional {asset_id: source seconds}"}))], &["music_asset_id", "asset_ids"]), run: |ss, a| atomic(ss, a, cut_to_beat) },

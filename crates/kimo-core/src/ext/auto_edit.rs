@@ -2,7 +2,8 @@
 //! sensible defaults -- rough cut (dead air out) -> b-roll placement (RV-33: matched to the words spoken,
 //! given a transcript) -> jump-cut punch-ins (only on the segments that stay on screen, so the zoom is never
 //! hidden under b-roll) -> word-synced captions -> an optional cold-open hook title -> an optional music bed
-//! -> auto color -> a final audio mix to a YouTube loudness target -> a subscribe-style end screen -> lint_edit's
+//! -> auto color -> a b-roll color/exposure match to the talking head -> a final audio mix to a YouTube
+//! loudness target -> a subscribe-style end screen -> lint_edit's
 //! own review, auto-applying whatever it can fix by itself. Built because an
 //! agent handed a folder of raw clips had no single call for "edit this well"; it had to compose eight-plus
 //! tool calls in the right order to get a result that didn't look assembled by hand. Every stage below is an
@@ -54,6 +55,13 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let punch_scale = opt_num(a, "punch_scale", 1.15).clamp(1.01, 3.0);
     let punch_on = a.get("punch_ins").and_then(|v| v.as_bool()).unwrap_or(true);
     let grade_on = a.get("grade").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.0Q: on by default whenever there's a dialogue clip and at least one b-roll clip to match -- the
+    // free color-cohesion win a raw auto-cut never gets (measured on the real benchmark: an indoor warm
+    // talking head cut against a cool-toned city b-roll and a bright-daylight coffee b-roll, each already
+    // "well exposed and neutral" by auto_grade's own absolute band, so auto_grade alone left the mismatch
+    // untouched). Off entirely for callers who want their own look preserved.
+    let broll_match_on = a.get("broll_color_match").and_then(|v| v.as_bool()).unwrap_or(true);
+    let broll_match_strength = a.get("broll_color_match_strength").and_then(|v| v.as_f64());
     let platform = a.get("platform").and_then(|v| v.as_str()).unwrap_or("none").to_string();
     // default on for the landscape/youtube-style edit (platform none); a vertical short usually ends on
     // whatever the platform's own UI shows next, so it defaults off there unless explicitly asked for.
@@ -126,12 +134,13 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // With the transcript above, each cutaway is matched to the clip whose name/tags fit what's said right
     // then (RV-33); without it (no speech recognized, or recognition skipped), it falls back to given order.
     let mut broll_ranges: Vec<(f64, f64)> = vec![];
+    let mut broll_clip_ids: Vec<String> = vec![];
     if !broll_ids.is_empty() {
         let mut broll_args = json!({"track_id": track_id, "asset_ids": broll_ids});
         if !transcript_words.is_empty() { broll_args["words"] = json!(transcript_words); }
         if let Some(v) = whoosh_sfx { broll_args["whoosh_sfx"] = json!(v); }
         let br = call(ss, "place_broll", &broll_args)?;
-        if let Some(arr) = br["clips"].as_array() { for c in arr { if let (Some(s), Some(e)) = (c["start"].as_f64(), c["end"].as_f64()) { broll_ranges.push((s, e)); } } }
+        if let Some(arr) = br["clips"].as_array() { for c in arr { if let (Some(s), Some(e)) = (c["start"].as_f64(), c["end"].as_f64()) { broll_ranges.push((s, e)); } if let Some(cid) = c["clip_id"].as_str() { broll_clip_ids.push(cid.to_string()); } } }
         stages.insert("broll".into(), br);
     } else {
         warnings.push("no broll_asset_ids given: the talking head runs with no cutaways".into());
@@ -245,6 +254,20 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         stages.insert("grade".into(), grade);
     }
 
+    // 7b. B-roll color/exposure match to the talking head: auto_grade (just above) only pulls every clip
+    // toward one fixed absolute target, so two shots from different light still clash after it runs. This
+    // runs auto_grade's primaries grade as the starting point and nudges it further, toward the dialogue's
+    // own measured look specifically -- the match a real cut needs, not just "neither shot is blown out".
+    if broll_match_on && !broll_clip_ids.is_empty() {
+        let reference_clip_ids: Vec<String> = dialogue_clips.iter().map(|(id, _, _)| id.clone()).collect();
+        let mut match_args = json!({"reference_clip_ids": reference_clip_ids, "target_clip_ids": broll_clip_ids});
+        if let Some(v) = broll_match_strength { match_args["strength"] = json!(v); }
+        match call(ss, "match_shot_look", &match_args) {
+            Ok(m) => { stages.insert("broll_color_match".into(), m); }
+            Err(e) => warnings.push(format!("b-roll color match skipped: {e}")),
+        }
+    }
+
     // 8. Final mix: clean dialogue, b-roll sound off, music under speech, mix to the loudness target.
     let mut finish_args = json!({"target_lufs": target_lufs});
     if let Some(v) = level_dynamics { finish_args["level_dynamics"] = json!(v); }
@@ -346,6 +369,8 @@ pub fn commands() -> Vec<Command> {
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),
                 ("grade", json!({"type": "boolean", "description": "default true: auto_grade every clip"})),
+                ("broll_color_match", json!({"type": "boolean", "description": "default true (when there is b-roll): pull each b-roll clip's own measured look toward the talking head's, so a cut against footage shot in different light still reads as one edit"})),
+                ("broll_color_match_strength", n("0..1, default 0.6, how fully each b-roll clip is pulled toward the talking head's look")),
                 ("target_lufs", n("final mix loudness target, default -14 (YouTube)")),
                 ("platform", s("passed to lint_edit/apply_review_fixes: tiktok|reels|shorts|none (default none)")),
                 ("level_dynamics", json!({"type": "boolean", "description": "passed to finish_audio: gentle speech leveling, default true"})),
