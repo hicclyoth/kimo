@@ -313,3 +313,34 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(r2["ok"] == json!(true), "{r2}");
     assert!(r2["stages"]["broll_color_match"].is_null(), "broll_color_match:false should skip the stage entirely: {r2}");
 }
+
+/// V8.0Q: once the dialogue ends there is nothing left for the music to duck under, but finish_audio/
+/// duck_timeline both only ever set the bed's level for use UNDER speech -- without a swell the end card
+/// plays against the same quiet, ducked-for-speech level, which reads as the music timidly trailing off
+/// right when there's no voice left to protect. Proves the music clip gets a real ramp-up keyed right where
+/// the end card starts.
+#[test] fn music_bed_swells_under_the_end_card_once_dialogue_ends() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("swell_th.mp4", &[(0.0, 4.0)], 0.0)})), "asset_id");
+    let m = sid(&call(&mut ss, "import_media", json!({"path": music("swell_bed.wav", 12.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "music_asset_id": m, "captions": false, "grade": false, "punch_ins": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let dialogue_dur = r["duration"].as_f64().unwrap();
+    assert!(r["total_duration"].as_f64().unwrap() > dialogue_dur, "end screen should be on by default here: {r}");
+    let music_cid = sid(&r["stages"]["music"], "clip_id");
+    let c = ss.project.find_clip(&music_cid).unwrap();
+    assert!(c.audio.volume.keys.len() >= 2, "expected a swell ramp keyframed on the music clip's volume once the end card starts, got {} key(s): {:?}", c.audio.volume.keys.len(), c.audio.volume.keys);
+    let local_card_start = dialogue_dur - c.start;
+    let before = c.audio.volume.at((local_card_start - 0.01).max(0.0));
+    let after = c.audio.volume.at(local_card_start + 0.35);
+    assert!(after > before * 1.5, "music should swell up once the dialogue ends (no more voice to duck for): before {before:.4}, after {after:.4}");
+
+    // end_screen:false -- no card, nothing to swell for.
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": talk("swell_noes_th.mp4", &[(0.0, 4.0)], 0.0)})), "asset_id");
+    let m2 = sid(&call(&mut ss2, "import_media", json!({"path": music("swell_noes_bed.wav", 12.0)})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "music_asset_id": m2, "captions": false, "grade": false, "punch_ins": false, "end_screen": false}));
+    let music_cid2 = sid(&r2["stages"]["music"], "clip_id");
+    let c2 = ss2.project.find_clip(&music_cid2).unwrap();
+    assert!(c2.audio.volume.keys.is_empty(), "no end screen means nothing to swell for: expected no volume keys, got {:?}", c2.audio.volume.keys);
+}

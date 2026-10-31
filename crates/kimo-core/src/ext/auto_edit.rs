@@ -347,6 +347,36 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     }
     stages.insert("review".into(), fixes);
 
+    // 10. End-card music swell: once the dialogue ends there is nothing left for the music to duck under,
+    // but finish_audio/duck_timeline both only ever set the bed's level for USE UNDER SPEECH -- measured on
+    // real_v21, the end card's own span played ~12.6 LU quieter than the speech body (no voice to protect
+    // there, so there is nothing pulling the bed back up). A short ramp (starting right where the dialogue
+    // ends, finishing before the card is even readable) brings the bed up to a normal "voice is gone, let
+    // the music breathe" level; the segment's own tail fade_out (job 1, set when the music clip was built
+    // in step 6) still takes it back down to silence in its last <=0.5s, unchanged by this. Runs LAST, after
+    // apply_review_fixes (step 9): a review fix that re-invokes finish_audio replaces a clip's whole volume
+    // Prop (Prop::new, dropping any keys) rather than merging into it, so a swell keyed any earlier in the
+    // pipeline could be silently wiped by the review pass -- this is the one stage guaranteed to survive.
+    const END_CARD_SWELL_DB: f64 = 8.0;
+    const END_CARD_SWELL_RAMP_S: f64 = 0.3;
+    if end_screen_on {
+        if let Some(mt) = &music_track_id {
+            let boost = 10f64.powf(END_CARD_SWELL_DB / 20.0);
+            let clips: Vec<(String, f64, f64)> = ss.project.tracks.iter().find(|t| &t.id == mt).map(|t| t.clips.iter().map(|c| (c.id.clone(), c.start, c.duration)).collect()).unwrap_or_default();
+            for (cid, cstart, cdur) in clips {
+                let cend = cstart + cdur;
+                if cend <= edit_duration + 1e-6 { continue; } // this segment ends before the card starts; nothing to swell
+                let local_start = (edit_duration - cstart).max(0.0);
+                let local_ramp_end = (local_start + END_CARD_SWELL_RAMP_S).min(cdur);
+                let base = ss.project.find_clip(&cid).map(|c| c.audio.volume.at(local_start)).unwrap_or(1.0);
+                call(ss, "set_audio_volume_key", &json!({"clip_id": cid, "time": r3(local_start), "value": r3(base)}))?;
+                if local_ramp_end > local_start + 1e-6 {
+                    call(ss, "set_audio_volume_key", &json!({"clip_id": cid, "time": r3(local_ramp_end), "value": r3(base * boost)}))?;
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
         "stages": stages, "warnings": warnings, "lint_clean": lint_ok, "remaining_problems": remaining,
