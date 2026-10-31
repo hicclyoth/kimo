@@ -229,3 +229,45 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     });
     assert!(covers_end_screen, "expected a media (the frozen/blurred last-frame background) clip spanning the whole end-screen card, found none after review");
 }
+
+/// V8.0Q: without this fix, a default-on end screen played over true digital silence -- the music clip's own
+/// length only ever targeted the talking-head span (edit_duration), so by the time the end card's background
+/// clip (muted on purpose) covered the last 2-4s, nothing else was left playing. Proves the music clip's own
+/// length now reaches the full planned export (end screen included) and carries a tail fade so it winds down
+/// instead of hard-cutting at export's edge.
+#[test] fn music_bed_keeps_playing_under_the_end_screen() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("es_music_th.mp4", &[(0.0, 4.0)], 0.0)})), "asset_id");
+    let m = sid(&call(&mut ss, "import_media", json!({"path": music("es_music_bed.wav", 12.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "music_asset_id": m, "captions": false, "grade": false, "punch_ins": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let total = r["total_duration"].as_f64().unwrap();
+    let dialogue_dur = r["duration"].as_f64().unwrap();
+    assert!(total > dialogue_dur, "end screen should be on by default here: {r}");
+
+    let music_cid = sid(&r["stages"]["music"], "clip_id");
+    let c = ss.project.find_clip(&music_cid).unwrap();
+    assert!(c.start + c.duration >= total - 0.05, "music clip (ends at {}) should cover the whole planned export (end screen included, ends at {total})", c.start + c.duration);
+    assert!(c.audio.fade_out > 0.0, "the music bed's tail should fade out instead of hard-cutting at export's edge, got fade_out={}", c.audio.fade_out);
+
+    // A music asset shorter than the full planned export: it should still play as much as it can (full
+    // asset length) and warn honestly instead of silently leaving the rest on dead air.
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": talk("es_music_short_th.mp4", &[(0.0, 4.0)], 0.0)})), "asset_id");
+    let m2 = sid(&call(&mut ss2, "import_media", json!({"path": music("es_music_short_bed.wav", 3.0)})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "music_asset_id": m2, "captions": false, "grade": false, "punch_ins": false}));
+    let music_cid2 = sid(&r2["stages"]["music"], "clip_id");
+    let c2 = ss2.project.find_clip(&music_cid2).unwrap();
+    assert!((c2.duration - 3.0).abs() < 0.05, "a short music asset should still play its full length: {}", c2.duration);
+    assert!(r2["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("shorter than the edit plus end screen")), "expected an honest warning that the music is too short to cover the end card: {r2}");
+}
+
+/// No music at all, end screen on by default: the chain should say so honestly (not silently ship dead air
+/// with no comment).
+#[test] fn end_screen_with_no_music_warns_about_the_silent_tail() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("es_nomusic_th.mp4", &[(0.0, 2.0)], 0.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "captions": false, "grade": false, "punch_ins": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("no music_asset_id given")), "expected a warning that the end card has nothing under it: {r}");
+}

@@ -184,16 +184,36 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // that) layers a dynamic envelope on top through duck_gain, a SEPARATE multiplier from volume -- the two
     // never fight. Without this the bed sits at one flat level the whole edit: no swell in the gaps, no real
     // give-and-take with the voice, the "lifeless" mix a static level-match alone produces.
+    //
+    // V8.0Q: the music bed's length targets the FULL planned export (end screen included, when end_screen_on
+    // -- end_screen_duration is already resolved above, before this stage runs), not just the talking-head
+    // span. Before this, every default-on end screen landed on true digital silence: the dialogue track has
+    // no clip past edit_duration and the end screen's own background clip is explicitly muted, so the
+    // subscribe card played over nothing. A short fade_out on the music clip's own tail (set_audio) means it
+    // winds down instead of hard-cutting at export's edge, whether that edge lands mid-card or (no end
+    // screen) right at the last word.
+    let planned_total_duration = edit_duration + if end_screen_on { end_screen_duration } else { 0.0 };
     let mut music_track_id: Option<String> = None;
     if let Some(mid) = &music_id {
         let mdur = ss.project.assets.get(mid).map(|x| x.duration).unwrap_or(0.0);
         if mdur <= 0.0 { warnings.push(format!("music_asset_id '{mid}' has no measurable duration; music bed skipped")); }
         else {
             let mt = new_track(ss)?;
-            let clip = call(ss, "add_clip", &json!({"track_id": mt, "source_type": "media", "asset_id": mid, "start": 0.0, "duration": edit_duration.min(mdur)}))?;
+            let music_len = planned_total_duration.min(mdur);
+            let clip = call(ss, "add_clip", &json!({"track_id": mt, "source_type": "media", "asset_id": mid, "start": 0.0, "duration": music_len}))?;
+            let mcid = clip["clip_id"].as_str().map(str::to_string);
+            if let Some(mcid) = &mcid {
+                let fade = 1.2_f64.min(music_len * 0.5).max(0.05);
+                call(ss, "set_audio", &json!({"clip_id": mcid, "fade_out": fade}))?;
+            }
+            if end_screen_on && music_len + 0.05 < planned_total_duration {
+                warnings.push(format!("music_asset_id '{mid}' ({mdur:.1}s) is shorter than the edit plus end screen ({planned_total_duration:.1}s); the end card plays without music under it"));
+            }
             stages.insert("music".into(), clip);
             music_track_id = Some(mt);
         }
+    } else if end_screen_on {
+        warnings.push("no music_asset_id given: the end screen plays over whatever is left of the dialogue track's own room tone (silence once speech ends) -- pass a music_asset_id so the card doesn't land on dead air".into());
     }
 
     // 7. Color: neutralise cast / fix exposure on every clip auto_grade can read (talking head + b-roll).
