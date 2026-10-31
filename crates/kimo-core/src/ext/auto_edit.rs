@@ -199,17 +199,40 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         if mdur <= 0.0 { warnings.push(format!("music_asset_id '{mid}' has no measurable duration; music bed skipped")); }
         else {
             let mt = new_track(ss)?;
-            let music_len = planned_total_duration.min(mdur);
-            let clip = call(ss, "add_clip", &json!({"track_id": mt, "source_type": "media", "asset_id": mid, "start": 0.0, "duration": music_len}))?;
-            let mcid = clip["clip_id"].as_str().map(str::to_string);
-            if let Some(mcid) = &mcid {
-                let fade = 1.2_f64.min(music_len * 0.5).max(0.05);
-                call(ss, "set_audio", &json!({"clip_id": mcid, "fade_out": fade}))?;
+            // A music asset shorter than the full planned export (talking head + end screen) is tiled from
+            // its own start -- a real editor loops a short bed rather than letting it run out under the
+            // card -- capped at 200 repeats so a near-zero-length asset can't spin this into thousands of
+            // clips; past that cap it plays once, honestly, and the warning below says why the tail is bare.
+            const MAX_LOOP_SEGMENTS: usize = 200;
+            let segment_count = if mdur >= planned_total_duration { 1 } else { ((planned_total_duration / mdur).ceil() as usize).max(1).min(MAX_LOOP_SEGMENTS) };
+            let loop_fade = 0.15_f64.min(mdur * 0.1);
+            let mut segments: Vec<(String, f64)> = vec![]; // (clip_id, this segment's own length)
+            let mut t = 0.0;
+            for i in 0..segment_count {
+                let remaining = planned_total_duration - t;
+                if remaining <= 1e-6 { break; }
+                let seg_len = remaining.min(mdur);
+                let clip = call(ss, "add_clip", &json!({"track_id": mt, "source_type": "media", "asset_id": mid, "start": t, "duration": seg_len, "in_point": 0.0}))?;
+                if i == 0 { stages.insert("music".into(), clip.clone()); }
+                if let Some(cid) = clip["clip_id"].as_str() { segments.push((cid.to_string(), seg_len)); }
+                t += seg_len;
             }
-            if end_screen_on && music_len + 0.05 < planned_total_duration {
-                warnings.push(format!("music_asset_id '{mid}' ({mdur:.1}s) is shorter than the edit plus end screen ({planned_total_duration:.1}s); the end card plays without music under it"));
+            let covered = t;
+            let n = segments.len();
+            for (i, (cid, seg_len)) in segments.iter().enumerate() {
+                let is_last = i + 1 == n;
+                // Every loop seam gets a short fade_out/fade_in so a bed shorter than the edit blends
+                // instead of popping at each repeat; the true tail (the last segment's own end) instead
+                // winds all the way down to silence over up to 0.5s, matching the end card's own fade.
+                let fade_out = if is_last { 0.5_f64.min(*seg_len) } else { loop_fade.min(*seg_len * 0.5) };
+                let fade_in = if i > 0 { loop_fade.min(*seg_len * 0.5) } else { 0.0 };
+                let mut set = json!({"clip_id": cid, "fade_out": fade_out});
+                if fade_in > 0.0 { set["fade_in"] = json!(fade_in); }
+                call(ss, "set_audio", &set)?;
             }
-            stages.insert("music".into(), clip);
+            if end_screen_on && covered + 0.05 < planned_total_duration {
+                warnings.push(format!("music_asset_id '{mid}' ({mdur:.1}s) could not be looped enough times (capped at {MAX_LOOP_SEGMENTS}) to cover the edit plus end screen ({planned_total_duration:.1}s); the last {:.1}s of the end card plays without music under it", planned_total_duration - covered));
+            }
             music_track_id = Some(mt);
         }
     } else if end_screen_on {

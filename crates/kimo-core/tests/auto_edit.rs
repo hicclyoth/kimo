@@ -10,6 +10,7 @@ fn dir() -> PathBuf { let d = std::env::temp_dir().join(format!("kimo_auto_edit_
 fn ffmpeg(args: &[&str]) { let st = Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).stdin(Stdio::null()).status().expect("ffmpeg"); assert!(st.success(), "ffmpeg {args:?}"); }
 fn call(ss: &mut Session, name: &str, a: Value) -> Value { dispatch(ss, name, &a).unwrap_or_else(|e| panic!("{name} {a}: {e}")) }
 fn sid(v: &Value, k: &str) -> String { v[k].as_str().unwrap_or_else(|| panic!("no {k} in {v}")).to_string() }
+fn music_track_for(ss: &Session, clip_id: &str) -> String { ss.project.tracks.iter().find(|t| t.clips.iter().any(|c| c.id == clip_id)).unwrap_or_else(|| panic!("no track holds clip {clip_id}")).id.clone() }
 
 /// A talking-head stand-in: a voice-like tone in the given speech windows over a quiet noise floor, with
 /// `dead` seconds of true silence stitched in up front so auto_rough_cut has real dead air to cut.
@@ -250,16 +251,22 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(c.start + c.duration >= total - 0.05, "music clip (ends at {}) should cover the whole planned export (end screen included, ends at {total})", c.start + c.duration);
     assert!(c.audio.fade_out > 0.0, "the music bed's tail should fade out instead of hard-cutting at export's edge, got fade_out={}", c.audio.fade_out);
 
-    // A music asset shorter than the full planned export: it should still play as much as it can (full
-    // asset length) and warn honestly instead of silently leaving the rest on dead air.
+    // A music asset shorter than the full planned export: it should be LOOPED (tiled from its own start)
+    // to cover the whole thing rather than running out under the card -- no warning, because the loop made
+    // it whole.
     let mut ss2 = proj();
     let a2 = sid(&call(&mut ss2, "import_media", json!({"path": talk("es_music_short_th.mp4", &[(0.0, 4.0)], 0.0)})), "asset_id");
     let m2 = sid(&call(&mut ss2, "import_media", json!({"path": music("es_music_short_bed.wav", 3.0)})), "asset_id");
     let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "music_asset_id": m2, "captions": false, "grade": false, "punch_ins": false}));
-    let music_cid2 = sid(&r2["stages"]["music"], "clip_id");
-    let c2 = ss2.project.find_clip(&music_cid2).unwrap();
-    assert!((c2.duration - 3.0).abs() < 0.05, "a short music asset should still play its full length: {}", c2.duration);
-    assert!(r2["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("shorter than the edit plus end screen")), "expected an honest warning that the music is too short to cover the end card: {r2}");
+    assert!(r2["ok"] == json!(true), "{r2}");
+    let total2 = r2["total_duration"].as_f64().unwrap();
+    let music_track2 = music_track_for(&ss2, &sid(&r2["stages"]["music"], "clip_id"));
+    let mut music_clips: Vec<_> = ss2.project.tracks.iter().find(|t| t.id == music_track2).unwrap().clips.iter().map(|c| (c.start, c.duration)).collect();
+    music_clips.sort_by(|a, b| a.0.total_cmp(&b.0));
+    assert!(music_clips.len() > 1, "a 3s music bed under a ~{total2:.1}s export should have looped into more than one clip, got {}", music_clips.len());
+    let covered_end = music_clips.last().unwrap().0 + music_clips.last().unwrap().1;
+    assert!(covered_end >= total2 - 0.05, "looped music clips (last one ends at {covered_end}) should still cover the full export ({total2})");
+    assert!(!r2["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("could not be looped enough")), "a 3s bed looping into a ~{total2:.1}s export is well under the 200-segment cap, should not have warned: {r2}");
 }
 
 /// No music at all, end screen on by default: the chain should say so honestly (not silently ship dead air
