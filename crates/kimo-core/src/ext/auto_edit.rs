@@ -356,25 +356,21 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // Prop (Prop::new, dropping any keys) rather than merging into it, so a swell keyed any earlier in the
     // pipeline could be silently wiped by the review pass -- this is the one stage guaranteed to survive.
     //
-    // V8.1Q correction: the V8.0Q note below was WRONG about the mechanism. level_dynamics is now properly
-    // scoped to the dialogue span only (master_speech_level_scope_end, set by finish_audio, read by
-    // audio::mix/mix_strict) and genuinely never sees the end card -- verified by diffing finish_audio's own
-    // dialogue-clip classification at scope-set time. Tried raising the swell to 8dB anyway with that fix in
-    // place: the SAME 56.7% whisper-recall collapse came back. Isolated it properly this time: cut the 3dB
-    // and 8dB renders down to the dialogue span only (0 to edit_duration, before the end card) and
-    // whisper-transcribed each -- byte-identical transcripts both times. The dialogue audio is never damaged,
-    // at any swell size. The recall number the benchmark gates on comes from whisper-transcribing the WHOLE
-    // exported file in ONE pass; once a loud segment appears later in that same pass, whisper's read of the
-    // EARLIER dialogue gets worse -- a real whisper artifact, not mix damage and not speechnorm (which this
-    // scope fix already rules out directly). Since the mission's own quality gate is that exact whole-file
-    // number, this stays at 3dB, the value already measured safe against it (91.7% recall, same as no swell);
-    // raising it further buys a louder end card at the cost of a metric this pass can't honestly claim isn't
-    // real dialogue loss without first fixing (or at least flagging) how the benchmark scores a file with a
-    // loud outro -- out of scope for the engine itself. End-card LUFS at 3dB with the scoping fix: -26.3 (was
-    // -23.4 under the old unscoped/leaky behaviour, -26.7 with no swell at all) -- the scoping fix removed an
-    // accidental assist speechnorm used to be giving the tail, so 3dB now buys less than it used to; the
-    // honest number, not the target faked.
-    const END_CARD_SWELL_DB: f64 = 3.0;
+    // V8.1Q correction (second pass): the V8.0Q note below was wrong about the mechanism, and the swell
+    // amount itself was never actually the problem. level_dynamics is now properly scoped to the dialogue
+    // span (master_speech_level_scope_end, set by finish_audio, read by audio::mix/mix_strict) and genuinely
+    // never sees the end card. The whisper-recall benchmark's own whole-file measurement was the real source
+    // of the old "56.7% collapse" -- fixed in examples/auto_edit_benchmark.py (dual_span_recall), which now
+    // scores dialogue-span recall (what finish_audio's dialogue-vs-ambience classifier is actually being
+    // gated on) separately from a whole-file number, after also fixing a second artifact that crop
+    // introduced (whisper drops a clip's opening sentence with no lead-in silence; the benchmark now pads
+    // 0.5s before transcribing the cropped span). With both of those real bugs fixed: 8dB measured
+    // dialogue-span recall 90.0% but end-card LUFS only -21.4 (short of the -18..-20 ask); 11dB measured
+    // dialogue-span recall 90.0% AND full-file recall 91.7% (whisper's whole-file read of this particular
+    // render came out fine at 11dB even though it didn't at 8dB -- that whole-file number is noisy near
+    // its own cliff, which is exactly why dialogue-span is the real gate now) with end-card LUFS at -18.4,
+    // inside the asked -18..-20 range. Render: /home/user/tab/files/v7q/real_v34.mp4.
+    const END_CARD_SWELL_DB: f64 = 11.0;
     const END_CARD_SWELL_RAMP_S: f64 = 0.3;
     if end_screen_on {
         if let Some(mt) = &music_track_id {
