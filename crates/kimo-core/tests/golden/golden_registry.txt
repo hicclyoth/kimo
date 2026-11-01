@@ -75,7 +75,7 @@ auto_captions eb2ea2f83777efbd
 auto_chapters fff8eaf584738d1c
 auto_color 86d35765cf0dcf74
 auto_duck 782881168d8430d5
-auto_edit aa8085bfee10d8dc
+auto_edit e1b7838fbe4be371
 auto_grade 64db55ba3dd926ff
 auto_reframe 62c25d0e6fc84dd1
 auto_rough_cut 0dc325c5f230d88f
@@ -270,6 +270,7 @@ mark_source f05beb0417bee904
 match_color 7826baef90c3deb6
 match_events ccd11b0e9f67e25e
 match_grade d8125018a0c24142
+match_shot_look 94bc2ec16fb5bdf1
 match_shots 12847fb3b4d768ea
 measure_loudness 232b21f45eecf9b0
 mesh_boolean e4de94bd791ffd6b
@@ -292,7 +293,7 @@ pick_thumbnail a48ee1f3ca782e9e
 pick_white_balance 4e36686f25fac6d1
 pin_layer 141a292e07c94a12
 place_at_track e69bc7f50736dc25
-place_broll 5db2fcc545901e17
+place_broll 45fd6f96e1a0ffaa
 preview_material f0654be5429689e8
 preview_range 27365e61d374a963
 preview_subject_match 8fbee66dc3095cb4

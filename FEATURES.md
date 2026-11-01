@@ -1,9 +1,40 @@
 # kimo features
 
+New in v8.0.0: the 3.0s dead-air tail at the end of every render fixed (the music bed now covers the
+full export including the end screen, looped when short); a new `match_shot_look` tool pulls b-roll
+color/exposure toward the talking head's own look (wired into `auto_edit` as `broll_color_match`,
+default on); an end-card music swell once dialogue ends, capped at a measured-safe 3dB after 8dB
+silently collapsed whisper recall via `finish_audio`'s master-bus speechnorm. Tools: 521 -> 522.
+
 New in v7.9.0: a real-footage voice-dynamics pass (honest, partial -- see below), plus a new `whoosh_sfx`
 option on `place_broll`'s b-roll cut-ins and `auto_edit`'s hook title, synthesized at call time like the
 existing pop SFX -- built, TDD'd, and left OFF by default after it measurably cost whisper word recall on
 real footage even ducked low. Tools: 521 -> 523.
+
+## v8.0-Q: dead air fixed, a real b-roll color match shipped, end-card swell capped by a measured safety limit
+
+- [x] **The 3.0s dead-air tail at the end of every render.** Every `real_*` render back to v15 ended
+  on 3.0s of near-silence under the default end screen: the music clip's length only ever targeted the
+  talking-head span, not the full export. Fixed by extending the music bed's own length to the full
+  planned export (looping a too-short asset, capped at 200 repeats, with loop-seam fades and a true tail
+  fade to silence over up to 0.5s). Verified with `audio-proof.mjs`: zero silences anywhere (was 3.0s),
+  word recall unchanged at 90.0%.
+- [x] **B-roll color/exposure match to the talking head** (new tool `match_shot_look`; `auto_edit` option
+  `broll_color_match`, default on whenever there is b-roll). `auto_grade` only pulls a clip toward one
+  fixed absolute target and never looks at another shot in the same edit, so a warm interview cut
+  against cool or bright-daylight b-roll still clashed after it ran. `match_shot_look` measures a
+  reference shot's own look and pulls target clips a `strength` fraction toward it. Before/after frame
+  comparison in `v80_broll_compare.png`, looked at by hand -- a clearly visible warm push on the real
+  benchmark's cool coffee-shop b-roll.
+- [~] **End-card music swell once dialogue ends.** The end card played 12.6 LU quieter than the speech
+  body with no voice left to duck for. A ramp-up keyed where the card starts brings the bed up --
+  capped at a measured-safe 3dB, not the ~8dB originally targeted: 8dB collapsed whisper recall 90.0% ->
+  56.7% on the real benchmark via `finish_audio`'s master-bus speechnorm reacting to the sudden loud
+  segment (confirmed with `--no-level-dynamics` recovering to 93.3%); the boundary measured as a cliff
+  (3dB safe at 91.7% recall, 5dB back at the 56.7% collapse). End-card LUFS -26.7 -> -23.4, short of the
+  -18..-20 targeted -- the honest number, not a faked one.
+- [ ] Voice dynamics (`loudness_range`) still at 1.4 vs the >=3 target -- not attempted this pass (see
+  v7.9-Q's entry above for what was already tried and ruled out there); disclosed, not claimed.
 
 ## v7.9-Q: voice dynamics investigated honestly, whoosh SFX shipped off-by-default, b-roll visual gain not reached
 

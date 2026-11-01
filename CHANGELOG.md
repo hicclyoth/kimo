@@ -2,6 +2,60 @@
 
 - Added preview proxy media management: generation, enable/disable, health listing, deep integrity validation, safe relinking and detachment. PNG/range previews can use verified proxies; exports, audio and analysis retain originals. Missing/stale proxies fall back. Persisted, undoable bindings; synchronous SDR/CFR scope. See [proxy workflow](docs/PROXY_WORKFLOW.md).
 
+## v8.0.0 (2026-11-01)
+
+V8.0-Q quality pass: the finished video itself, not feature count. Tools: 521 -> 522 (new
+`match_shot_look`).
+
+- **The 3.0s dead-air tail at the end of every render, fixed.** Every `real_*` render back to v15
+  ended on 3.0s of near-silence (18.86-21.87s): the default-on end screen (v7.7-Q) extends the real
+  export past the talking-head's own `edit_duration`, but the music bed's own clip length only ever
+  targeted `edit_duration`, so the card played over a muted freeze-frame background with nothing else
+  under it. Confirmed by extracting frames at the silent span (the SUBSCRIBE FOR MORE card, audibly
+  dead) before touching any code.
+  - Fix: the music clip's length now targets the full planned export (`edit_duration` +
+    `end_screen_duration` when the end screen is on). A music asset shorter than that full length is
+    TILED (looped from its own start, capped at 200 repeats) rather than left to run out, with a short
+    fade at each loop seam and the true tail fading to silence over up to 0.5s. `duck_timeline` needed
+    no change -- it already iterates every clip on a track.
+  - Honest result: **zero silences anywhere** (was 3.0s), word recall unchanged at 90.0%, loudness and
+    true peak unchanged within spec.
+  - TDD: `music_bed_keeps_playing_under_the_end_screen`, `end_screen_with_no_music_warns_about_the_silent_tail`.
+- **B-roll color/exposure match to the talking head** (new tool `match_shot_look`, wired into
+  `auto_edit` as `broll_color_match`, default on whenever there is b-roll). `auto_grade` only ever
+  pulls a clip toward one fixed absolute target (neutral cast, a target luma) -- it never looks at
+  what ANOTHER shot in the same edit actually looks like, so a warm-lit interview cut against a
+  cool-toned or bright-daylight b-roll still reads as two different shoots stitched together even
+  after `auto_grade` runs (measured on the real benchmark: the talking head reads warm/indoor, the
+  city b-roll cool, the coffee b-roll bright daylight, each already inside `auto_grade`'s own "fine"
+  band). `match_shot_look(reference_clip_ids, target_clip_ids, strength)` measures each clip's own mean
+  RGB with the same fit-aware reader `auto_grade` uses, then pulls each target clip's measured look a
+  `strength` fraction toward the reference clips' averaged look -- white balance and exposure together,
+  gains clamped 0.5..2.0 per channel so a very different reference can never crush or blow a shot.
+  Before/after frame comparison saved to `v80_broll_compare.png` (talking head reference, b-roll
+  before, b-roll after -- a clearly visible warm push on the cool coffee-shop shot, looked at by hand).
+  New options on `auto_edit`: `broll_color_match` (bool, default true when b-roll exists),
+  `broll_color_match_strength` (0..1, default 0.6).
+  - TDD: `match_shot_look_pulls_target_toward_reference`,
+    `match_shot_look_skips_a_clip_that_is_its_own_reference`,
+    `broll_color_match_runs_by_default_and_can_be_turned_off`.
+- **End-card music swell, capped at a measured-safe level.** Once the dialogue ends there is nothing
+  left for the music to duck under, but `finish_audio`/`duck_timeline` only ever set the bed's level for
+  use UNDER speech -- the end card's own span measured 12.6 LU quieter than the speech body with no
+  voice left to protect. A short ramp keyed right where the card starts brings the bed up once speech is
+  done. **Capped at 3dB, not the originally-targeted ~8dB**: an 8dB swell measured clean in isolated
+  testing but, re-rendered on the real benchmark, collapsed whisper word recall from 90.0% to 56.7%
+  (reproduced twice, byte-identical both times, with no change to the dialogue audio itself) --
+  `finish_audio`'s master-bus speech leveler (`level_dynamics`, ffmpeg `speechnorm` run once over the
+  WHOLE mixed timeline) reacts to a sudden loud segment anywhere in the mix, confirmed by
+  `--no-level-dynamics` on the same 8dB render recovering to 93.3%. The boundary measured as a cliff,
+  not a gradient: 3dB held at 91.7% recall, 5dB fell straight back to the same 56.7% collapse as 8dB.
+  Shipped at the confirmed-safe 3dB. Honest result: end-card LUFS -26.7 -> -23.4 (a real improvement,
+  short of the -18..-20 originally asked, reported as such rather than faked).
+  - TDD: `music_bed_swells_under_the_end_card_once_dialogue_ends`.
+- No job 3 (voice dynamics, `loudness_range` still 1.4 vs the >=3 target) this pass -- disclosed, not
+  attempted; see v7.9.0's own entry for what was already tried and ruled out there.
+
 ## Unreleased
 
 ## v7.9.0 (2026-10-31)

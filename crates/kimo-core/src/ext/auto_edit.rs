@@ -61,7 +61,6 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // "well exposed and neutral" by auto_grade's own absolute band, so auto_grade alone left the mismatch
     // untouched). Off entirely for callers who want their own look preserved.
     let broll_match_on = a.get("broll_color_match").and_then(|v| v.as_bool()).unwrap_or(true);
-    let broll_match_strength = a.get("broll_color_match_strength").and_then(|v| v.as_f64());
     let platform = a.get("platform").and_then(|v| v.as_str()).unwrap_or("none").to_string();
     // default on for the landscape/youtube-style edit (platform none); a vertical short usually ends on
     // whatever the platform's own UI shows next, so it defaults off there unless explicitly asked for.
@@ -260,8 +259,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // own measured look specifically -- the match a real cut needs, not just "neither shot is blown out".
     if broll_match_on && !broll_clip_ids.is_empty() {
         let reference_clip_ids: Vec<String> = dialogue_clips.iter().map(|(id, _, _)| id.clone()).collect();
-        let mut match_args = json!({"reference_clip_ids": reference_clip_ids, "target_clip_ids": broll_clip_ids});
-        if let Some(v) = broll_match_strength { match_args["strength"] = json!(v); }
+        let match_args = json!({"reference_clip_ids": reference_clip_ids, "target_clip_ids": broll_clip_ids});
         match call(ss, "match_shot_look", &match_args) {
             Ok(m) => { stages.insert("broll_color_match".into(), m); }
             Err(e) => warnings.push(format!("b-roll color match skipped: {e}")),
@@ -410,8 +408,7 @@ pub fn commands() -> Vec<Command> {
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),
                 ("grade", json!({"type": "boolean", "description": "default true: auto_grade every clip"})),
-                ("broll_color_match", json!({"type": "boolean", "description": "default true (when there is b-roll): pull each b-roll clip's own measured look toward the talking head's, so a cut against footage shot in different light still reads as one edit"})),
-                ("broll_color_match_strength", n("0..1, default 0.6, how fully each b-roll clip is pulled toward the talking head's look")),
+                ("broll_color_match", json!({"type": "boolean", "description": "default true (with b-roll): match b-roll's look to the talking head's"})),
                 ("target_lufs", n("final mix loudness target, default -14 (YouTube)")),
                 ("platform", s("passed to lint_edit/apply_review_fixes: tiktok|reels|shorts|none (default none)")),
                 ("level_dynamics", json!({"type": "boolean", "description": "passed to finish_audio: gentle speech leveling, default true"})),
