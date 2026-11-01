@@ -623,16 +623,31 @@ fn finish_audio(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // level_dynamics:false restores the old compressor-only behaviour exactly (master_speech_level stays 0).
     let level_on = a.get("level_dynamics").and_then(|v| v.as_bool()).unwrap_or(true);
     let level_strength = opt_num(a, "level_strength", 2.5).clamp(1.0, 4.0);
+    // V8.1Q: tried lowering this default (down to 1.0, speechnorm's own minimum expansion/compression
+    // factor) to widen voice dynamics -- real gain on the real benchmark (dialogue-span loudness_range
+    // 1.5 -> 2.0 LU at 1.0, recall held at 90.0%, so the V7.9Q note below's "collapsed recall" claim for a
+    // lower level_strength turned out to be the same benchmark dialogue-span-crop-with-no-lead-in artifact
+    // fixed in examples/auto_edit_benchmark.py, not a real regression) -- but 1.0 is speechnorm's hard floor
+    // and makes it a complete no-op (finish_audio_level_dynamics_narrows_loudness_range_within_a_clip, which
+    // builds a clip with a real wide swing on purpose, measured on=off=11.4 LU at 1.0: zero narrowing for a
+    // genuinely bad take, a real regression for the feature's actual purpose). 1.8 still measurably narrows
+    // that stress clip (10.3 LU, short of the test's <=10.0 bar) so the honest choice here is: the default
+    // stays 2.5, protecting footage that actually needs leveling; a caller editing already-even footage who
+    // wants the full natural dynamics back can still pass level_strength:1.0 explicitly (exposed, tested
+    // above, safe). See finish_audio's note on master_speech_level_scope_end for the fuller voice-dynamics
+    // picture (V8.1Q job 2): best honest loudness_range reached on this footage with every lever at its
+    // gentlest (level_dynamics off, match_strength 0, compress_strength 0) was 2.6 LU, short of the >=3 LU
+    // target -- marked [~] in CHANGELOG, not faked.
     // V7.9Q: the per-clip AVERAGE-matching loop below (separate from level_dynamics' WITHIN-clip speechnorm
     // above) was previously all-or-nothing -- every dialogue clip's average got pulled the FULL distance to
     // the loudest one. That is right when two genuinely different speakers sit far apart in mic level (see
     // finish_audio_levels_speakers_and_hits_the_target) -- match_strength lets a caller dial that down when
     // it is NOT what they want. Measured on real rough-cut footage first, though: clips from the SAME speaker
     // were already within ~2.3 dB of each other at this step, so lowering match_strength barely moved
-    // loudness_range (1.2 -> 1.3 LU at 0.6) while it measurably hurt whisper word recall on the now-quieter
-    // clips (88.3% -> 56.7%, reproduced twice) -- this loop was not actually the real footage's flattening
-    // cause. Default stays 1.0 (old exact behaviour, recall-safe); the real lever for loudness_range turned
-    // out to be finish_audio's hardcoded dialogue compressor just below (now `compress_strength`).
+    // loudness_range (1.2 -> 1.3 LU at 0.6, 1.8 LU measured again V8.1Q at 0.0 with level_dynamics otherwise
+    // off -- real but small) -- this loop is not the real lever for loudness_range. Default stays 1.0 (old
+    // exact behaviour, recall-safe); match_strength exists for the actual two-speaker case, not for widening
+    // one speaker's own dynamics.
     let match_strength = opt_num(a, "match_strength", 1.0).clamp(0.0, 1.0);
     // V7.9Q: finish_audio always ran a fixed acompressor (ratio 3:1 @ -18dB, no knob) on every dialogue clip.
     // compress_strength (0..1) scales that ratio from 1.0 (old fixed 3:1, 1.0 at the knob) down to no
