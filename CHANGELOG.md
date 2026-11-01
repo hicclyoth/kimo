@@ -1,5 +1,58 @@
 # Changelog
 
+## v8.3.0 (2026-11-01)
+
+V8.3-M montage mode: editing features for non-dialogue footage (travel, sports, pets, raw phone
+clips) -- "top YouTube editor quality" regardless of clip type. Voice/audio-leveling and captions
+were out of scope this pass (steered off). 4 new tools (526, was 522).
+
+- **Best-moment selection**, new `score_windows` (read-only) and `best_segments` (mutating) tools.
+  There was no path at all for non-dialogue footage before this: calling `auto_edit` without
+  `talking_head_asset_ids` hard-errors. Scores every window of a clip on sharpness (`focus_series`),
+  exposure (`frame_quality`), subject framing (`pick_thumbnail`'s own scorer), motion
+  (`frozen_frames`), and one shake value per clip (`stabilize_clip`'s own read-only correction) --
+  every signal reused from an existing tool, nothing re-derived. Hard per-axis floors
+  (`min_sharpness`, `min_exposure`, `max_shake_px`) sit on top of the blended score so a window can't
+  pass on a good blend alone while badly blurred. `best_segments` cuts the kept/dropped windows with
+  `split_clip`/`delete_clip`.
+  - TDD: a clean clip is kept; blurry/dark/shaky clips are scored low and dropped; `best_segments`
+    actually deletes the junk and splits a mixed clip to just its sharp half.
+  - Verified on real b-roll, not just synthetic clips: a static shot reads ~0.01px shake and is kept;
+    the same shot with real jitter added reads ~25px (threshold 12) and is dropped; blurred/near-black
+    copies dropped on sharpness/exposure. Contact sheet: `v83_bestmoment_compare.png`.
+
+- **Beat-synced montage cuts with energy-varied shot length**, new `beat_sync_montage` tool. Reuses
+  `beat_cut` for all the actual cutting (never re-implemented); reads `audio_transients`' own beat
+  grid (per-beat strength), picks a shorter or longer shot at each beat from that beat's own
+  strength, hands the chosen cut times straight to `beat_cut` as its own `beats` array (every cut IS
+  a real detected beat), and ends on a `beats_per_phrase`-aligned beat instead of mid-phrase. Lays the
+  music, normalizes to `target_lufs` (default -14) before keying a fade-out over the last
+  `fade_out_beats`. Found and fixed a real gap along the way: a peaky/transient music bed can refuse
+  `normalize_loudness`'s plain gain (would clip); now takes the refusal's own suggested fix (a light
+  compressor) and retries once rather than leaving the music quiet.
+  - TDD: cuts land within 1 frame of real beats and the edit ends on a phrase boundary; a peaky bed
+    reaches target loudness via the compressor-retry path.
+  - Verified on real footage (best_segments' own kept output): a two-tier music bed produces 0.5s
+    shots in the loud section and 2.0s shots in the quiet section -- shot length visibly tracking
+    energy. `match_events` on the real render: 34/35 cuts within 1 frame of a real beat (median offset
+    0.3ms). Final export: -14.29 LUFS, -4.05 dBTP, zero silences, confirmed fade (no abrupt cutoff).
+    Renders: `montage_v01.mp4`, `montage_v02.mp4`. Contact sheet:
+    `v83_beatsync_montage_overview.png`.
+
+- **Shot-to-shot colour consistency**, new `montage_color_match` tool. A thin wrapper around the
+  existing `match_shot_look` (already used for broll-vs-talking-head, reused verbatim) scoped to a
+  whole montage: pick one clip as the anchor (`clip_ids[0]` by default, or your own
+  `reference_clip_ids`) and pull every other listed clip toward it in one call.
+  - TDD: a warm clip and a cool clip -- the match moves the non-anchor clip's gain in the correct
+    direction (red up, blue down toward the anchor), not just "ran without erroring"; an explicit
+    reference is honoured; every clip also listed as its own reference errors cleanly.
+  - Verified on real footage: a dark b-roll anchor pulls a warmer desk-shot clip's exposure and color
+    down to match. Contact sheet: `v83_colormatch_compare.png`.
+
+Talking-head path (`auto_edit`, `auto_rough_cut`) and its benchmark are untouched by this pass --
+every new tool lives in its own file (`montage_tools.rs`) wired only into the `timeline`/`output`
+toolgroups.
+
 ## v8.2.0 (2026-11-01)
 
 V8.2-V visual finish quality pass: "if I put some clips into it, be it of anything, I get top YouTube

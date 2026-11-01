@@ -85,6 +85,8 @@ batch ef0c6c2068bb9798
 batch_normalize_loudness 8c5cd436d72936a9
 batch_set_meta 38d808f5d0a73034
 beat_cut 0c1be4637c253146
+beat_sync_montage e67b0ecb762f703a
+best_segments 1455f4531a1eacd3
 bind_beats 2d8bcd8a43d9aad9
 bind_shared_grade_graphs d163ca88fc64bb1d
 black_frames d782d005bfdbf524
@@ -277,6 +279,7 @@ mesh_boolean e4de94bd791ffd6b
 mesh_extrude_path a625c4dd252d61c8
 mesh_lathe 24a15bfc8857aa04
 mesh_subdivide be0ac02097402cdb
+montage_color_match 7851ede605a3e7ab
 motion_diff daa6747b3e2f0f44
 motion_extract 40677d74bedf2eb2
 move_asset_to_bin 23a63229fa937d23
@@ -389,6 +392,7 @@ sample_sdf_raw b0e579f1cde1279c
 sample_texture_material 4a03308329ef702a
 save_project d51a7abb5be457b3
 scene_split e3169bf97fff6916
+score_windows 2ee81cf98be42143
 self_review 60d5d56439bd1c85
 session_stats 08b78ec5daffb184
 set_3d_compositor c3fab2e718ae3113

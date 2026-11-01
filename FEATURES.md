@@ -1,5 +1,13 @@
 # kimo features
 
+New in v8.3.0: montage mode for non-dialogue footage (travel, sports, pets, raw phone clips) --
+`score_windows`/`best_segments` score and cut down to the strongest moments (sharpness, exposure,
+subject framing, motion, shake), `beat_sync_montage` cuts on real detected beats with shot length
+varying by musical energy and a clean phrase-aligned fade-out, `montage_color_match` ties a whole
+montage's clips to one consistent look. No voice/audio-leveling or caption work this pass (steered
+off); the talking-head path (`auto_edit`, `auto_rough_cut`) and its benchmark are untouched. Tools:
+522 -> 526.
+
 New in v8.2.0: visual finish quality -- a slow Ken Burns push-in on static b-roll cutaways
 (`add_smart_punch`, already in the registry, now wired into `auto_edit` as `push_in`, default on,
 zoom 5%); the talking-head jump-cut punch-ins now force a split on any uncovered stretch that would
@@ -28,6 +36,32 @@ New in v7.9.0: a real-footage voice-dynamics pass (honest, partial -- see below)
 option on `place_broll`'s b-roll cut-ins and `auto_edit`'s hook title, synthesized at call time like the
 existing pop SFX -- built, TDD'd, and left OFF by default after it measurably cost whisper word recall on
 real footage even ducked low. Tools: 521 -> 523.
+
+## v8.3-M: montage mode for non-dialogue footage
+
+Scope per the brief: editing features for footage with no dialogue (travel, sports, pets, raw phone
+clips), "top YouTube editor quality" regardless of clip type. Voice/audio-leveling and captions were
+out of scope this pass (steered off).
+
+- [x] **Best-moment selection (`score_windows`, `best_segments`).** There was no path for non-dialogue
+  footage before this -- `auto_edit` hard-errors without `talking_head_asset_ids`. Scores every window
+  on sharpness (`focus_series`), exposure (`frame_quality`), subject framing (`pick_thumbnail`'s own
+  scorer), motion (`frozen_frames`), and per-clip shake (`stabilize_clip`'s own read-only correction) --
+  every signal reused, nothing re-derived -- with hard per-axis floors on top of the blended score so a
+  badly blurred window can't pass on a good blend alone. `best_segments` cuts the result with
+  `split_clip`/`delete_clip`. Verified on real b-roll (not just synthetic clips): real jitter reads
+  ~25px shake and is dropped (threshold 12px), a static shot reads ~0.01px and is kept.
+- [x] **Beat-synced montage cuts with energy-varied shot length (`beat_sync_montage`).** Reuses
+  `beat_cut` for the actual cutting; reads `audio_transients`' beat grid, picks a shorter or longer shot
+  at each beat from that beat's own strength, ends on a phrase-aligned beat, lays and normalizes the
+  music (-14 LUFS default) with a compressor-retry fallback for peaky beds, fades out cleanly. Verified
+  on real footage: cuts land within 1 frame of real beats (34/35, median offset 0.3ms), shot length
+  visibly tracks a two-tier energy music bed (0.5s loud / 2.0s quiet), final export -14.29 LUFS / -4.05
+  dBTP / zero silences.
+- [x] **Shot-to-shot colour consistency (`montage_color_match`).** A thin wrapper around the existing
+  `match_shot_look`: pick an anchor clip and pull every other listed clip toward its look in one call.
+  Verified on real footage: a dark b-roll anchor pulls a warmer desk-shot clip's exposure/color down to
+  match.
 
 ## v8.2-V: visual finish quality -- push-in, forced punch-in splits, face-aware captions, b-roll whip transitions
 
