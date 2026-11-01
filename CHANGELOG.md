@@ -1,3 +1,28 @@
+## v8.5.3 (2026-11-01)
+
+`vhs_decay` still didn't read as VHS in a 4fps/200px-wide thumbnail strip even though the v8.5.2
+build looked like worn tape at full size -- measured directly: the native `scanlines` effect darkens
+exactly 1 row every `spacing` rows, and a slow sine-wave luminance test (tried first, before this)
+reads as a soft vignette rather than scanline texture, because the eye needs real edges, not slow
+brightness drift -- both vanish under a ~6x thumbnail downscale. The `vhs` effect's own tracking band
+only displaces pixels in a narrow region; it never brightens or adds noise there, so "a bright, noisy
+tracking band rolling through the frame" was never actually visible, only a faint wobble.
+
+- **`vhs_decay`**: replaced the plain `scanlines` node with a hard-edged duty-cycle stripe at a FIXED
+  pixel period via a new `pixel_expr` node (`vhs_scanline_expr`) -- it reads as real scanline texture
+  at full size AND survives a 200px-wide thumbnail downscale, verified both ways with `vfx_preview` +
+  `attach_image` before this file changed. Added a second `pixel_expr` node (`vhs_tracking_band_expr`)
+  at the same roll phase as the `vhs` effect's own band (`fract(t*0.35)*h`, so the two read as one
+  event): inside a smoothstep-falloff band it brightens the image, resamples with extra horizontal
+  jitter (`sample(u+offset,v)`), and adds strong hashed noise, masked to fall off outside the band.
+  Raised the pre-blur for a genuinely softer, lower-resolution feel (a real downscale/upscale round
+  trip isn't a vfx_graph node, so a stronger blur stands in, as the brief allowed). Added a `levels`
+  node for lifted/crushed blacks (a faded, reduced-contrast tape floor -- the old chain used the full
+  0..1 range). Checked 0% clipping at both the default intensity (0.4) and dialed to 1.0; face stays
+  recognizable at both. No OSD timestamp/REC text was added -- `vfx_graph`'s only generators are
+  solid/gradient/shape (circle/rect), there is no text/glyph node to drive a "PLAY"/"REC" overlay from,
+  so per the brief this is skipped rather than faked with shapes.
+
 ## v8.5.2 (2026-11-01)
 
 Three looks from the v8.5.1 pass still didn't read at phone size on real-footage review:

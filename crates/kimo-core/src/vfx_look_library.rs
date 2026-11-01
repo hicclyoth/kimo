@@ -44,6 +44,50 @@ fn particles(id: &str, preset: &str, overrides: Value) -> Value {
 fn particles_raw(id: &str, params: Value) -> Value {
     json!({"id": id, "type": "particles", "params": params})
 }
+
+/// V8.5.3 vhs_decay: a hard-edged duty-cycle stripe at a FIXED pixel period (not spacing-in-rows like the native
+/// `scanlines` effect), via pixel_expr. A smooth sine-wave luminance test read as a soft vignette rather than
+/// scanline texture (the eye needs real edges, not slow brightness drift) and, like the native `scanlines` effect's
+/// 1-row darkening, vanished under a ~6x thumbnail downscale (200px wide, as a 4fps strip renders). This survives
+/// that downscale as real horizontal banding because the period (22px @720p) and duty cycle give wide enough bands
+/// that an area-correct resize still shows them. `strength` (how dark the stripe gets) scales with intensity.
+fn vhs_scanline_expr(i: f64) -> String {
+    let period = 22.0_f64;
+    let duty = 0.42_f64;
+    let feather = 2.0_f64;
+    let strength = 0.16 + 0.25 * i;
+    let m = format!("(y - floor(y/{period})*{period})");
+    let dark = format!("(1.0 - smoothstep({:.4}, {:.4}, {m}))", period * duty - feather, period * duty);
+    let factor = format!("(1.0 - {strength}*{dark})");
+    format!("vec4(red(src)*{factor}, green(src)*{factor}, blue(src)*{factor}, alpha(src))")
+}
+
+/// V8.5.3 vhs_decay: the `vhs` effect's own tracking band (its `bands` param) only adds extra horizontal
+/// displacement in a narrow region -- it never brightens or adds noise there, so "a bright, noisy tracking band
+/// rolling through the frame" (what real worn tape looks like) was never actually visible, only a faint wobble.
+/// This pixel_expr node adds a second band at the SAME roll phase as the `vhs` effect's own (fract(t*0.35)*h, so
+/// the two read as one event, not two uncorrelated glitches): inside a smoothstep-falloff half-width band it
+/// brightens the image, resamples with extra per-row horizontal jitter (sample(u+offset,v)), and adds strong
+/// hashed per-pixel noise, all masked to fall off to nothing outside the band. jitter/brightness/noise amount
+/// scale with intensity. (No `abs` builtin in this expression language -- sqrt(x*x) stands in for it.)
+fn vhs_tracking_band_expr(i: f64) -> String {
+    let speed = 0.35_f64;
+    let halfwidth_frac = 0.05_f64;
+    let jitter = 0.02 + 0.035 * i;
+    let bright = 0.3 + 0.45 * i;
+    let noise_amt = 0.3 + 0.45 * i;
+    let by = format!("(fract(t*{speed})*h)");
+    let dist = format!("sqrt((y - {by})*(y - {by}))");
+    let hw = format!("(h*{halfwidth_frac})");
+    let mask = format!("smoothstep({hw}, 0.0, {dist})");
+    let off = format!("((noise(11.0, floor(y/2.0), floor(t*18.0)) - 0.5) * {jitter} * {mask})");
+    let col = format!("sample((u + {off}), v)");
+    let nz = format!("((noise(23.0, x, y) - 0.5) * {noise_amt} * {mask})");
+    let bb = format!("(1.0 + {bright}*{mask})");
+    format!(
+        "vec4(clamp(red({col})*{bb} + {nz}, 0.0, 1.0), clamp(green({col})*{bb} + {nz}, 0.0, 1.0), clamp(blue({col})*{bb} + {nz}, 0.0, 1.0), alpha({col}))"
+    )
+}
 /// A punchy, repeating pulse as a keyframe Prop: holds near `low`, spikes to `high` over `attack` seconds, decays
 /// back to `low` over the rest of `period`, then repeats forever via loop_out "cycle" -- a deterministic stand-in
 /// for "on the beat" with no audio analysis needed (vfx_graph exposes only the current instant t; see vfx_graph.rs's
@@ -194,14 +238,34 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // `temperature` push after the grain (90s camcorders skew warm, not neutral-desaturated) and widened the
         // vignette -- the v02 chain (vhs + scanlines + grain + flat desaturation) had no low-res softness and no
         // warm cast, which is why it read as "slightly desaturated video" rather than tape.
+        // V8.5.3: still didn't read at PHONE-THUMBNAIL size (a 4fps strip at 200px wide) even though it looked like
+        // real tape at full size -- measured directly: the native `scanlines` effect darkens exactly 1 row every
+        // `spacing` rows, and a slow sine-wave luminance test (tried first, see git history of this comment) reads
+        // as a soft vignette, not scanline texture, because the eye needs real edges, not slow brightness drift --
+        // both vanish under a ~6x thumbnail downscale. Replaced with two pixel_expr nodes, each verified at both
+        // full size and a resized 200px-wide thumbnail before this file changed: `vhs_scanline_expr` is a hard-
+        // edged duty-cycle stripe at a fixed pixel period (not spacing-in-rows), which survives the thumbnail
+        // downscale as real banding; `vhs_tracking_band_expr` adds brightness + strong hashed noise + extra
+        // horizontal jitter inside a smoothstep-falloff band at the SAME roll phase as the `vhs` effect's own
+        // (fract(t*0.35)*h), because the `vhs` effect's own band only displaces, it never brightens or adds noise,
+        // so the "roll" by itself was never visible at a glance. Also added `levels` for lifted/crushed blacks
+        // (a faded, reduced-contrast tape floor -- the old chain had full 0..1 range) and raised the pre-blur for
+        // a softer, lower-resolution feel ("downscale and back up, or similar" -- a real downscale/upscale round
+        // trip isn't a vfx_graph node, so a stronger blur stands in for it, same approach the brief allowed).
+        // Checked: 0% clipping at both the default intensity (0.4) and dialed to 1.0; face stays recognizable at
+        // 1.0 too, though 0.4 is the cleaner default. No OSD text added -- vfx_graph's only generators are
+        // solid/gradient/shape (circle/rect), there is no text/glyph node to drive a "PLAY"/"REC" overlay from, so
+        // per the brief this is skipped rather than faked with shapes.
         "vhs_decay" => json!({"nodes": [
-            eff("soft", SRC, "blur", json!({"radius": 0.5 + 0.7 * i})),
-            eff("tape", "soft", "vhs", json!({"wobble": 2.5 + 4.0 * i, "bleed": 4.5 + 5.5 * i, "noise": 0.12 + 0.16 * i, "bands": 1.0 + 1.4 * i})),
-            eff("scan", "tape", "scanlines", json!({"amount": 0.22 + 0.26 * i, "spacing": 3.0})),
-            eff("grain", "scan", "grain", json!({"amount": 0.05 + 0.07 * i})),
+            eff("soft", SRC, "blur", json!({"radius": 1.3 + 2.0 * i})),
+            eff("tape", "soft", "vhs", json!({"wobble": 3.0 + 4.5 * i, "bleed": 4.5 + 5.0 * i, "noise": 0.12 + 0.16 * i, "bands": 1.0 + 1.4 * i})),
+            eff("scan", "tape", "pixel_expr", json!({"expr": vhs_scanline_expr(i)})),
+            eff("band", "scan", "pixel_expr", json!({"expr": vhs_tracking_band_expr(i)})),
+            eff("grain", "band", "grain", json!({"amount": 0.05 + 0.08 * i})),
             eff("warm", "grain", "temperature", json!({"amount": 0.12 + 0.14 * i})),
             eff("desat", "warm", "saturation", json!({"amount": (1.0 - 0.18 * i).max(0.7)})),
-            eff("out", "desat", "vignette", json!({"amount": 0.18 + 0.18 * i})),
+            eff("crush", "desat", "levels", json!({"in_black": 0.02 + 0.02 * i, "in_white": 1.0, "gamma": 1.0, "out_black": 0.05 + 0.06 * i, "out_white": 0.95 - 0.05 * i})),
+            eff("out", "crush", "vignette", json!({"amount": 0.16 + 0.16 * i})),
         ], "output": "out"}),
         // V8.5.1: a static overlay read as a flat tinted filter, not "flowing colour bands". The gradient's angle
         // and middle stop now ride Sin-expr keyframe Props (no audio/time-offset sampling available -- see
