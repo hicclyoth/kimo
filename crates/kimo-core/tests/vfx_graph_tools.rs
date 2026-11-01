@@ -65,7 +65,8 @@ fn vfx_preview_renders_requested_times_with_metrics_and_does_not_commit() {
     assert_eq!(frames.len(), 2);
     for fr in frames {
         let p = fr["path"].as_str().unwrap();
-        assert!(std::path::Path::new(p).exists(), "{p} should exist");
+        let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("{p} should exist and be readable: {e}"));
+        assert_eq!(&bytes[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], "{p} must be a real PNG (magic bytes), not the internal KIMOPX01 pixel-interchange format");
         assert!(fr["mean_luma"].as_f64().unwrap() > 0.0);
         assert!(fr["clipping_pct"].as_f64().is_some());
         assert!(fr["edge_energy"].as_f64().is_some());

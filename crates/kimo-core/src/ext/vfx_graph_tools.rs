@@ -127,9 +127,8 @@ pub fn commands() -> Vec<Command> { vec![
                 let src = render_clip_at(ss, &cid, t)?;
                 let mask = match &mask_id { Some(id) => Some(render_clip_at(ss, id, t)?), None => None };
                 let out = vfx_graph::interpret(&g, &vfx_graph::validate(&g).unwrap(), &src, mask.as_ref(), t, 1).map_err(|e| format!("vfx_preview at t={t}: {e}"))?;
-                let png = crate::pixels::encode(&out).map_err(|e| format!("vfx_preview: PNG encode failed: {e}"))?;
                 let path = format!("{}/vfx_preview_{i:02}_t{t:.3}s.png", out_dir.trim_end_matches('/'));
-                std::fs::write(&path, &png).map_err(|e| format!("cannot write {path}: {e}"))?;
+                crate::render::write_image(&out, &path).map_err(|e| format!("vfx_preview: PNG write failed: {e}"))?;
                 frames.push(json!({
                     "time": t, "path": path,
                     "mean_luma": mean_luma(&out), "clipping_pct": clipping_pct(&out),
