@@ -47,7 +47,7 @@ fn in_transition(ss: &Session, clip_id: &Option<String>, t: f64) -> bool {
 /// thirds grid (saliency_map's own `stats` grid, cell 4) -- rewards a subject placed centrally, 0 with no saliency mass
 /// at all; (b) a detail term, the Rec.709 luma standard deviation of the whole frame against a fixed 0.12 reference --
 /// rewards texture/subject matter and penalises a large flat low-detail area (a plain wall), 0..1. Combined 0.65a+0.35b.
-fn subject_score(im: &Image) -> f64 {
+pub(crate) fn subject_score(im: &Image) -> f64 {
     let luma: Vec<f64> = (0..im.w * im.h).map(|i| im.luma(i)).collect();
     let mean: f64 = luma.iter().sum::<f64>() / luma.len().max(1) as f64;
     let var: f64 = luma.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / luma.len().max(1) as f64;
