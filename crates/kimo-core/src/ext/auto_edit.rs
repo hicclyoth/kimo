@@ -1,6 +1,6 @@
 //! `auto_edit`: one call, raw clips -> a finished, polished edit, chaining Kimo's own existing tools with
 //! sensible defaults -- rough cut (dead air out) -> b-roll placement (RV-33: matched to the words spoken,
-//! given a transcript) -> jump-cut punch-ins (only on the segments that stay on screen, so the zoom is never
+//! given a transcript) -> a slow Ken Burns push-in on static b-roll cutaways -> jump-cut punch-ins (only on the segments that stay on screen, so the zoom is never
 //! hidden under b-roll) -> word-synced captions -> an optional cold-open hook title -> an optional music bed
 //! -> auto color -> a b-roll color/exposure match to the talking head -> a final audio mix to a YouTube
 //! loudness target -> a subscribe-style end screen -> lint_edit's
@@ -54,6 +54,8 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let whoosh_sfx = a.get("whoosh_sfx").and_then(|v| v.as_bool());
     let punch_scale = opt_num(a, "punch_scale", 1.15).clamp(1.01, 3.0);
     let punch_on = a.get("punch_ins").and_then(|v| v.as_bool()).unwrap_or(true);
+    let push_in_on = a.get("push_in").and_then(|v| v.as_bool()).unwrap_or(true);
+    let push_in_zoom = opt_num(a, "push_in_zoom", 1.05).clamp(1.01, 1.3);
     let grade_on = a.get("grade").and_then(|v| v.as_bool()).unwrap_or(true);
     // V8.0Q: on by default whenever there's a dialogue clip and at least one b-roll clip to match -- the
     // free color-cohesion win a raw auto-cut never gets (measured on the real benchmark: an indoor warm
@@ -143,6 +145,29 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         stages.insert("broll".into(), br);
     } else {
         warnings.push("no broll_asset_ids given: the talking head runs with no cutaways".into());
+    }
+
+    // 2b. Slow push-in (V8.2V, Ken Burns): a gentle, eased push-in on every static b-roll cutaway -- the
+    // free "it's not just a photo pasted in" win a raw cutaway never gets. Scoped to b-roll on purpose:
+    // the talking head gets its own cut-zoom treatment below (job 2), so a b-roll-only push here never
+    // competes with that. Skips a clip whose own scale/x/y already carry keys or an expression (an
+    // already-animated cutaway, e.g. a caller-supplied pan, is left exactly as it was, never double-pushed)
+    // and any clip too short for a push to read as motion rather than a flicker.
+    if push_in_on && !broll_clip_ids.is_empty() {
+        let candidates: Vec<String> = broll_clip_ids.iter().filter(|cid| {
+            ss.project.find_clip(cid).is_some_and(|c| c.duration >= 1.2
+                && ["scale", "x", "y"].iter().all(|k| c.props.get(*k).is_none_or(|q| q.keys.is_empty() && q.expr.is_empty())))
+        }).cloned().collect();
+        let mut pushed = vec![];
+        for cid in &candidates {
+            let dur = ss.project.find_clip(cid).map_or(0.0, |c| c.duration);
+            let samples = if dur > 6.0 { 6 } else { 3 };
+            match call(ss, "add_smart_punch", &json!({"clip_id": cid, "zoom": push_in_zoom, "samples": samples})) {
+                Ok(v) => pushed.push(v),
+                Err(e) => warnings.push(format!("push-in skipped on clip {cid}: {e}")),
+            }
+        }
+        if !pushed.is_empty() { stages.insert("push_in".into(), json!({"clips": pushed})); }
     }
 
     // 3. Punch-ins (jump-cut zoom variation) only on the dialogue clips that stay mostly on screen -- a
@@ -411,6 +436,8 @@ pub fn commands() -> Vec<Command> {
                 ("captions", json!({"type": "boolean", "description": "default true"})),
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),
+                ("push_in", json!({"type": "boolean", "description": "default true: slow Ken Burns push-in on static b-roll cutaways"})),
+                ("push_in_zoom", n("push-in target scale by the cutaway's end, default 1.05 (5%), clamped 1.01..1.3")),
                 ("grade", json!({"type": "boolean", "description": "default true: auto_grade every clip"})),
                 ("broll_color_match", json!({"type": "boolean", "description": "default true (with b-roll): match b-roll's look to the talking head's"})),
                 ("target_lufs", n("final mix loudness target, default -14 (YouTube)")),

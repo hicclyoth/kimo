@@ -344,3 +344,46 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     let c2 = ss2.project.find_clip(&music_cid2).unwrap();
     assert!(c2.audio.volume.keys.is_empty(), "no end screen means nothing to swell for: expected no volume keys, got {:?}", c2.audio.volume.keys);
 }
+
+
+/// V8.2V job 1: a slow Ken Burns push-in on static b-roll cutaways, on by default. Proves real motion:
+/// the b-roll clip's own scale carries a real keyframed ramp (not a static value), and it is NOT the identity
+/// (the end differs from the start) -- the actual thing a viewer would see as "it's pushing in", not just a
+/// stage key existing.
+#[test] fn push_in_animates_static_broll_by_default() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("pushin_th.mp4", &[(0.0, 4.0), (4.5, 8.0)], 0.0)})), "asset_id");
+    let bm = sid(&call(&mut ss, "import_media", json!({"path": broll("pushin_broll.mp4", 3.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "broll_asset_ids": [bm], "captions": false, "grade": false, "punch_ins": false, "broll_color_match": false, "end_screen": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let pushed = r["stages"]["push_in"]["clips"].as_array().unwrap_or_else(|| panic!("push_in stage missing with a 3s static b-roll clip present: {r}"));
+    assert!(!pushed.is_empty(), "expected at least one b-roll clip pushed in: {r}");
+    let cid = sid(&pushed[0], "clip_id");
+    let c = ss.project.find_clip(&cid).unwrap();
+    let q = c.props.get("scale").unwrap_or_else(|| panic!("pushed clip has no scale property at all: {c:?}"));
+    assert!(q.keys.len() >= 2, "expected a real keyframed scale ramp (start != end), got {} key(s): {:?}", q.keys.len(), q.keys);
+    let start_scale = q.at(0.0);
+    let end_scale = q.at(c.duration);
+    assert!(end_scale > start_scale + 0.01, "push-in should end noticeably wider-zoomed than it starts: start {start_scale:.4}, end {end_scale:.4}");
+    // 3-6% ask: the default should land inside (or very close to) that band over the shot.
+    let pct = (end_scale / start_scale - 1.0) * 100.0;
+    assert!((2.5..=7.0).contains(&pct), "push-in should be a subtle few-percent push by default, got {pct:.2}%");
+
+    // push_in:false -- no stage, b-roll scale stays untouched (no keys at all, since place_broll itself never animates scale).
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": talk("pushin_off_th.mp4", &[(0.0, 4.0), (4.5, 8.0)], 0.0)})), "asset_id");
+    let bm2 = sid(&call(&mut ss2, "import_media", json!({"path": broll("pushin_off_broll.mp4", 3.0)})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "broll_asset_ids": [bm2], "captions": false, "grade": false, "punch_ins": false, "broll_color_match": false, "end_screen": false, "push_in": false}));
+    assert!(r2["ok"] == json!(true), "{r2}");
+    assert!(r2["stages"]["push_in"].is_null(), "push_in:false should skip the stage entirely: {r2}");
+}
+
+/// A b-roll clip too short for the motion to read (under 1.2s) is left alone -- no push-in attempted on it.
+#[test] fn push_in_skips_very_short_broll() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("pushin_short_th.mp4", &[(0.0, 5.0)], 0.0)})), "asset_id");
+    let bm = sid(&call(&mut ss, "import_media", json!({"path": broll("pushin_short_broll.mp4", 0.6)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "broll_asset_ids": [bm], "captions": false, "grade": false, "punch_ins": false, "broll_color_match": false, "end_screen": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    assert!(r["stages"]["push_in"].is_null(), "a single very short b-roll clip (<1.2s) should leave nothing to push in: {r}");
+}
