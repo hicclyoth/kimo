@@ -88,6 +88,7 @@ pub fn apply(kind: &str, params: &Params, strings: &BTreeMap<String, String>, f:
     if kind == "field_operator" { return crate::noise_fields::apply(params,strings,f,t); }
     if kind == "coherent_noise" { return crate::noise::apply(params,strings,f,t); }
     if ["displace","convolution","grade"].contains(&kind){return crate::shader_ops::apply(kind,params,strings,f,t);}
+    if kind == "vfx_graph" { return crate::vfx_graph::apply_effect(params, strings, f, t, seed); }
     if kind == "pixel_expr" {
         let source=strings.get("expr").cloned().unwrap_or_else(||format!("vec4({},{},{},{})",strings.get("r").map(String::as_str).unwrap_or("r"),strings.get("g").map(String::as_str).unwrap_or("g"),strings.get("b").map(String::as_str).unwrap_or("b"),strings.get("a").map(String::as_str).unwrap_or("a")));
         let cap=crate::resource_limits::current().expr_max_ops.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;

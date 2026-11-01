@@ -25,7 +25,7 @@ impl Place { pub fn identity(&self) -> bool { (self.scale - 1.0).abs() < 1e-9 &&
 
 /// The string key holding the driving clip's id.
 /// lens_blur carries one only when add_lens_blur was given a depth map (depth_clip); without it the lens blur is an ordinary effect.
-pub fn source_key(kind: &str) -> Option<&'static str> { match kind { "displacement_map" => Some("map_clip"), "set_matte" => Some("matte_clip"), "lens_blur" | "depth_parallax" => Some("depth_clip"), "channel_combiner" | "set_channels" | "match_grain" => Some("ref_clip"), "subject_clone" => Some("mask_clip"), _ => None } }
+pub fn source_key(kind: &str) -> Option<&'static str> { match kind { "displacement_map" => Some("map_clip"), "set_matte" => Some("matte_clip"), "lens_blur" | "depth_parallax" => Some("depth_clip"), "channel_combiner" | "set_channels" | "match_grain" => Some("ref_clip"), "subject_clone" => Some("mask_clip"), "vfx_graph" => Some("mask_clip_id"), _ => None } }
 /// True when the effect is driven by another clip right now (its source key is set).
 pub fn driven(e: &Effect) -> bool { source_key(&e.kind).is_some_and(|k| e.strings.contains_key(k)) }
 
@@ -219,4 +219,4 @@ pub fn subject_clone(e: &Effect, f: &mut Frame, mask: &Frame, lt: f64) {
         } }
     }
 }
-pub fn apply(e: &Effect, f: &mut Frame, src: &Frame, lt: f64, place: Option<Place>, seed: u64) { match e.kind.as_str() { "displacement_map" => displace(e, f, src, lt, place), "set_matte" => set_matte(e, f, src), "lens_blur" => lens_depth(e, f, src, lt), "depth_parallax" => depth_parallax(e, f, src, lt), "channel_combiner" => channel_combiner(e, f, src, lt), "set_channels" => set_channels(e, f, src, lt), "match_grain" => match_grain(e, f, src, lt, seed), "subject_clone" => subject_clone(e, f, src, lt), _ => {} } }
+pub fn apply(e: &Effect, f: &mut Frame, src: &Frame, lt: f64, place: Option<Place>, seed: u64) { match e.kind.as_str() { "displacement_map" => displace(e, f, src, lt, place), "set_matte" => set_matte(e, f, src), "lens_blur" => lens_depth(e, f, src, lt), "depth_parallax" => depth_parallax(e, f, src, lt), "channel_combiner" => channel_combiner(e, f, src, lt), "set_channels" => set_channels(e, f, src, lt), "match_grain" => match_grain(e, f, src, lt, seed), "subject_clone" => subject_clone(e, f, src, lt), "vfx_graph" => crate::vfx_graph::apply_driven(e, f, src, lt, seed), _ => {} } }

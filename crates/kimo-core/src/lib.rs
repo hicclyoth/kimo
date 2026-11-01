@@ -69,6 +69,7 @@ pub mod tracking; pub mod roto; pub mod robust_est; pub mod mask_track;
 pub mod stabilize;
 pub mod edit;
 pub mod effects2;
+pub mod vfx_graph;
 pub mod color;
 pub mod keying;
 pub mod colortools;
