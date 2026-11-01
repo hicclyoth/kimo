@@ -387,3 +387,34 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(r["ok"] == json!(true), "{r}");
     assert!(r["stages"]["push_in"].is_null(), "a single very short b-roll clip (<1.2s) should leave nothing to push in: {r}");
 }
+
+
+/// V8.2V job 2: a single long uncut talking-head take (no internal pause for rough_cut/tighten_pauses to
+/// split on) must still end up broken into pieces no longer than punch_max_static, so add_punch_ins has
+/// real wide/tight variation to alternate -- the actual "never static past ~4-5s" promise, not just a
+/// single clip sitting there the whole time.
+#[test] fn job2_splits_a_long_uncut_dialogue_take_for_punch_ins() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("longtake_th.mp4", &[(0.0, 10.0)], 0.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "captions": false, "grade": false, "push_in": false, "broll_color_match": false, "end_screen": false, "pacing": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let pin = r["stages"]["punch_ins"]["clips"].as_array().unwrap_or_else(|| panic!("punch_ins stage missing for a 10s single take: {r}"));
+    assert!(pin.len() >= 2, "a 10s single take should have been split into multiple pieces for punch-ins, got {}: {r}", pin.len());
+    for cp in pin {
+        let cid = sid(cp, "clip_id");
+        let c = ss.project.find_clip(&cid).unwrap();
+        assert!(c.duration <= 4.5 + 1e-6, "clip {cid} is {:.2}s, should never exceed punch_max_static (4.5s default): {r}", c.duration);
+    }
+    assert!(pin.iter().any(|c| c["punched"] == json!(true)), "expected at least one punched segment among the split pieces: {r}");
+}
+
+/// punch_max_static is a real, respected knob: set high enough, a short single take is left exactly as
+/// before (one clip, the pre-existing "not enough to alternate" warning) -- job 2 never forces a split that
+/// isn't needed.
+#[test] fn job2_punch_max_static_is_configurable() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("longtake_nosplit_th.mp4", &[(0.0, 6.0)], 0.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "captions": false, "grade": false, "push_in": false, "broll_color_match": false, "end_screen": false, "pacing": false, "punch_max_static": 30.0}));
+    assert!(r["ok"] == json!(true), "{r}");
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("punch-ins skipped")), "a 6s take under a 30s ceiling should be left as one clip (pre-existing not-enough-clips warning): {r}");
+}

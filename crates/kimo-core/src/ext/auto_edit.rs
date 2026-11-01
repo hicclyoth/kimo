@@ -37,6 +37,30 @@ fn covered_fraction(s: f64, e: f64, cover: &[(f64, f64)]) -> f64 {
     (covered / span).clamp(0.0, 1.0)
 }
 
+/// V8.2V job 2: where to split a long uncovered dialogue stretch so no piece sits static past `max_static`
+/// seconds. Prefers a real pause in the words (a gap of >=0.12s between two consecutive words, the nearest
+/// one to each ~max_static mark) so a cut lands between sentences/phrases, not mid-word; where no such pause
+/// exists nearby (a single breathless take), splits at the plain interval instead, so the rule always holds.
+fn split_points(clip_start: f64, clip_end: f64, words: &[Value], max_static: f64) -> Vec<f64> {
+    let mut pauses: Vec<f64> = vec![];
+    for w in words.windows(2) {
+        let (Some(pe), Some(ns)) = (w[0]["end"].as_f64(), w[1]["start"].as_f64()) else { continue };
+        if ns - pe >= 0.12 && ns > clip_start + 0.5 && ns < clip_end - 0.5 { pauses.push(ns); }
+    }
+    pauses.sort_by(f64::total_cmp);
+    let mut points = vec![];
+    let mut last = clip_start;
+    loop {
+        let ideal = last + max_static;
+        if ideal >= clip_end - 0.5 { break; }
+        let pick = pauses.iter().filter(|&&p| p > last + 1.0 && p <= ideal + max_static * 0.3).min_by(|x, y| (**x - ideal).abs().total_cmp(&(**y - ideal).abs()));
+        let t = *pick.unwrap_or(&ideal);
+        points.push(t);
+        last = t;
+    }
+    points
+}
+
 fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let th_ids = str_list(a, "talking_head_asset_ids");
     if th_ids.is_empty() { return Err("talking_head_asset_ids: give one or more imported talking-head asset ids, in story order (import_media first)".into()); }
@@ -168,6 +192,31 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
             }
         }
         if !pushed.is_empty() { stages.insert("push_in".into(), json!({"clips": pushed})); }
+    }
+
+    // 2c. V8.2V job 2: force extra splits on any uncovered dialogue stretch that would otherwise sit static
+    // longer than punch_max_static -- natural-pause splitting (rough_cut, tighten_pauses) already breaks up
+    // most real takes, but a continuous sentence with no breath (or a single long uncut take) can leave one
+    // giant clip with nothing for add_punch_ins below to alternate against. A clip already mostly covered by
+    // b-roll is left alone (nobody sees its zoom anyway, same reasoning as the visibility filter just below).
+    let punch_max_static = opt_num(a, "punch_max_static", 4.5).clamp(1.5, 20.0);
+    if punch_on {
+        let mut next_dialogue = Vec::with_capacity(dialogue_clips.len());
+        for (id, s, e) in dialogue_clips.drain(..) {
+            if e - s <= punch_max_static || covered_fraction(s, e, &broll_ranges) >= 0.5 { next_dialogue.push((id, s, e)); continue; }
+            let points = split_points(s, e, &transcript_words, punch_max_static);
+            let mut cur_id = id; let mut cur_start = s; let mut ok = true;
+            for t in &points {
+                match call(ss, "split_clip", &json!({"clip_id": cur_id, "at": t})) {
+                    Ok(v) => { let right = v["right_clip_id"].as_str().unwrap_or_default().to_string();
+                        next_dialogue.push((cur_id, cur_start, *t)); cur_id = right; cur_start = *t; }
+                    Err(e2) => { warnings.push(format!("long-take split skipped on clip {cur_id}: {e2}")); ok = false; break; }
+                }
+            }
+            if !ok && cur_start == s { next_dialogue.push((cur_id, s, e)); continue; }
+            next_dialogue.push((cur_id, cur_start, e));
+        }
+        dialogue_clips = next_dialogue;
     }
 
     // 3. Punch-ins (jump-cut zoom variation) only on the dialogue clips that stay mostly on screen -- a
@@ -436,6 +485,7 @@ pub fn commands() -> Vec<Command> {
                 ("captions", json!({"type": "boolean", "description": "default true"})),
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),
+                ("punch_max_static", n("force an extra split so no dialogue stretch sits static past this many seconds, default 4.5, clamped 1.5..20")),
                 ("push_in", json!({"type": "boolean", "description": "default true: slow Ken Burns push-in on static b-roll cutaways"})),
                 ("push_in_zoom", n("push-in target scale by the cutaway's end, default 1.05 (5%), clamped 1.01..1.3")),
                 ("grade", json!({"type": "boolean", "description": "default true: auto_grade every clip"})),
