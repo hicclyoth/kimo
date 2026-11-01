@@ -1,3 +1,5 @@
+New in v8.5.1: a look-library quality pass on real footage, not just technical correctness. 6 of the 9 looks read as barely-there on a phone screen at a glance (`ember_drift`, `chrome_bloom`, `dream_haze`, `vhs_decay`, `aurora_wash`, `glitch_surge`) -- each reworked and re-verified against real footage with `vfx_preview` before shipping (see CHANGELOG for the per-look before/after). `magic_sparkle` and `solar_flare` were visible but mild and are pushed further; `frost_veil` was already strong and is untouched. All 9 names, schemas and the `apply_vfx_preset` tool are unchanged -- this is graph/parameter work inside the existing look library, not a new surface.
+
 New in v8.5.0: a composable VFX node-graph engine (`vfx_graph` effect kind: `effect` nodes wrap any
 existing effect by name, `solid`/`gradient`/`shape` generators, `blend`, `mask_apply`, `mask_clip`,
 and a `particles` node that calls Kimo's existing deterministic emitter directly), `add_vfx_graph` /

@@ -1,3 +1,91 @@
+## v8.5.1 (2026-11-01)
+
+Look library quality pass. Naman's goal is "put any clips into Kimo and get top-YouTube-editor
+quality" judged by how the frames actually look -- so this pass is a straight review-and-rework of
+the 9 v8.5.0 looks against real footage (the talking-head clip in `work/v7q_real`), not a feature
+add. Verdict going in: `frost_veil` strong; `magic_sparkle`/`solar_flare` visible but mild; the other
+6 (`ember_drift`, `chrome_bloom`, `glitch_surge`, `dream_haze`, `vhs_decay`, `aurora_wash`) nearly
+indistinguishable from source at a glance on a phone. Every change below was iterated with
+`vfx_preview` (no rebuild needed per tweak -- it takes an arbitrary graph JSON directly) and the peak
+frame inspected at full size before touching `vfx_look_library.rs`; none of the 9 needed cutting --
+all read clearly after the rework.
+
+- **`ember_drift`**: the old graph used the `sparks` particle preset at its fixed default spawn point
+  (a tiny fountain near the chest) -- technically "particles" but not "rising from the lower edge" and
+  barely visible even at full intensity. Replaced with an explicit (no-preset) particle emitter: a
+  wide line along the very bottom of frame, gentle upward buoyancy (negative gravity, modest speed),
+  warm orange-to-red colour ramp, and a life short enough (~2.2s at this speed) that embers fade out
+  roughly a third of the way up frame -- clear of a centred subject's face by construction, not by
+  luck. Teal/orange grade and bloom amounts raised alongside it.
+- **`chrome_bloom`**: bloom's threshold/amount pushed hard for a real "strong bloom on highlights"
+  read, plus a `tint_r/g/b` cool tint on the bloom itself. The grade is now cool temperature + a
+  desaturation pass + a touch of contrast, instead of relying on chromatic-fringe alone for the
+  "chrome" read. Chromatic aberration and sharpen are dialled back from a first pass that aliased
+  badly (visible moire) on a patterned shirt at full intensity -- unmistakable without reintroducing
+  the aliasing the brief rules out.
+- **`glitch_surge`**: was a constant mild amount at every frame -- visible as a texture, not as a
+  "glitch". `glitch_blocks`' and `rgb_split`'s `amount` params now ride a new `pulse_prop` helper: a
+  keyframed Prop (sharp attack, quick decay, `loop_out: cycle`) that punches hard on a ~0.55s period
+  and settles to a light scanline/fringe texture between hits -- deterministic "on the beat" with no
+  audio analysis (the engine only exposes the current instant `t`; see `vfx_graph.rs`'s own module
+  note). Peak-intensity ceilings dialled back once from an even punchier first pass that fully
+  scrambled a face at the attack frame -- still a real punch, face stays recognisable through it.
+- **`dream_haze`**: added a real `halation` pass (the dedicated effect, distinct from `bloom`) for
+  "clear halation", and a `grade` lift/gain pass (gentle lift on all three channels, a touch of gain
+  pull on blue/green) plus mild desaturation for "lifted pastel" -- the old graph had neither; it was
+  blur + bloom + light_rays + temperature + vignette, which reads as "soft", not specifically "hazy
+  with lifted pastel shadows".
+- **`vhs_decay`**: rebuilt on the dedicated `vhs` effect kind (per-line wobble, chroma bleed via
+  offset RGB sampling, noise, and a moving tracking band) layered with scanlines/grain/desaturation/
+  vignette. The old graph (grain + scanlines + chromatic_aberration + saturation) had no actual line
+  wobble or tracking band -- which is most of what reads as "worn VHS tape" rather than just "a bit
+  degraded". Values tuned down once from a first pass that was dramatic but left the face too
+  degraded to read at full intensity.
+- **`aurora_wash`**: the gradient wash was static -- a flat tinted overlay, not "flowing colour
+  bands". `angle_deg` now rides a `sin`-expr keyframe Prop for a slow deterministic swing (no literal
+  flow is possible: `gen_gradient`'s own stop parsing reads position/colour with plain `as_f64()`, not
+  `value_to_prop`, so stop values themselves can't be keyframed today -- a pre-existing engine gap
+  this pass did not touch), a third colour stop was added for a richer band structure, the wash is
+  blurred before blending so it reads as soft bands rather than a sharp gradient edge, and overlay
+  opacity plus the base bloom were both raised.
+- **`magic_sparkle`**: pushed further per the brief (bloom amount/threshold, dust rate/size all
+  raised) -- and in doing so, found and fixed a face-safety bug the push would otherwise have made
+  worse: the `magic_dust` preset's own default spawn point (x=0.5, y=0.5, a 0.15-radius circle) sits
+  squarely on a centred subject's face, so "push it further" without repositioning means MORE
+  particles ON the face. The three dust emitters are now explicit (no preset defaults relied on),
+  placed left, right and low-centre -- framing the subject instead of covering it.
+- **`solar_flare`**: pushed further per the brief -- and the same review caught a second problem the
+  push introduced: a stronger `light_rays` + `halation` + `bloom` + `exposure` stack blew 41.7% of a
+  real frame to clipped white (mean luma 0.86), which is a washed-out frame, not a strong look, by the
+  brief's own words. Every amount in the final graph is tuned down from that first pass to land a
+  strong, unmistakable flare that still leaves the subject's face and most of the frame readable
+  (measured clipping ~29-35% afterward, contained to the flare's own highlight, not the whole shot).
+- **`frost_veil`**: untouched -- Tab's verdict going in was "strong" on real footage, and the previous
+  worker had already reworked its one real miss (`edge_glow` reading as a full wireframe) before the
+  8.5.0 wrap.
+- New helper in `vfx_look_library.rs`: `pulse_prop(period, low, high)` (a periodic keyframed Prop via
+  `loop_out: cycle`, used by `glitch_surge`) and `particles_raw` (an explicit particles node with no
+  preset, used by `ember_drift` and `magic_sparkle` to avoid fighting a preset's own frame-centred
+  defaults).
+- v01 demos kept on disk untouched; new v02 demos rendered for all 9 looks
+  (`files/v7q/v85_<look>_v02.mp4`, 5s, real talking-head footage, intensity 0.7 for a fair like-for-
+  like comparison across looks) plus a new side-by-side contact sheet, source vs look at each look's
+  own peak frame (`files/v7q/v85_look_library_contact_sheet_v02.png`).
+- Tests: `vfx_look_library.rs`'s 5 tests are structural over `NAMES` (every look builds/validates/
+  visibly changes a frame at 3 intensities) and needed no expectation changes -- none of the 9 looks
+  were cut, and none broke the "visibly different from source" contract. `vfx_graph_core`/`_tools`/
+  `_particles`, `surreal_vfx_tools`, `golden_frames` (incl. `golden_registry_contract`), `recipes`
+  (incl. `golden_frames_per_recipe`), `registry_lint`, `registry_unique` all green, unmoved -- this
+  pass only touches `vfx_look_library.rs`'s graph JSON and adds two private helper functions; no
+  tool schema, effect kind, or registry entry changed.
+- Warnings: 34 (cap 35; unchanged from 8.5.0 -- nothing added, nothing newly unused).
+- Benchmark: `real_v50.mp4` (fonts already present in this worktree from the previous pass) re-ran
+  `examples/auto_edit_benchmark.py` against the same real folder with the 8.5.1 build -- md5
+  `82ef81b676c9b78a3428e6d4bc57d8b4`, matching `real_v44`-`v47`/`v49` exactly. No code in this pass
+  touches auto_edit, captions, or the render/export path -- only `vfx_look_library.rs`'s own graph
+  JSON, which is opt-in and unrelated to the default auto-edit path -- so this is confirmation, not a
+  surprise.
+
 ## v8.4.0 (2026-11-01)
 
 V8.4 surreal VFX tools. Inventoried the existing stylize catalog first (set_echo, kaleidoscope/
