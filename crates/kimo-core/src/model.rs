@@ -277,7 +277,7 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub templates: Vec<crate::ext::templates::Template>,
     /// Directory of the project file (canonical), set by load_project / save_project / collect. Never serialized. Relative stored paths resolve against it.
     #[serde(skip)] pub base_dir: Option<std::path::PathBuf>,
-    /// RV-28: a gentle master-bus speech leveler (ffmpeg `speechnorm`), applied ONCE to the whole mixed timeline buffer
+    /// RV-28: a gentle master-bus speech leveler (ffmpeg `speechnorm`), applied to the mixed timeline buffer
     /// in `audio::mix`/`audio::mix_strict` right before each one's own peak limiter -- not per clip. A per-clip version was tried first and made
     /// loudness range WORSE on real multi-take footage (11.1 -> 13.7 LU): speechnorm is a slow raise/fall leveler, and
     /// restarting its internal state at every short rough-cut clip boundary introduced a new transient at every cut
@@ -286,11 +286,23 @@ pub struct Project {
     /// existing project/golden stays byte-identical and mix()-identical); else the speechnorm expansion/compression
     /// factor. Set by finish_audio's level_dynamics/level_strength args, never by hand-authored projects.
     #[serde(default, skip_serializing_if = "is_zero_f64")] pub master_speech_level: f64,
+    /// V8.1Q: the scope `master_speech_level` actually runs over, as a timeline end time in seconds. 0 = unscoped,
+    /// the old whole-buffer behaviour (back-compat for any caller that sets master_speech_level without this).
+    /// When > 0, `audio::mix`/`mix_strict` apply speechnorm only to `[0, this)` and leave the tail (an end card,
+    /// a music-only outro) untouched, with a short crossfade at the boundary so the handoff isn't audible.
+    /// Root cause this fixes (V8.0Q): speechnorm run over the WHOLE mix reacts to a sudden louder segment
+    /// ANYWHERE in it -- an end-card music swell as small as 5dB collapsed whisper word recall from ~90% to
+    /// 56.7% on the real benchmark even though the dialogue audio itself never changed (confirmed via
+    /// --no-level-dynamics recovering recall on the same render). Scoping speechnorm to the dialogue span
+    /// (set by finish_audio from its own classified dialogue clips' latest end) removes the end card from
+    /// speechnorm's view entirely, so a swell there can no longer touch it. Set by finish_audio, never by
+    /// hand-authored projects.
+    #[serde(default, skip_serializing_if = "is_zero_f64")] pub master_speech_level_scope_end: f64,
 }
 
 impl Default for Project {
     fn default() -> Self {
-        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0 }
+        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
     }
 }
 

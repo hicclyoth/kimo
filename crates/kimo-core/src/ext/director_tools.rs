@@ -679,11 +679,19 @@ fn finish_audio(ss: &mut Session, a: &Value) -> Result<Value, String> {
     for id in &dia {
         call(ss, "set_audio", &json!({"clip_id": id, "highpass": 80, "compress": true, "compress_amount": compress_strength}))?;
     }
-    // RV-28: speech leveling runs ONCE over the whole mixed timeline (master_speech_level, read by audio::mix),
+    // RV-28: speech leveling runs ONCE over the mixed timeline (master_speech_level, read by audio::mix),
     // not per clip -- a per-clip version was tried first and widened loudness range instead of narrowing it
     // (restarting speechnorm's state at every short rough-cut boundary is itself a new transient). See the
     // field's doc on Project for the measured before/after.
     ss.project.master_speech_level = if level_on { level_strength } else { 0.0 };
+    // V8.1Q: scope that leveling to the dialogue span itself (master_speech_level_scope_end, read by
+    // audio::mix/mix_strict) -- the latest end of any clip this pass just classified as dialogue, which is
+    // exactly the boundary beyond which only music/ambience (an end card, a music-only tail) ever plays.
+    // `dia` is populated above from clips already on the timeline right now, so this is correct whenever
+    // finish_audio runs, including a later re-invocation from apply_review_fixes after an end card exists --
+    // the end card's own title/background clips are never classified as dialogue, so they never move this.
+    let dia_end = dia.iter().filter_map(|id| ss.project.find_clip(id)).map(|c| c.start + c.duration).fold(0.0_f64, f64::max);
+    ss.project.master_speech_level_scope_end = if level_on { dia_end } else { 0.0 };
     // level the dialogue clips to the loudest one (so a quiet speaker comes up), then trim the whole mix to the target below
     let meas: Vec<(String, Option<f64>)> = dia.iter().map(|id| (id.clone(), clip_lufs(ss, id))).collect();
     let refl = meas.iter().filter_map(|(_, l)| *l).fold(f64::NEG_INFINITY, f64::max);

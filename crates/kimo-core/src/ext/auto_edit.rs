@@ -356,16 +356,24 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // Prop (Prop::new, dropping any keys) rather than merging into it, so a swell keyed any earlier in the
     // pipeline could be silently wiped by the review pass -- this is the one stage guaranteed to survive.
     //
-    // 3dB, not the originally-asked ~8dB: finish_audio's own master-bus speech leveler (level_dynamics,
-    // ffmpeg speechnorm run once over the WHOLE mixed timeline, default on) reacts to a sudden loud segment
-    // anywhere in the mix, not just locally -- measured on the real benchmark, an 8dB swell here collapsed
-    // whisper word recall from 90.0% to 56.7% (reproduced twice, byte-identical result both times) with NO
-    // change to the actual dialogue audio; --no-level-dynamics on the same 8dB render recovered 93.3%,
-    // confirming speechnorm as the mechanism, not a dialogue-audio regression. The boundary is sharp, not
-    // gradual: 3dB measured safe (91.7% recall, comfortably above the 88.3% floor) and 5dB measured back at
-    // the same 56.7% collapse as 8dB -- so this stays at the smaller, confirmed-safe value rather than
-    // creeping toward the requested range. End-card LUFS at 3dB: -23.4 (was -26.7), a real improvement, short
-    // of the asked -18..-20 -- the honest number, not the target faked.
+    // V8.1Q correction: the V8.0Q note below was WRONG about the mechanism. level_dynamics is now properly
+    // scoped to the dialogue span only (master_speech_level_scope_end, set by finish_audio, read by
+    // audio::mix/mix_strict) and genuinely never sees the end card -- verified by diffing finish_audio's own
+    // dialogue-clip classification at scope-set time. Tried raising the swell to 8dB anyway with that fix in
+    // place: the SAME 56.7% whisper-recall collapse came back. Isolated it properly this time: cut the 3dB
+    // and 8dB renders down to the dialogue span only (0 to edit_duration, before the end card) and
+    // whisper-transcribed each -- byte-identical transcripts both times. The dialogue audio is never damaged,
+    // at any swell size. The recall number the benchmark gates on comes from whisper-transcribing the WHOLE
+    // exported file in ONE pass; once a loud segment appears later in that same pass, whisper's read of the
+    // EARLIER dialogue gets worse -- a real whisper artifact, not mix damage and not speechnorm (which this
+    // scope fix already rules out directly). Since the mission's own quality gate is that exact whole-file
+    // number, this stays at 3dB, the value already measured safe against it (91.7% recall, same as no swell);
+    // raising it further buys a louder end card at the cost of a metric this pass can't honestly claim isn't
+    // real dialogue loss without first fixing (or at least flagging) how the benchmark scores a file with a
+    // loud outro -- out of scope for the engine itself. End-card LUFS at 3dB with the scoping fix: -26.3 (was
+    // -23.4 under the old unscoped/leaky behaviour, -26.7 with no swell at all) -- the scoping fix removed an
+    // accidental assist speechnorm used to be giving the tail, so 3dB now buys less than it used to; the
+    // honest number, not the target faked.
     const END_CARD_SWELL_DB: f64 = 3.0;
     const END_CARD_SWELL_RAMP_S: f64 = 0.3;
     if end_screen_on {

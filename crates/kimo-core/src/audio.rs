@@ -108,6 +108,33 @@ fn level_neutral(pcm: &[f32], strength: f64) -> Vec<f32> {
         _ => leveled,
     }
 }
+/// V8.1Q: apply `master_speech_level` scoped to `master_speech_level_scope_end` (see its doc on Project) rather
+/// than to the whole buffer. Shared by `mix` and `mix_strict` so finish_audio's own internal loudness
+/// measurement (which goes through mix_strict via measure_loudness) and the real export (mix) always see the
+/// same thing -- a mismatch there would mean finish_audio converges the mix to a target the export doesn't
+/// actually hit. A 50ms crossfade at the scope boundary keeps the handoff from the leveled dialogue to the
+/// untouched tail from being an audible seam.
+fn apply_master_speech_level(p: &Project, out: Vec<f32>) -> Vec<f32> {
+    if p.master_speech_level <= 0.0 { return out; }
+    let scope_end = p.master_speech_level_scope_end;
+    if scope_end <= 0.0 { return level_neutral(&out, p.master_speech_level); }
+    let n_scope = (((scope_end * SR as f64).round() as usize) * 2).min(out.len());
+    if n_scope == 0 { return out; }
+    let leveled = level_neutral(&out[..n_scope], p.master_speech_level);
+    let mut result = leveled;
+    if n_scope < out.len() {
+        let xfade_frames = ((SR as f64 * 0.05) as usize).min(n_scope / 2);
+        let fade_start = n_scope - xfade_frames * 2;
+        for k in 0..xfade_frames {
+            let t = (k as f32 + 1.0) / xfade_frames.max(1) as f32;
+            let idx = fade_start + k * 2;
+            result[idx] = result[idx] * (1.0 - t) + out[idx] * t;
+            result[idx + 1] = result[idx + 1] * (1.0 - t) + out[idx + 1] * t;
+        }
+        result.extend_from_slice(&out[n_scope..]);
+    }
+    result
+}
 /// Mix every media clip's audio (and audio-only assets) into one interleaved stereo buffer.
 pub fn mix(p: &Project) -> Vec<f32> {
     let total = ((p.duration() * SR as f64).ceil() as usize) * 2; let mut out = vec![0f32; total];
@@ -125,7 +152,7 @@ pub fn mix(p: &Project) -> Vec<f32> {
             if off + i + 1 < out.len() { out[off + i] += s[i] * g * (1.0-pv.max(0.0)) as f32; out[off + i + 1] += s[i + 1] * g * (1.0+pv.min(0.0)) as f32; }
         }
     }}
-    if p.master_speech_level > 0.0 { out = level_neutral(&out, p.master_speech_level); }
+    out = apply_master_speech_level(p, out);
     limit(&mut out, -1.5);
     out
 }
@@ -220,7 +247,7 @@ pub fn mix_strict(p:&Project)->Result<Vec<f32>,AudioError>{
  let s=match strict_decode(&p.resolve(&a.path),c){Ok(v)=>v,Err(AudioError::NoAudioTrack)=>continue,Err(e)=>return Err(e)};let off=((c.start*SR as f64) as usize).checked_mul(2).ok_or_else(||AudioError::ResourceLimit("audio offset overflow".into()))?;let n=((c.duration*SR as f64) as usize).checked_mul(2).ok_or_else(||AudioError::ResourceLimit("clip samples overflow".into()))?.min(s.len());
  for i in (0..n).step_by(2){if i%65536==0{crate::guard::check()}let lt=(i/2) as f64/SR as f64;let kt=if ko==0.{lt}else{lt-ko};let mut g=(crate::keyframe::clamp_prop("volume",c.audio.volume.at(kt))*c.audio.duck_gain.at(kt)) as f32;if !g.is_finite(){return Err(AudioError::InvalidInput("nonfinite volume".into()))}if c.audio.fade_in>0.&&lt<c.audio.fade_in{g*=(lt/c.audio.fade_in) as f32}let rem=c.duration-lt;if c.audio.fade_out>0.&&rem<c.audio.fade_out{g*=(rem/c.audio.fade_out) as f32}let pv=crate::keyframe::clamp_prop("pan",c.audio.pan.at(kt));if off.checked_add(i+1).filter(|j|*j<out.len()).is_some(){for j in 0..2{let v=out[off+i+j]+s[i+j]*g*if j==0{(1.-pv.max(0.)) as f32}else{(1.+pv.min(0.)) as f32};if !v.is_finite(){return Err(AudioError::InvalidInput("audio mix overflow".into()))}out[off+i+j]=v}}}
  }}
- if p.master_speech_level>0.{out=level_neutral(&out,p.master_speech_level);}
+ out=apply_master_speech_level(p,out);
  strict_limit(&mut out,-1.5);Ok(out)
 }
 
