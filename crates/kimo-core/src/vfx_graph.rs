@@ -47,6 +47,7 @@ pub const NODE_CATALOG: &[(&str, &str, &[&str])] = &[
     ("blend", "Composites two node outputs. inputs a, b. params.mode 'normal'|'add'|'screen'|'multiply'|'overlay'|'difference', params.opacity 0..1.", &["a", "b"]),
     ("mask_apply", "Multiplies source's alpha by mask's luma (falls back to mask's own alpha if its RGB is flat zero). inputs source, mask. params.invert 0/1.", &["source", "mask"]),
     ("mask_clip", "The externally driven mask/depth clip set via strings.mask_clip_id on the owning add_vfx_graph call, rendered at the SAME instant as this frame (no time-offset -- see the module note). No inputs; read-only source.", &[]),
+    ("particles", "A deterministic seeded particle system (Kimo's existing crate::particles emitter -- point/line/circle/rect/ring shapes, or 'layer' spawning from an optional 'mask' input's alpha, edge-only with emit_edge): gravity/wind/drag/turbulence/attractor/vortex forces, soft/hard/streak/ring/star/spark/mote/puff/card sprites, additive blend, life-curve size/colour/alpha. params.preset names a built-in look (fire, sparks, snow, rain, smoke, confetti, fireflies, bokeh, magic_dust, explosion, bubbles, foam, card_dance) to start from; any other param overrides that preset's field. Optional input: mask (another node's alpha, used when params.shape is 'layer').", &[]),
 ];
 
 fn known_kind(k: &str) -> bool { NODE_CATALOG.iter().any(|(n, _, _)| *n == k) }
@@ -177,19 +178,6 @@ fn str_param<'a>(params_obj: &'a Value, key: &str, default: &'a str) -> &'a str 
 }
 
 // ---------- tiny shared pixel helpers (kept local to this module; effects2.rs's own are private to it) ----------
-/// Bilinear sample used by the particle renderer's soft sprite stamp (particle_tools.rs).
-pub(crate) fn bilinear(src: &[f32], w: usize, h: usize, x: f32, y: f32) -> [f32; 4] {
-    if w == 0 || h == 0 { return [0.0; 4]; }
-    let (x, y) = (x.clamp(0.0, w as f32 - 1.001), y.clamp(0.0, h as f32 - 1.001));
-    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
-    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-    let px = |xx: usize, yy: usize| -> [f32; 4] { let i = (yy * w + xx) * 4; [src[i], src[i + 1], src[i + 2], src[i + 3]] };
-    let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
-    let mut o = [0f32; 4];
-    for j in 0..4 { o[j] = a[j] * (1.0 - fx) * (1.0 - fy) + b[j] * fx * (1.0 - fy) + c[j] * (1.0 - fx) * fy + d[j] * fx * fy; }
-    o
-}
 pub(crate) fn luma(c: &[f32]) -> f32 { 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] }
 fn clone_frame(f: &Frame) -> Frame { Frame { w: f.w, h: f.h, d: f.d.clone() } }
 fn blend_frame(mix: f64, orig: &Frame, out: &mut Frame) {
@@ -314,6 +302,26 @@ fn mask_apply(source: &Frame, mask: &Frame, params: &Value, _t: f64) -> Result<F
     Ok(out)
 }
 
+// ---------- particles node: reuses crate::particles' existing deterministic emitter wholesale ----------
+fn particles_emitter(params_obj: &Value, t: f64) -> Result<crate::particles::Emitter, String> {
+    let mut base = match params_obj.get("preset").and_then(|v| v.as_str()) {
+        Some(name) => crate::particles::preset(name).map_err(|e| format!("particles: {e}"))?,
+        None => Value::Object(Default::default()),
+    };
+    if let (Some(obj), Some(m)) = (params_obj.as_object(), base.as_object_mut()) {
+        for (k, v) in obj {
+            if k == "preset" || k == "fps" { continue; }
+            let resolved = if v.is_number() || v.is_object() {
+                let f = value_to_prop(v)?.at(t);
+                // integral values (e.g. `seed`, which is u64 on Emitter) must round-trip as a JSON integer, not 7.0
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f < (u64::MAX as f64) { Value::from(f as u64) } else { Value::from(f) }
+            } else { v.clone() };
+            m.insert(k.clone(), resolved);
+        }
+    }
+    serde_json::from_value(base).map_err(|e| format!("particles: {e}"))
+}
+
 // ---------- node params -> (Params, strings) for the "effect" node ----------
 fn effect_args(params_obj: &Value) -> Result<(Params, BTreeMap<String, String>), String> {
     let mut props: Params = BTreeMap::new();
@@ -362,6 +370,20 @@ pub fn interpret(g: &Graph, order: &[String], source: &Frame, mask_clip: Option<
             "blend" => { let a = get_input(&bufs, "a")?; let b = get_input(&bufs, "b")?; blend(&a, &b, &n.params, t)? }
             "mask_apply" => { let s = get_input(&bufs, "source")?; let m = get_input(&bufs, "mask")?; mask_apply(&s, &m, &n.params, t)? }
             "mask_clip" => mask_clip.map(clone_frame).ok_or_else(|| format!("node '{}' (mask_clip): no strings.mask_clip_id set on this add_vfx_graph call", n.id))?,
+            "particles" => {
+                let emitter = particles_emitter(&n.params, t).map_err(|e| format!("node '{}': {e}", n.id))?;
+                let mut buf = Frame::new(source.w, source.h);
+                let fps = num(&n.params, "fps", 25.0, t)?.max(1.0);
+                let use_mask = n.inputs.contains_key("mask") && emitter.shape == "layer";
+                if use_mask {
+                    let mask_frame = get_input(&bufs, "mask")?;
+                    let alpha: Vec<f32> = (0..mask_frame.w * mask_frame.h).map(|i| mask_frame.d[i * 4 + 3]).collect();
+                    crate::particles::set_emit_mask(Some((mask_frame.w, mask_frame.h, std::sync::Arc::new(alpha))), emitter.emit_edge);
+                }
+                crate::particles::render_fps(&emitter, &mut buf, t, fps);
+                if use_mask { crate::particles::set_emit_mask(None, false); }
+                buf
+            }
             other => return Err(format!("node '{}': unknown type '{}'", n.id, other)),
         };
         bufs.insert(n.id.clone(), out);
