@@ -187,7 +187,7 @@ pub fn commands() -> Vec<Command> { vec![
 
     Command { name: "apply_vfx_preset", description: "One-call surreal look: dreamy, glitch, vertigo (dolly-zoom) or echo (ghost trail), built from existing effects. dreamy is soft glow + halation + a touch of chromatic fringe + vignette; glitch is datamosh pixel-sort + digital tear blocks + chromatic split + VHS noise; vertigo is a Hitchcock dolly-zoom (needs depth_clip_id); echo is ghost-trail frame blending. intensity (0..1) scales every sub-effect together so a small model doesn't have to tune each one by hand.", mutates: true,
         schema: obj(vec![("clip_id", s("clip to apply the preset to")),
-            ("preset", json!({"type":"string","enum":PRESETS,"description":"dreamy | glitch | vertigo | echo"})),
+            ("preset", json!({"type":"string","enum":preset_names(),"description":"dreamy | glitch | vertigo | echo (V8.4, hand-tuned multi-effect) | ember_drift | chrome_bloom | glitch_surge | dream_haze | frost_veil | magic_sparkle | vhs_decay | aurora_wash | solar_flare (V8.5, vfx_graph look library -- see crate::vfx_look_library::describe for what each one is)"})),
             ("intensity", n("0..1, how strong the whole look reads, default 0.4 (subtle)")),
             ("start_time", n("clip-local seconds the look starts (dreamy/glitch/echo apply for the clip's whole visible range regardless; vertigo ramps across this window), default 0")),
             ("end_time", n("clip-local seconds the look ends (vertigo only), default the clip's own duration")),
@@ -197,7 +197,7 @@ pub fn commands() -> Vec<Command> { vec![
             let cid = a.get("clip_id").and_then(|v| v.as_str()).ok_or("apply_vfx_preset needs clip_id")?.to_string();
             if ss.project.find_clip(&cid).is_none() { return Err(format!("no such clip {cid}")); }
             let preset = a.get("preset").and_then(|v| v.as_str()).ok_or("apply_vfx_preset needs preset")?.to_string();
-            if !PRESETS.contains(&preset.as_str()) { return Err(format!("preset must be one of {}, got {preset}", PRESETS.join(", "))); }
+            if !preset_names().contains(&preset.as_str()) { return Err(format!("preset must be one of {}, got {preset}", preset_names().join(", "))); }
             let intensity = num(&a, "intensity", 0.4, 0.0, 1.0)?;
             let mut applied = vec![];
             match preset.as_str() {
@@ -219,13 +219,24 @@ pub fn commands() -> Vec<Command> { vec![
                 "echo" => {
                     let count = (3.0 + intensity * 7.0).round(); let spacing = 0.02 + intensity * 0.03; let decay = 0.55 + intensity * 0.3;
                     crate::commands::dispatch(ss, "set_echo", &json!({"clip_id": cid, "count": count, "spacing": spacing, "decay": decay, "mode": "composite"}))?; applied.push("set_echo"); }
-                _ => unreachable!(),
+                look => {
+                    // V8.5 look library: one vfx_graph per look (see vfx_look_library.rs), full-strength mix ramped
+                    // in/out over start_time..end_time exactly like add_vfx_graph's own window -- intensity scales
+                    // each node's own params (grade amounts, particle rates, ...) rather than the top-level mix, so
+                    // the look's internal balance (e.g. a bloom relative to a grade) doesn't shift as intensity moves.
+                    let graph = crate::vfx_look_library::graph_for(look, intensity).map_err(|e| format!("apply_vfx_preset: {e}"))?;
+                    let dur = ss.project.find_clip(&cid).unwrap().duration;
+                    let start = num(&a, "start_time", 0.0, 0.0, dur)?; let end = num(&a, "end_time", dur, start, dur)?;
+                    crate::commands::dispatch(ss, "add_vfx_graph", &json!({"clip_id": cid, "graph": graph, "mix": 1.0, "start_time": start, "end_time": end}))?;
+                    applied.push("vfx_graph"); }
             }
             Ok(json!({"clip_id": cid, "preset": preset, "intensity": intensity, "sub_effects": applied})) } },
 ] }
 
 
 const PRESET_ARGS: [&str; 6] = ["clip_id", "preset", "intensity", "start_time", "end_time", "depth_clip_id"];
-const PRESETS: [&str; 4] = ["dreamy", "glitch", "vertigo", "echo"];
+// V8.4's 4 hand-tuned multi-effect presets, plus V8.5's 9 vfx_graph look-library presets (crate::vfx_look_library).
+const PRESETS_V84: [&str; 4] = ["dreamy", "glitch", "vertigo", "echo"];
+fn preset_names() -> Vec<&'static str> { PRESETS_V84.iter().copied().chain(crate::vfx_look_library::NAMES.iter().copied()).collect() }
 
 

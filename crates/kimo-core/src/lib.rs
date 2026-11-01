@@ -70,6 +70,7 @@ pub mod stabilize;
 pub mod edit;
 pub mod effects2;
 pub mod vfx_graph;
+pub mod vfx_look_library;
 pub mod color;
 pub mod keying;
 pub mod colortools;

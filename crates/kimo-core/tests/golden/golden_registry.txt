@@ -69,7 +69,7 @@ apply_camera_solve 01dc5fd029068bb6
 apply_motion_preset 7cfb92221fb1f5d8
 apply_responsive_time cf77602d5eaadee4
 apply_review_fixes d9f13340b644fab9
-apply_vfx_preset 75c91875f8ca0a30
+apply_vfx_preset 576c5938799116e6
 audio_effect_describe 07a0a16b3052585b
 audio_filter_response 4cae8e36278fcc87
 audio_probe 15e29ff927c2d40a
