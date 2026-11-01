@@ -16,7 +16,8 @@ add_counter 2cfd3406e38575f3
 add_depth_parallax cc1c6063f0930b13
 add_detection_box e740cc0690940b44
 add_displacement_map be79622940cf29ef
-add_effect 332a58e2724ee9e4
+add_droste_zoom 6613207b378704f2
+add_effect 6d34af40ebc8bd49
 add_emitter 163900fc22436efa
 add_glitch_confetti ea3c9845ccf22d20
 add_glow_text 11957bdb81e0bc57
@@ -38,6 +39,7 @@ add_path_key cf58f43b9b5a2a16
 add_path_operator 196bd4ba39ae182d
 add_path_shape 7a38d9af75a4a47f
 add_pip 1e76155401cd8c73
+add_portal_mirror 73d766607af5337e
 add_prompt_box 1f7b236e95633eb0
 add_punch_ins f51612dec98633d9
 add_push_wipe 4869e61f95c4c704
@@ -53,6 +55,7 @@ add_text_animator 7c837530f3da76ca
 add_title ef78e3db77ecd193
 add_track cf1da67768a18dbb
 add_transition bb51e8386d1e8f16
+add_vertigo_zoom 19a177a511ee9471
 add_watermark b96ec8e068099019
 analyze_color 34563f36b4186ca4
 analyze_exposure 9ca9ecd0326382b4
