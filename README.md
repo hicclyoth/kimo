@@ -11,7 +11,7 @@ Plug it into Claude Code, Codex, Cursor or any MCP client and watch the edit hap
 
 <a href="https://getkimo.tech"><img alt="Website" src="https://img.shields.io/badge/getkimo.tech-FF5C28?style=for-the-badge&labelColor=0E0E12"></a>
 <a href="https://github.com/naman-sharma12345/kimo/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/naman-sharma12345/kimo?style=for-the-badge&label=download&labelColor=0E0E12&color=F4F0E8"></a>
-<a href="#-connect-your-ai"><img alt="MCP" src="https://img.shields.io/badge/MCP-452%20tools-F4F0E8?style=for-the-badge&labelColor=0E0E12"></a>
+<a href="#-connect-your-ai"><img alt="MCP" src="https://img.shields.io/badge/MCP-526%20tools-F4F0E8?style=for-the-badge&labelColor=0E0E12"></a>
 
 <a href="https://github.com/naman-sharma12345/kimo/actions/workflows/kimo-validation.yml"><img alt="CI" src="https://github.com/naman-sharma12345/kimo/actions/workflows/kimo-validation.yml/badge.svg"></a>
 <a href="https://github.com/naman-sharma12345/kimo/actions/workflows/release.yml"><img alt="release build" src="https://github.com/naman-sharma12345/kimo/actions/workflows/release.yml/badge.svg"></a>
@@ -83,16 +83,18 @@ Free to use, fork and ship. Linux and Windows builds on every release.
 </tr>
 </table>
 
-## ✦ What's new in v6.0.0 "eyes"
+## ✦ What's new in v8
 
 | | |
 |---|---|
-| 🖼️ **`add_pip`** | One-call picture-in-picture: circle or rounded crop, border ring, shadow, pop-in |
-| 💬 **`add_keyword_pops`** | Emphasised words pop on screen as they're spoken, picked by you or from the transcript |
-| ➡️ **`add_arrow`** | Animated "look here" callouts with an auto start point and optional label |
-| ✂️ **Transcript editing** | `transcript_search` + `transcript_edit_apply`: cut by phrase, atomic ripple deletes, full undo. [Guide](docs/TRANSCRIPT_EDITING.md) |
-| 🎯 **Trackable `vignette`** | Roundness, size, aspect, edge tint, and a centre that follows a tracked point or mask |
-| 🔥 **`film_burn` + new metrics** | A new transition, plus `flash_series`, `audio_spectrum`, loudness curves and PSNR / SSIM / MS-SSIM comparisons |
+| 🎵 **End-card music** | The bed keeps playing, and swells, once dialogue ends instead of cutting to silence over a frozen frame |
+| 🎨 **`match_shot_look`** | B-roll auto-matched to the talking head's colour and exposure, so cutaways read as one shoot |
+| 🗣️ **Scoped speech levelling** | Loudness levelling now stays inside the dialogue span, leaving the end card's music untouched |
+| 🔎 **Auto push-ins** | Slow Ken Burns push-ins on static b-roll cutaways |
+| ✂️ **Smarter punch-ins** | A long uncut dialogue take now forces a punch-in split so pacing never goes dead |
+| 💬 **Face-aware captions** | Captions move off the bottom band when a face sits there |
+| 🌀 **B-roll whip transitions** | A short zoom-blur whip into every b-roll cutaway |
+| 🎬 **Montage mode** *(new)* | `best_segments` drops the blurry/dark/shaky footage, `beat_sync_montage` cuts on the beat with shot length that varies with the music's energy and ends on a phrase-aligned fade, `montage_color_match` keeps every clip's colour consistent — for footage with no talking at all |
 
 Full list in [CHANGELOG.md](CHANGELOG.md).
 
@@ -126,23 +128,23 @@ Installers are built by the [release workflow](.github/workflows/release.yml) on
 
 | | Linux x86_64 | Windows x64 |
 |---|---|---|
-| **Engine (CLI + MCP server)** | `kimo-v6.0.0-linux-x86_64-glibc.tar.gz` (glibc 2.35+) | `kimo-6.0.0-windows-x86_64-setup.exe` or `.zip` |
-| **Spectator app** | `Kimo-Spectator_6.0.0_amd64.deb` or `.AppImage` | `Kimo-Spectator_6.0.0_x64_en-US.msi` |
+| **Engine (CLI + MCP server)** | `kimo-v8.3.0-linux-x86_64-glibc.tar.gz` (glibc 2.35+) | `kimo-8.3.0-windows-x86_64-setup.exe` or `.zip` |
+| **Spectator app** | `Kimo-Spectator_8.3.0_amd64.deb` or `.AppImage` | `Kimo-Spectator_8.3.0_x64_en-US.msi` |
 
-Check every download against the release's [`SHA256SUMS`](https://github.com/naman-sharma12345/kimo/releases/tag/v6.0.0):
+Check every download against the release's [`SHA256SUMS`](https://github.com/naman-sharma12345/kimo/releases/tag/v8.3.0):
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing                                   # Linux
-Get-FileHash .\Kimo-Spectator_6.0.0_x64_en-US.msi -Algorithm SHA256        # Windows PowerShell
+Get-FileHash .\Kimo-Spectator_8.3.0_x64_en-US.msi -Algorithm SHA256        # Windows PowerShell
 ```
 
 **Linux**
 
 ```bash
-sudo apt install ./Kimo-Spectator_6.0.0_amd64.deb      # remove with: sudo apt remove kimo-spectator
+sudo apt install ./Kimo-Spectator_8.3.0_amd64.deb      # remove with: sudo apt remove kimo-spectator
 # or, no install:
-chmod +x Kimo-Spectator_6.0.0_amd64.AppImage
-./Kimo-Spectator_6.0.0_amd64.AppImage                  # no FUSE? add --appimage-extract-and-run
+chmod +x Kimo-Spectator_8.3.0_amd64.AppImage
+./Kimo-Spectator_8.3.0_amd64.AppImage                  # no FUSE? add --appimage-extract-and-run
 ```
 
 **Windows.** Run the `.msi`. SmartScreen says "Windows protected your PC": click **More info**, then **Run anyway**. It uses Microsoft Edge WebView2 (already on Windows 11). The engine installer goes per user, no admin, into `%LOCALAPPDATA%\Programs\kimo\bin\kimo-mcp.exe`. See the [Windows guide](packaging/windows/WINDOWS.md).
@@ -395,7 +397,7 @@ Put this in `opencode.json` in your project, or in `~/.config/opencode/opencode.
 #### Any other MCP client
 kimo is a standard MCP stdio server (protocol 2024-11-05, `initialize`, `tools/list`, `tools/call`). Any client that can register a stdio server by command works: give it the absolute path to `kimo-mcp` and no arguments. Many clients use the `mcpServers` JSON shape shown for Cursor; some (for example Zed) use a different key, so check your client's MCP docs for the exact file and format. Only the four clients above were checked against their docs.
 
-Windows: use the path to `kimo-mcp.exe` (the Windows engine installer `kimo-6.0.0-windows-x86_64-setup.exe` installs per user, no admin rights, into `%LOCALAPPDATA%\Programs\kimo` by default, so the binary is `%LOCALAPPDATA%\Programs\kimo\bin\kimo-mcp.exe` ([kimo.iss](packaging/windows/kimo.iss)); in JSON write backslashes doubled, see the [Windows guide](packaging/windows/WINDOWS.md)). The configs above are the same except for the path; the Claude Code, Codex, Cursor and OpenCode formats were checked on their docs, not tested on Windows here.
+Windows: use the path to `kimo-mcp.exe` (the Windows engine installer `kimo-8.3.0-windows-x86_64-setup.exe` installs per user, no admin rights, into `%LOCALAPPDATA%\Programs\kimo` by default, so the binary is `%LOCALAPPDATA%\Programs\kimo\bin\kimo-mcp.exe` ([kimo.iss](packaging/windows/kimo.iss)); in JSON write backslashes doubled, see the [Windows guide](packaging/windows/WINDOWS.md)). The configs above are the same except for the path; the Claude Code, Codex, Cursor and OpenCode formats were checked on their docs, not tested on Windows here.
 
 **3. Try it.** Ask your assistant: "Use kimo to import /path/to/clip.mp4, add a title, and render a frame." Or drive it yourself with the Python client in `examples/mcp_client.py`.
 
@@ -424,7 +426,7 @@ Set it like this: `claude mcp add --transport stdio --env KIMO_TOOLS=core kimo -
 
 ## ✦ What it can do
 
-**452 tools in 14 groups.** 438 are live in the default build; 16 more are feature-gated (OCIO, mesh import) and answer with a clear refusal until built in.
+526 registered tools sit in 14 groups. 438 are live in the default build; 16 more are feature-gated (OCIO, mesh import) and answer with a clear refusal until built in.
 
 | Area | Groups | Examples |
 |---|---|---|
