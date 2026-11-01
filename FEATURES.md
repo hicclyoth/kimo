@@ -1,3 +1,19 @@
+New in v8.4.0: surreal VFX tools -- `droste_zoom` (Escher-style infinite recursive spiral tunnel,
+log-polar), `portal_mirror` (a solid circular doorway into a flipped, colour-inverted world),
+`add_vertigo_zoom` (the Hitchcock dolly-zoom, a pure keyframe wrapper over the existing
+`depth_parallax`), `subject_clone` (dimmer offset copies of a masked subject, new aux-clip effect
+kind reusing the same same-time-clip plumbing as `depth_parallax`/`lens_blur`), `melt_drip`
+(experimental wavy/jitter warp -- on real footage it reads as uneven jitter rather than a clean melt,
+not used by apply_vfx_preset -- distinct from the existing symmetric `turbulent_displace`), and
+`apply_vfx_preset` (one call for a named combo -- dreamy, glitch, vertigo, echo -- built entirely on
+these and existing effects, no new pixel math of its own). `slit_scan` was scoped but dropped: it
+needs sampling the same clip at many different times in one output frame, and the only "read another
+clip" hook in the renderer (depth_parallax/lens_blur/subject_clone's own aux-clip path) fetches it at
+the SAME instant, not a different one -- doing it for real needs new render-pipeline machinery, out of
+scope for this pass. `subject_clone` is spatial-offset only for the same reason (no cheap path to a
+true time-delayed clone). No voice/audio-leveling or caption work this pass (steered off); the
+talking-head path and its benchmark are untouched. Tools: 526 -> 532.
+
 # kimo features
 
 New in v8.3.0: montage mode for non-dialogue footage (travel, sports, pets, raw phone clips) --

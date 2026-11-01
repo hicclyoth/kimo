@@ -28,7 +28,7 @@ add_managed_linear_effect 15e7663749141579
 add_marker 13b9c5a2e2022d94
 add_mask 128b6203f759a55c
 add_match_grain a1b28d4e072f25b9
-add_melt_drip 860ba2e733e594b1
+add_melt_drip c90eaea4d8da751d
 add_modifier 881425bab098ce59
 add_morph_cut f5aea6965892fcd5
 add_multicam f0d46cf978e1e7f9
@@ -51,7 +51,7 @@ add_shape_modifier 95434f64dd11932f
 add_shard_burst d5d23132405a5039
 add_smart_punch 841bcd969ba8ab27
 add_speed_lines 0db4bddd46e7a057
-add_subject_clone 92626178b82ee907
+add_subject_clone f6fe4888b2d1c573
 add_text e504fc3dce60034a
 add_text_animator 7c837530f3da76ca
 add_title ef78e3db77ecd193
@@ -68,7 +68,7 @@ apply_camera_solve 01dc5fd029068bb6
 apply_motion_preset 7cfb92221fb1f5d8
 apply_responsive_time cf77602d5eaadee4
 apply_review_fixes d9f13340b644fab9
-apply_vfx_preset 76b9255674a219c3
+apply_vfx_preset 75c91875f8ca0a30
 audio_effect_describe 07a0a16b3052585b
 audio_filter_response 4cae8e36278fcc87
 audio_probe 15e29ff927c2d40a

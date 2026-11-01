@@ -1,3 +1,118 @@
+## v8.4.0 (2026-11-01)
+
+V8.4 surreal VFX tools. Inventoried the existing stylize catalog first (set_echo, kaleidoscope/
+cc_kaleida, turbulent_displace, pixel_sort/glitch_confetti/vhs/film_damage, chromatic_aberration/
+vr_chromatic_aberration, bloom/glow/halation already cover most of a "surreal effects" wishlist) and
+built only genuinely new ones on top of existing infra. 6 new tools (526, was 532).
+
+- **`droste_zoom`** (effects2.rs, pure per-frame math, no render.rs changes): Escher/Droste infinite
+  recursive spiral tunnel via a log-polar radius wrap. Found and fixed a real bug during the demo
+  pass: the first version wrapped the RAW pixel radius into the ring range, so every output pixel
+  sampled a ~1px speck near the frame centre and painted it flat across the whole image -- a brown/
+  orange wash with no scene content, not a tunnel. Fixed by wrapping the radius RATIO against a
+  proper anchor radius (0.42x the short side) instead, so every wrapped sample lands on real picture
+  content. Re-verified by extracting frames across the whole demo clip (not one cherry-picked frame)
+  after the fix.
+  - TDD: pixel-level test confirms it changes the frame and is opt-in outside its time window.
+  - Demo: `vfx_droste_zoom_v02.mp4` (city b-roll) -- v01 is the pre-fix broken render, kept rather
+    than overwritten so the before/after is on record.
+
+- **`portal_mirror`** (effects2.rs): a soft-edged circular portal showing the frame flipped and
+  colour-inverted inside it. Same class of bug as droste_zoom's first version: `intensity` was
+  driving the blend (`mix`) itself, so anything under full intensity read as a faint, semi-
+  transparent ghost overlay with no readable portal edge. Fixed by decoupling them -- `mix` always
+  ramps to full opacity once the portal is open; `intensity` instead scales the portal's radius.
+  - TDD: confirms a flipped, colour-inverted disc appears and is fully removable.
+  - Demo: `vfx_portal_mirror_v02.mp4` (typing b-roll) -- v01 is the pre-fix translucent-ghost render,
+    kept rather than overwritten.
+
+- **`add_vertigo_zoom`** (ext/surreal_vfx_tools.rs): the Hitchcock dolly-zoom/vertigo move. Zero new
+  pixel math -- a pure keyframed convenience over the existing `depth_parallax` (zoom in while
+  dollying out, or the reverse), from a depth map clip the same way `depth_parallax` already takes
+  one.
+  - TDD: the masked subject's pixels stay put while the background moves.
+  - Demo: `vfx_vertigo_zoom_v01.mp4` (talking-head footage) with a synthetic radial depth map (no
+    automatic depth-from-RGB model exists in this engine; a centred radial gradient is a reasonable
+    stand-in for a centred portrait shot, named honestly as a limitation) -- verified across the
+    whole clip: the subject holds size while the room behind them visibly grows.
+
+- **`subject_clone`** (new effect kind in layerfx.rs, reusing the exact same same-time aux-clip
+  rendering pattern as `depth_parallax`/`lens_blur`): pastes N copies of a masked subject's own
+  pixels at growing spatial offsets, each dimmer, the real subject always sharpest/on top.
+  - TDD: a dimmer offset copy is produced and is opt-in.
+  - Demo: `vfx_subject_clone_v01.mp4` (talking-head footage). Per review, the mask is NOT hand-
+    supplied: built from Kimo's own matte tracker (`track_matte`, a couple of rough seed points,
+    optical-flow propagated through the clip) refined with `refine_matte`, rendered to PNGs and
+    assembled into a standalone mask clip -- no manual mask-drawing needed from the caller.
+  - Known limitation, stated plainly rather than silently: this is spatial-offset only, not
+    time-delayed ("echoes through time"). The only "read another clip" hook this effect (and
+    depth_parallax/lens_blur) has fetches the aux clip at the SAME instant, never a different one;
+    a true time-offset version needs new render-pipeline machinery, out of scope here.
+
+- **`melt_drip`** (effects2.rs, pure per-frame math), shipped as **experimental**: a per-column-noise
+  warp that displaces the image toward one edge (default straight down). Distinct from the existing
+  symmetric `turbulent_displace`. Two passes at this, honestly reported:
+  - A genuine pixel-math bug was found and fixed: the first version used 3 octaves of fbm noise per
+    drip column, which reads as a jagged sawtooth/zigzag (fine high-frequency wobble stacked on the
+    base lane pattern) instead of a smooth melt -- reported plainly as "a jagged wave, nothing flowing
+    downward." Fixed by dropping to 1 octave (already a smooth bilinear-interpolated noise field, see
+    `vnoise`) and replacing the raw quadratic along-the-flow growth with a smoothstep.
+  - On a synthetic horizontal-stripe test clip the fix reads clean. On real footage (coffee and city
+    b-roll, both reviewed frame-by-frame, not just one timestamp) it does not: a per-pixel diff against
+    the unwarped source shows a tight, repeating corrugated/wavy band pattern along any edge the warp
+    crosses (cup rim, hand, skyline silhouette) rather than a single smooth downward drip front. It
+    reads as an uneven wavy/jitter distortion, not a convincing melt. Rather than keep tuning against a
+    30-minute wrap budget, it ships labelled for what it actually does: the tool, its description, and
+    this entry all now say "experimental wavy/jitter warp." It is NOT used by `apply_vfx_preset`.
+  - TDD: a straight-down drip measurably drags the subject's content downward more than upward, and
+    is a no-op outside its time window. Caught and fixed a real normalisation bug while writing this
+    test too: the "how far along the flow" fraction was normalised by max(width,height), which
+    understated the effect for a non-square frame on a mostly-vertical drip; fixed to normalise by
+    the actual projected extent along the drip direction.
+  - Demo: `vfx_melt_drip_v03.mp4` (coffee b-roll, clean 0-2.8s window, intensity 1.0, size 150) --
+    v01 and v02 are the earlier, more broken renders, kept rather than overwritten. v03 is the
+    honest current state of the tool, not a "fixed, looks great" claim.
+
+- **`apply_vfx_preset`** (ext/surreal_vfx_tools.rs, pure orchestration via the same
+  `crate::commands::dispatch` path add_clip/lift_range already use to call each other): one call for
+  a named combo -- `dreamy` (glow + halation + chromatic_aberration + vignette, all pre-existing
+  effects), `glitch` (pixel_sort + glitch_blocks + chromatic_aberration + vhs, all pre-existing),
+  `vertigo` (dispatches to `add_vertigo_zoom`), `echo` (dispatches to the existing `set_echo`). No
+  new pixel math; every sub-call goes through the real tool's own validation.
+  - TDD: dreamy/glitch visibly change the frame, vertigo still locks the subject, echo dispatches
+    without error, and vertigo without `depth_clip_id` is refused rather than silently skipped.
+
+- **Dropped**: `slit_scan` was in the original candidate list and investigated, but dropped rather
+  than built. It needs reading the same clip at many different points in time within one output
+  frame; the only "read another clip" hook the renderer exposes (the one depth_parallax/lens_blur/
+  subject_clone all use) fetches an aux clip at the SAME instant as the main clip, never a different
+  one. Building real time-displacement would mean surgery in the core render loop, which is more risk
+  than this pass's safety rules (protect the goldens, stay under the warnings cap) allow for.
+  `melt_drip` was built in its place.
+
+- **Contract fix, found while wrapping**: `add_subject_clone` and `apply_vfx_preset` had first sentences over the 149-character limit (203 and 267 chars) -- a pre-existing bug from their own commits, caught by `description_first_sentence`'s full-suite run, not part of the melt/droste/portal fixes above. Shortened both to a plain short first sentence with the detail moved after it, same pattern as the v5.0.0 REWRITTEN batch. golden_registry.txt updated for both (description-only, no schema or pixel change).
+
+crates/kimo-core/tests/golden/golden_registry.txt: 6 new entries (one per new tool above) plus
+`add_effect`'s own hash (its schema enum grew by 2: droste_zoom, melt_drip). No existing frame or
+project golden touched -- the sanctioned use of this file per golden_frames.rs's own doc comment.
+
+Build note: partway through the demo-render pass, a hard build failure surfaced from a shared
+`CARGO_TARGET_DIR` -- another concurrent Kimo task building a different checkout of this same repo
+had configured the vendored manifold C++ library's cmake cache against ITS source path, and this
+task's build then collided with that cache (wrong source path, hard cmake error). Rather than clear
+or touch a cache another task's work depends on, this task's build was moved to its own isolated
+target dir for the rest of the pass -- cost one slow cold rebuild, cost nothing of the other task's
+work.
+
+Warnings: 34 (cap 35, unchanged across all 6 commits this pass).
+
+Talking-head benchmark, checked once at the end per the brief: re-ran examples/auto_edit_benchmark.py
+against the same real talking-head + b-roll + music folder used throughout this engine's work, output
+real_v47.mp4 -- byte-identical (same md5, 82ef81b6...) to the last-checked real_v45.mp4. The
+talking-head path is unmoved; nothing in this pass touches it.
+
+Before/after contact sheet across all 5 built effects: `files/v7q/v84_vfx_compare.png`.
+
 # Changelog
 
 ## v8.3.0 (2026-11-01)

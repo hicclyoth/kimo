@@ -84,13 +84,17 @@ pub fn commands() -> Vec<Command> { vec![
             let cx = num(&a, "cx", 0.5, 0.0, 1.0)?; let cy = num(&a, "cy", 0.4, 0.0, 1.0)?; let radius = num(&a, "radius", 0.22, 0.05, 0.6)?;
             let flip_v = match a.get("flip_vertical") { None | Some(Value::Null) => true, Some(v) => v.as_bool().ok_or("flip_vertical must be true or false")? };
             let invert_c = match a.get("invert_color") { None | Some(Value::Null) => true, Some(v) => v.as_bool().ok_or("invert_color must be true or false")? };
+            // intensity scales the PORTAL'S SIZE (radius), not its opacity: mix always ramps to 1.0 (a fully solid
+            // window once open), same fix as droste_zoom/apply_vfx_preset -- a portal blended at partial opacity reads
+            // as a faint see-through ghost over the footage instead of a doorway, which is what was reported.
+            let eff_radius = radius * (0.5 + 0.5 * intensity.max(0.05));
             let fade = ((end - start) * 0.2).max(0.1);
-            let mut params: std::collections::BTreeMap<String, Prop> = [("cx", cx), ("cy", cy), ("radius", radius), ("feather", radius * 0.35), ("flip_vertical", if flip_v { 1.0 } else { 0.0 }), ("invert_color", if invert_c { 1.0 } else { 0.0 })].iter().map(|(k, v)| (k.to_string(), Prop::new(*v))).collect();
-            params.insert("mix".into(), ramp_prop(start, end, intensity.max(0.05), fade));
+            let mut params: std::collections::BTreeMap<String, Prop> = [("cx", cx), ("cy", cy), ("radius", eff_radius), ("feather", eff_radius * 0.3), ("flip_vertical", if flip_v { 1.0 } else { 0.0 }), ("invert_color", if invert_c { 1.0 } else { 0.0 })].iter().map(|(k, v)| (k.to_string(), Prop::new(*v))).collect();
+            params.insert("mix".into(), ramp_prop(start, end, 1.0, fade));
             let eid = { let existing = ss.project.find_clip(&cid).unwrap().effects.iter().find(|e| e.kind == "portal_mirror").map(|e| e.id.clone()); existing.unwrap_or_else(|| ss.project.gen_id("fx")) };
             let c = ss.project.find_clip_mut(&cid).unwrap();
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = Default::default(); true } else { c.effects.push(Effect { id: eid.clone(), kind: "portal_mirror".into(), params, strings: Default::default() }); false };
-            Ok(json!({"effect_id": eid, "updated": replaced, "intensity": intensity, "window": [start, end], "radius": radius})) } },
+            Ok(json!({"effect_id": eid, "updated": replaced, "intensity": intensity, "window": [start, end], "radius": eff_radius})) } },
 
     Command { name: "add_vertigo_zoom", description: "Hitchcock dolly-zoom / vertigo move: the subject stays locked in place and size while the background stretches or compresses around it. Pure keyframes on the existing depth_parallax camera move (dolly ramps, zoom stays 1, so anything at focal_depth never moves) -- needs a depth map clip same as add_depth_parallax.", mutates: true,
         schema: obj(vec![("clip_id", s("clip to move the camera on")),
@@ -124,7 +128,7 @@ pub fn commands() -> Vec<Command> { vec![
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = strings; true } else { c.effects.push(Effect { id: eid.clone(), kind: "depth_parallax".into(), params, strings }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "depth": {"clip_id": m, "focal_depth": focal}, "dolly_target": target, "window": [start, end], "note": "same effect kind as add_depth_parallax (depth_parallax) -- this is a keyframed convenience over it, not a separate effect"})) } },
 
-    Command { name: "add_subject_clone", description: "Clone/multiply the subject: duplicates whatever a mask clip marks as the subject (white = subject) at growing spatial offsets, each copy a little dimmer -- the subject appears to repeat across the frame. Needs a mask/matte clip the same way add_depth_parallax needs a depth map. Ramps in/out across start_time..end_time.", mutates: true,
+    Command { name: "add_subject_clone", description: "Clone/multiply the subject into dimmer copies at growing spatial offsets, using a mask clip to mark it. A mask clip marks the subject (white = subject); each copy is a little dimmer, so the subject appears to repeat across the frame. Needs a mask/matte clip the same way add_depth_parallax needs a depth map. Ramps in/out across start_time..end_time.", mutates: true,
         schema: obj(vec![("clip_id", s("clip to clone the subject of")),
             ("mask_clip_id", s("mask/matte clip: another clip read per pixel, white = subject, black = background (hidden, same convention as add_depth_parallax's depth map)")),
             ("intensity", n("0..1, overall clone opacity, default 0.5 (subtle)")),
@@ -157,7 +161,7 @@ pub fn commands() -> Vec<Command> { vec![
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = strings; true } else { c.effects.push(Effect { id: eid.clone(), kind: "subject_clone".into(), params, strings }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "mask": {"clip_id": m, "channel": ch, "threshold": thr}, "count": count, "window": [start, end]})) } },
 
-    Command { name: "add_melt_drip", description: "Directional dripping/melting warp: the image streaks and sags toward one edge (default straight down), like wet paint or a melting frame -- distinct from the existing symmetric liquid wobble (turbulent_displace). Ramps in/out across start_time..end_time.", mutates: true,
+    Command { name: "add_melt_drip", description: "Experimental wavy/jitter warp: per-column noise displaces the image toward one edge (default straight down). On real footage it reads as an uneven wavy/jitter distortion rather than a clean melt -- distinct from the existing symmetric liquid wobble (turbulent_displace). Ramps in/out across start_time..end_time.", mutates: true,
         schema: obj(vec![("clip_id", s("clip to apply it to")),
             ("intensity", n("0..1, how far it drips at its strongest, default 0.3 (subtle)")),
             ("start_time", n("clip-local seconds the drip ramps in from, default 0")),
@@ -181,7 +185,7 @@ pub fn commands() -> Vec<Command> { vec![
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = Default::default(); true } else { c.effects.push(Effect { id: eid.clone(), kind: "melt_drip".into(), params, strings: Default::default() }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "intensity": intensity, "window": [start, end], "amount_px": amount})) } },
 
-    Command { name: "apply_vfx_preset", description: "One-call surreal look: dreamy (soft glow + halation + a touch of chromatic fringe + vignette), glitch (datamosh pixel-sort + digital tear blocks + chromatic split + VHS noise), vertigo (Hitchcock dolly-zoom, needs depth_clip_id), or echo (ghost-trail frame blending). intensity (0..1) scales every sub-effect together so a small model doesn't have to tune each one by hand.", mutates: true,
+    Command { name: "apply_vfx_preset", description: "One-call surreal look: dreamy, glitch, vertigo (dolly-zoom) or echo (ghost trail), built from existing effects. dreamy is soft glow + halation + a touch of chromatic fringe + vignette; glitch is datamosh pixel-sort + digital tear blocks + chromatic split + VHS noise; vertigo is a Hitchcock dolly-zoom (needs depth_clip_id); echo is ghost-trail frame blending. intensity (0..1) scales every sub-effect together so a small model doesn't have to tune each one by hand.", mutates: true,
         schema: obj(vec![("clip_id", s("clip to apply the preset to")),
             ("preset", json!({"type":"string","enum":PRESETS,"description":"dreamy | glitch | vertigo | echo"})),
             ("intensity", n("0..1, how strong the whole look reads, default 0.4 (subtle)")),
