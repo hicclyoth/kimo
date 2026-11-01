@@ -1,5 +1,13 @@
 # kimo features
 
+New in v8.1.0: `level_dynamics` (the master-bus speech leveler) scoped to the dialogue span instead of
+the whole mix, so an end card or music-only tail can no longer be reached by it; the benchmark's
+whisper-recall gate now scores dialogue-span recall separately from a whole-file number (the real
+cause of v8.0.0's "56.7% collapse" -- a whisper whole-file transcription artifact, not mix damage, not
+speechnorm); the end-card swell raised 3dB -> 11dB now that both fixes are in place (-18.4 LUFS,
+inside the originally-asked range). Voice dynamics (LRA) investigated further and still short of the
+>=3 target -- see below. No new tools.
+
 New in v8.0.0: the 3.0s dead-air tail at the end of every render fixed (the music bed now covers the
 full export including the end screen, looped when short); a new `match_shot_look` tool pulls b-roll
 color/exposure toward the talking head's own look (wired into `auto_edit` as `broll_color_match`,
@@ -10,6 +18,38 @@ New in v7.9.0: a real-footage voice-dynamics pass (honest, partial -- see below)
 option on `place_broll`'s b-roll cut-ins and `auto_edit`'s hook title, synthesized at call time like the
 existing pop SFX -- built, TDD'd, and left OFF by default after it measurably cost whisper word recall on
 real footage even ducked low. Tools: 521 -> 523.
+
+## v8.1-Q: level_dynamics scoped to dialogue, the real cause of the recall "collapse" found and fixed, end-card swell raised to spec
+
+- [x] **`level_dynamics` scoped to the dialogue span, not the whole mix.** New
+  `Project.master_speech_level_scope_end` (set by `finish_audio` from its own classified dialogue
+  clips' latest end) narrows ffmpeg `speechnorm` to `[0, dialogue_end)` with a 50ms crossfade at the
+  boundary, leaving an end card or music-only tail untouched. `0` = unscoped (old behaviour), so any
+  caller that doesn't use this stays byte-identical. Disproves v8.0.0's own diagnosis: with speechnorm
+  now provably never seeing the end card, an 8dB swell still reproduced the same 56.7% recall
+  "collapse" -- the dialogue audio was never damaged by the swell at any size (byte-identical
+  dialogue-span transcripts at 3dB and 8dB, proven directly). See the benchmark fix below for the real
+  mechanism.
+- [x] **`examples/auto_edit_benchmark.py` reports dialogue-span AND full-file whisper recall, gates on
+  dialogue-span by default (`--recall-span`).** The old whole-file number was the real source of the
+  "collapse": whisper transcribes the whole exported file in one pass with no per-segment reset, so a
+  loud segment later in that pass degrades its read of EARLIER dialogue even though that dialogue's own
+  audio never changed. Also fixed a second artifact found along the way: a dialogue-span crop with no
+  lead-in silence drops whisper's read of the clip's opening sentence (66.7% -> 90.0% recall just from
+  padding 0.5s before transcribing).
+- [x] **End-card music swell raised 3dB -> 11dB.** With both fixes above in place, 11dB measures clean:
+  dialogue-span recall 90.0%, full-file recall 91.7%, end-card LUFS **-18.4** (was -23.4 at 3dB under
+  the old unscoped/leaky behaviour, -26.7 with no swell) -- inside the originally-asked -18..-20 range.
+- [~] **Voice dynamics (`loudness_range`): swept further, real ceiling found, still short of >=3.**
+  `level_strength` 1.0 (speechnorm's floor) reaches 2.0 LU at 90.0% recall, a real gain, and disproves
+  v7.9.0's "lower level_strength collapses recall" note (same benchmark crop artifact above, not a real
+  regression) -- but 1.0 is a literal no-op for speechnorm and breaks its own regression test for
+  footage that genuinely needs leveling, so the default stays 2.5 (1.0 is now a documented, tested,
+  explicit override for already-even footage). With every leveling touch off at once, the honest
+  ceiling measured was 2.6 LU. Reaching >=3 needs an active dynamics expander, not gentler leveling --
+  out of scope this pass.
+- [ ] A visible slow push-in (Ken Burns) on static b-roll -- not attempted this pass; time went to the
+  two real bugs above instead.
 
 ## v8.0-Q: dead air fixed, a real b-roll color match shipped, end-card swell capped by a measured safety limit
 

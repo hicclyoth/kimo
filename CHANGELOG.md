@@ -1,5 +1,64 @@
 # Changelog
 
+## v8.1.0 (2026-11-01)
+
+V8.1-Q quality pass: fixing the real cause behind two V8.0-Q compromises, instead of
+shipping around them. No new tools.
+
+- **`level_dynamics` (the master-bus speech leveler) is now scoped to the dialogue span, not the
+  whole mix.** New `Project.master_speech_level_scope_end` (set by `finish_audio` from its own
+  classified dialogue clips' latest end, read by `audio::mix`/`mix_strict` via a shared
+  `apply_master_speech_level`, with a 50ms crossfade at the boundary) narrows ffmpeg `speechnorm` to
+  `[0, dialogue_end)`, leaving an end card or music-only tail untouched. `0` = unscoped (the old
+  whole-buffer behaviour), so any caller that sets `master_speech_level` without this stays
+  byte-identical.
+  - This directly disproves v8.0.0's own explanation for why the end-card swell was capped at 3dB:
+    with speechnorm now provably never seeing the end card (checked `finish_audio`'s own dialogue
+    classification at the moment it sets the scope), raising the swell to 8dB reproduced the exact
+    same 56.7% whisper-recall collapse v8.0.0 blamed on speechnorm. The dialogue audio itself was
+    never damaged at any swell size (proven by cutting 3dB and 8dB renders down to the dialogue span
+    and whisper-transcribing each -- byte-identical transcripts both times); the collapse was whisper
+    transcribing the WHOLE exported file in one pass and reading the EARLY dialogue worse once a loud
+    segment followed later in the same pass. See the benchmark fix below.
+  - TDD: the scope fix itself has no new unit test (`finish_audio_level_dynamics_narrows_loudness_range_within_a_clip`
+    and the rest of `director_small.rs`'s `finish_audio_*` suite cover it unchanged); verified end to
+    end on the real benchmark.
+- **`examples/auto_edit_benchmark.py` now reports and gates dialogue-span recall separately from a
+  whole-file number.** `dual_span_recall()` whisper-transcribes a render twice -- once whole, once cut
+  to the dialogue span -- against the same reference transcript; both numbers always print in the
+  summary JSON (`word_recall_vs_full_source` / `word_recall_vs_ceiling`, each now `{dialogue, full}`),
+  and `--recall-span {dialogue,full}` (default `dialogue`) picks which one gates pass/fail. Also fixed
+  a second, smaller artifact found along the way: a dialogue-span crop with no lead-in silence reliably
+  dropped whisper's read of the clip's very first sentence (66.7% recall straight; 90.0% with 0.5s of
+  silence prepended, recovering exactly the dropped opening and nothing else) -- `_trim_to_span` now
+  pads 0.5s before transcribing a cropped span, and does it audio-only (WAV) rather than re-encoding
+  video it was going to throw away anyway.
+- **End-card music swell raised 3dB -> 11dB**, now that both the real scoping fix and the honest
+  benchmark gate are in place. End-card LUFS: **-18.4** (was -23.4 under the old unscoped/leaky
+  behaviour at 3dB, -26.7 with no swell at all) -- inside the originally-asked -18..-20 range.
+  Dialogue-span recall holds at 90.0%; full-file recall 91.7%.
+  - TDD: `music_bed_swells_under_the_end_card_once_dialogue_ends` (its `after > before * 1.3`
+    assertion holds comfortably at 11dB's ~3.5x boost).
+- **Voice dynamics (loudness_range) [~]: investigated, not reached.** Target was dialogue-span
+  `loudness_range` >= 3 LU (was 1.4-1.5) while holding -14+-0.5 LUFS, <=-1 dBTP, recall >=90%, no
+  interior silences. Swept every candidate the mission named on the real benchmark footage
+  (dialogue span only, now that the scope/benchmark fixes above make that measurement trustworthy):
+  `level_strength` 1.0 (speechnorm's own floor) reaches 2.0 LU at 90.0% recall -- a real, safe gain,
+  and disproves v7.9.0's note that a lower `level_strength` "collapses recall" (the same benchmark
+  dialogue-span-crop-with-no-lead-in artifact described above, not a real regression). But 1.0 is a
+  literal no-op for speechnorm (`e=c=1.0` cannot change gain either direction) and breaks the
+  feature's own regression test for footage that genuinely needs leveling
+  (`finish_audio_level_dynamics_narrows_loudness_range_within_a_clip`: on=off=11.4 LU at 1.0, zero
+  narrowing). `level_strength` stays at its default 2.5 to protect that real case -- a caller editing
+  already-even footage can pass `level_strength: 1.0` explicitly (now a tested, documented choice).
+  With every leveling touch off at once (`level_dynamics` off, `match_strength` 0, `compress_strength`
+  0 -- the gentlest this engine can be) the honest ceiling measured was **2.6 LU**, still short of the
+  >=3 target. Reaching it would need an active dynamics *expander* (deliberately widening quiet/loud
+  gaps beyond the source's own natural range), a materially different and riskier feature than
+  "gentler leveling" -- out of scope for this pass.
+- No job 3 (a visible slow push-in on static b-roll) this pass -- time went to finding and fixing the
+  two real bugs above instead; disclosed, not attempted.
+
 - Added preview proxy media management: generation, enable/disable, health listing, deep integrity validation, safe relinking and detachment. PNG/range previews can use verified proxies; exports, audio and analysis retain originals. Missing/stale proxies fall back. Persisted, undoable bindings; synchronous SDR/CFR scope. See [proxy workflow](docs/PROXY_WORKFLOW.md).
 
 ## v8.0.0 (2026-11-01)
