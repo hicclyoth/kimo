@@ -58,6 +58,7 @@ add_title ef78e3db77ecd193
 add_track cf1da67768a18dbb
 add_transition bb51e8386d1e8f16
 add_vertigo_zoom 19a177a511ee9471
+add_vfx_graph 43e032b8f9b532ad
 add_watermark b96ec8e068099019
 analyze_color 34563f36b4186ca4
 analyze_exposure 9ca9ecd0326382b4
@@ -530,3 +531,5 @@ validate_captions 2a670e9810531cd8
 validate_hdr_transfer_math 75436f55ab7f60e1
 validate_planar_track 3b16f4f833d08581
 validate_timeline 1c72f3a9cfcf888a
+vfx_graph_describe 84a378a55d8b4ae3
+vfx_preview 6dee05506af74cdc
