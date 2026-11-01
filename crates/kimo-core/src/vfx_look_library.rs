@@ -62,10 +62,11 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
             eff("out", "warm", "vignette", json!({"amount": 0.15 + 0.25 * i})),
         ], "output": "out"}),
         "frost_veil" => json!({"nodes": [
-            eff("edge", SRC, "edge_glow", json!({"amount": 0.4 + 0.5 * i, "r": 0.6, "g": 0.85, "b": 1.0})),
-            eff("soft", "edge", "blur", json!({"radius": 0.8 + 1.4 * i})),
+            eff("soft", SRC, "blur", json!({"radius": 0.8 + 1.4 * i})),
             eff("cool", "soft", "temperature", json!({"amount": -(0.12 + 0.18 * i)})),
-            eff("out", "cool", "vignette", json!({"amount": 0.2 + 0.2 * i})),
+            eff("edge", SRC, "edge_glow", json!({"amount": 0.12 + 0.12 * i, "r": 0.6, "g": 0.85, "b": 1.0})),
+            blend("rim", "cool", "edge", "screen", 0.35 + 0.25 * i),
+            eff("out", "rim", "vignette", json!({"amount": 0.2 + 0.2 * i})),
         ], "output": "out"}),
         "magic_sparkle" => json!({"nodes": [
             eff("glow", SRC, "bloom", json!({"amount": 0.2 + 0.3 * i, "threshold": 0.62})),

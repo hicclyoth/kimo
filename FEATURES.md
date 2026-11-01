@@ -1,3 +1,16 @@
+New in v8.5.0: a composable VFX node-graph engine (`vfx_graph` effect kind: `effect` nodes wrap any
+existing effect by name, `solid`/`gradient`/`shape` generators, `blend`, `mask_apply`, `mask_clip`,
+and a `particles` node that calls Kimo's existing deterministic emitter directly), `add_vfx_graph` /
+`vfx_graph_describe` / `vfx_preview` (a non-destructive 1-6-frame AI preview loop with cheap metrics),
+and a 9-name look library (`ember_drift`, `chrome_bloom`, `glitch_surge`, `dream_haze`, `frost_veil`,
+`magic_sparkle`, `vhs_decay`, `aurora_wash`, `solar_flare`) exposed through the existing
+`apply_vfx_preset` alongside V8.4's own 4. Honest limit stated in `vfx_graph_describe`: no frame-
+offset clip sampling anywhere in render.rs, so a graph's own "time" is `t` plus Prop's own expr ops,
+not true frame-offset sampling. `mask_clip_id` DOES carry a real `track_matte` result (verified
+directly) -- a duplicate of the matted clip with its own mask left un-cut rides it, which is how the
+hero shot's real edge-driven particle emission is wired. No voice/audio-leveling or caption work this
+pass (out of scope). Tools: 532 -> 535.
+
 New in v8.4.0: surreal VFX tools -- `droste_zoom` (Escher-style infinite recursive spiral tunnel,
 log-polar), `portal_mirror` (a solid circular doorway into a flipped, colour-inverted world),
 `add_vertigo_zoom` (the Hitchcock dolly-zoom, a pure keyframe wrapper over the existing

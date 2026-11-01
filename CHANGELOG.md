@@ -113,6 +113,82 @@ talking-head path is unmoved; nothing in this pass touches it.
 
 Before/after contact sheet across all 5 built effects: `files/v7q/v84_vfx_compare.png`.
 
+## v8.5.0 (2026-11-01)
+
+V8.5 VFX engine + AI preview loop + look library. Read the existing engine first (particle_flow.rs is
+a full deterministic particle system, keyframe/Prop covers every numeric param, effects2.rs/shader_ops
+already wrap most of a node-graph's worth of ops) and built a composable layer on top rather than a
+second pixel-math stack. 535 tools (was 532). Full `cargo test -p kimo-core` (not just the targeted new test files) caught one real gap before ship: the 3 new MCP tools had no `toolgroups.rs` entry (`every_tool_has_a_real_group` failed) -- fixed, and the full suite is now part of this pass's own checklist, not just the targeted one.
+
+- **`vfx_graph`** (new effect kind, `vfx_graph.rs`): a small node DAG -- `effect` (wraps ANY existing
+  effect kind by name, the main reuse lever), `solid`/`gradient`/`shape` generators, `blend` (add/
+  screen/multiply/overlay/difference), `mask_apply`, `mask_clip` (an externally driven aux clip, same
+  same-instant-only pattern `depth_parallax`/`subject_clone` already use), and `particles` (calls
+  `crate::particles::render_fps` -- Kimo's existing emitter -- directly onto the graph's own buffer,
+  `params.preset` for any of its 13 built-in looks, an optional `mask` input for silhouette/edge
+  emission). Every numeric node param takes a literal OR a full keyframe `Prop`, so the whole existing
+  keyframe system is reused with no new expression language. Honest limit, stated in
+  `vfx_graph_describe`: render.rs has no time-offset clip fetch (`render_clip_alone` always renders at
+  the CURRENT frame's `t`), so a graph's own "time" is `t` plus Prop's own expr ops, not frame-offset
+  sampling. `mask_clip` DOES carry a real `track_matte` result -- `render_clip_alone_as` only clears
+  the legacy single-mask field before a standalone render, not the `mask.layers` stack `track_matte`
+  populates (verified directly, see the hero shot below for how v02 actually uses this).
+- **`add_vfx_graph` / `vfx_graph_describe` / `vfx_preview`** (`ext/vfx_graph_tools.rs`): commit, catalog,
+  and non-destructive 1-6-frame preview with cheap metrics (mean luma, clipping %, Sobel edge energy,
+  diff from the clip's own unmodified frame). Bug found and fixed dogfooding the hero shot, not by test:
+  `vfx_preview` was writing `crate::pixels::encode`'s output straight to a `.png` path -- that function is
+  Kimo's own internal lossless pixel-interchange format (magic `KIMOPX01`), not a PNG encoder; the files
+  opened as 14.7 MB of raw data. Swapped to `crate::render::write_image` (what every other render tool
+  uses) and hardened the test to check real PNG magic bytes, not just that a file exists.
+- **Look library, 9 names, exposed through the existing `apply_vfx_preset`** (not a second tool):
+  `ember_drift`, `chrome_bloom`, `glitch_surge`, `dream_haze`, `frost_veil`, `magic_sparkle`,
+  `vhs_decay`, `aurora_wash`, `solar_flare` (`vfx_look_library.rs`), each a real `vfx_graph`. V8.4's
+  4 presets (dreamy/glitch/vertigo/echo) are untouched.
+- TDD throughout: 32 new tests across `vfx_graph_core.rs` (10: parse/validate/cycle-detection/
+  topo-order/solid/blend/effect-wrap), `vfx_graph_tools.rs` (6, PNG-bytes check added after the bug
+  above), `vfx_graph_particles.rs` (5: determinism -- same seed/params/t -> byte-identical -- different
+  seed moves it, a preset renders visibly, an unknown preset errors clearly, mask-driven layer
+  emission), `vfx_look_library.rs` (5: every look builds/validates at 3 intensities, an unknown name
+  errors, every look visibly changes a real-structure frame, `apply_vfx_preset` reaches all 9 and
+  still runs V8.4's own presets unchanged).
+- **Hero shot**, two rounds on real talking-head footage, both kept (never overwritten):
+  `files/v7q/v85_unreal_v01.mp4` then `v02.mp4`, each with its own `.kimo` project and graph JSON. A
+  real `track_matte` on the subject (seeded by hand, 2 seeds, confidence ~0.73-0.76 -- honest, not
+  pixel-perfect) drives `set_effect_mask` on two plain masked effects (bloom + teal/orange) for a
+  subject aura, and a `vfx_graph` chain (ripple+wave warp, teal/orange grade, chromatic aberration,
+  bloom, magic-dust particles) builds across the clip to a peak around 90% through, then eases back to
+  clean footage in the last ~15% (leaning into `add_vfx_graph`'s own ramp-back-to-0-by-`end_time`
+  instead of fighting it). v01 shipped with particles at a fixed point near the chest -- wrong: I had
+  misread `render_clip_alone_as`'s `m.matte = None` as stripping a clip's WHOLE mask stack before a
+  standalone render, when it only clears the legacy single-mask field; a `track_matte` result lives in
+  `mask.layers`, which IS honoured (verified directly with a small Rust probe before trusting it). v02
+  fixes that for real: a duplicate of the subject clip (`duplicate_clip`, its copied effects removed,
+  its copy of the same matte left at mode `add` so its own rendered alpha IS the matte) rides
+  `mask_clip_id`, and the particles node's `shape:"layer"` + `emit_edge` now spawns genuinely off the
+  tracked silhouette rim -- which is also what the review caught in v01 (sparkles scattered across the
+  face read as a rash, not an effect) and v02 fixes by construction, not by hiding the symptom; warp
+  peaks were also roughly halved after the real mask-driven pass read as face-melting at v01's values
+  (the two were never directly comparable before, since v01 never exercised this code path). Per-look
+  demo clips for all 9 looks on real b-roll: `files/v7q/v85_<look>_v01.mp4`, a labelled 3x3 contact
+  sheet at `files/v7q/v85_look_library_contact_sheet.png` -- `frost_veil`'s first pass was a real miss
+  (edge_glow at the look's original amount reads as a full edge-detection wireframe on real footage,
+  not a frosted rim; fixed by screen-blending a much weaker edge pass under the shot instead of
+  applying it in-line, re-rendered and re-checked before shipping) and the other 8 held up as built.
+- Warnings: 34 (cap 35; removed one unused `bilinear` helper from commit #1 that nothing ended up
+  needing once the particles node called the real emitter instead).
+- `golden_registry.txt`: 4 new tool entries + `add_vfx_graph`/`apply_vfx_preset`'s own hashes moved
+  (schema enums grew) -- each hand-computed with the exact `fnv(description|schema|mutates)` the real
+  test uses (a throwaway local test printed them, never committed, never `KIMO_UPDATE_GOLDEN`). No
+  frame or project golden touched.
+- Talking-head benchmark, checked at the end per the brief: re-ran `examples/auto_edit_benchmark.py`
+  against the same real folder, output `real_v48.mp4`. Its md5 (715e3c64...) does NOT match the
+  recorded `real_v45`/`real_v47` baseline (82ef81b6...) -- but a FRESH, unmodified build of the exact
+  8.4.0 base commit (3c328ed) this branch forked from, built the same way in this same environment,
+  renders the identical 715e3c64... So this pass's VFX work introduces zero drift on the talking-head
+  path (confirmed by direct control comparison, not assumed): the mismatch against the older recorded
+  baseline is a pre-existing environment difference (toolchain/encoder, not investigated further --
+  out of this pass's scope) from before this branch existed, not a regression from v8.5.
+
 # Changelog
 
 ## v8.3.0 (2026-11-01)
