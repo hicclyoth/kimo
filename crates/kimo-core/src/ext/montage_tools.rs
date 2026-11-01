@@ -181,6 +181,94 @@ fn best_segments(ss: &mut Session, a: &Value) -> Result<Value, String> {
     Ok(json!({"kept_clips": kept_clips, "kept_count": kept_clips.len(), "dropped_count": dropped, "window_count": wins.len(), "min_score": min_score, "min_sharpness": min_sharpness, "min_exposure": min_exposure, "max_shake_px": max_shake_px}))
 }
 
+// ---------------------------------------------------------------- beat_sync_montage (job 2)
+/// Beat-synced montage cuts. beat_cut/cut_to_beat already lay clips end to end on an exact beat grid (reused here
+/// verbatim -- this never re-implements cutting or clip placement); what neither does is vary shot length with the
+/// music's own energy or stop on a musical phrase. This reads audio_transients' own beat-mode grid (per-beat
+/// strength, already computed, no new beat tracker), walks it choosing a 1..max_beats_per_shot step at each beat
+/// from that beat's own strength (louder/stronger beat -> shorter shot, quieter -> longer), hands the resulting
+/// cut times straight to beat_cut as its own `beats` array (so every cut IS a real detected beat, not an
+/// approximation), and stops on a beats_per_phrase-aligned beat so the edit ends on a bar line instead of
+/// mid-phrase. Lays the music with add_audio_clip, normalizes it to target_lufs (batch_normalize_loudness, same
+/// headroom-checked gain as everywhere else in this engine) BEFORE keying the fade so the integrated measurement
+/// is not dragged down by the tail's own silence, then fades it out over fade_out_beats so the montage never just
+/// stops dead on the last frame.
+fn beat_energy_cuts(grid: &[(f64, f64)], idx0: usize, min_beats: usize, max_beats: usize) -> Vec<usize> {
+    let max_strength = grid.iter().map(|(_, s)| *s).fold(0.0f64, f64::max).max(1e-9);
+    let mut idx = idx0; let mut idxs = vec![idx];
+    while idx + 1 < grid.len() {
+        let energy = (grid[idx].1 / max_strength).clamp(0.0, 1.0);
+        // stronger beat -> a shorter shot (cut sooner); quieter -> a longer shot. Three tiers, clamped into range.
+        let step = if energy >= 0.66 { min_beats } else if energy >= 0.33 { ((min_beats + max_beats) / 2).max(min_beats) } else { max_beats };
+        let step = step.clamp(min_beats, max_beats.max(min_beats));
+        let next = idx + step;
+        if next >= grid.len() { break; }
+        idxs.push(next); idx = next;
+    }
+    idxs
+}
+
+fn beat_sync_montage(ss: &mut Session, a: &Value) -> Result<Value, String> {
+    let clip_ids = str_list(a, "clip_ids")?;
+    let music_asset_id = str_arg(a, "music_asset_id")?.to_string();
+    let beats_per_phrase = num(a, "beats_per_phrase", 4.0, 1.0, 32.0)? as usize;
+    let min_beats = (num(a, "min_beats_per_shot", 1.0, 1.0, 16.0)?) as usize;
+    let max_beats = (num(a, "max_beats_per_shot", 4.0, 1.0, 16.0)?).max(min_beats as f64) as usize;
+    let fade_out_beats = num(a, "fade_out_beats", 2.0, 0.0, 16.0)?;
+    let target_lufs = num(a, "target_lufs", -14.0, -36.0, -5.0)?;
+    let target_duration = a.get("target_duration").and_then(|v| v.as_f64());
+    let start = num(a, "start", 0.0, 0.0, 1e7)?;
+
+    let masset = ss.project.assets.get(&music_asset_id).ok_or_else(|| format!("no such asset {music_asset_id}"))?.clone();
+    let bt = call(ss, "audio_transients", &json!({"target": masset.path, "mode": "beat"}))?;
+    let grid: Vec<(f64, f64)> = bt["beat_grid"].as_array().map(|v| v.iter().filter_map(|b| Some((b["t"].as_f64()?, b["strength"].as_f64().unwrap_or(0.0)))).collect()).unwrap_or_default();
+    if grid.len() < beats_per_phrase + 2 { return Err(format!("audio_transients found only {} beats in this music; need at least {} for a phrase-aligned montage (a clearer, more percussive bed will beat-track better)", grid.len(), beats_per_phrase + 2)); }
+    let idx0 = grid.iter().position(|(t, _)| *t >= -1e-9).unwrap_or(0);
+    let m0 = grid[idx0].0;
+
+    let mut idxs = beat_energy_cuts(&grid, idx0, min_beats, max_beats);
+    if let Some(td) = target_duration { while idxs.len() > 1 && grid[*idxs.last().unwrap()].0 - m0 > td { idxs.pop(); } }
+    if idxs.len() < 2 { return Err("not enough beats after the energy walk for even one shot; lower min_beats_per_shot or beats_per_phrase, or use a longer/busier music bed".into()); }
+    // end on the next beats_per_phrase-aligned beat at or after the last chosen cut (phase relative to idx0), so the
+    // edit lands on a bar line, not mid-phrase; falls back to the grid's own last beat if the music runs out first.
+    let last_idx = *idxs.last().unwrap();
+    let phrase_idx = { let mut p = idx0; while p < last_idx { p += beats_per_phrase; } if p >= grid.len() { grid.len() - 1 } else { p } };
+    let end_src = grid[phrase_idx].0;
+    let shift = start - m0;
+    let beats_tl: Vec<f64> = idxs.iter().map(|&i| grid[i].0 + shift).collect();
+    let end_tl = end_src + shift;
+
+    let bc = call(ss, "beat_cut", &json!({"clip_ids": clip_ids, "beats": beats_tl, "end": end_tl}))?;
+    let duration = end_tl - start;
+    let mc = call(ss, "add_audio_clip", &json!({"asset_id": music_asset_id, "start": start, "duration": duration, "in_point": m0}))?;
+    let music_clip_id = mc["clip_id"].as_str().ok_or("add_audio_clip returned no clip_id")?.to_string();
+    let mut norm = call(ss, "batch_normalize_loudness", &json!({"clip_ids": [music_clip_id.clone()], "target_lufs": target_lufs}))?;
+    // A music bed with sharp, peaky transients (hard clicks, unmastered hits) can refuse the gain normalize_loudness
+    // needs without pushing its sample peaks over -1dBFS -- batch_normalize_loudness reports that clip in `failed`,
+    // not `applied`. Rather than silently leaving the montage quiet (defeating the -14 LUFS ask), take the refusal's
+    // own suggested fix once: a gentle compressor (add_audio_effect, already the engine's own tool for this -- the
+    // same params the refusal message itself names) to tame the peaks, then retry the same normalize once.
+    if norm["applied"].as_array().map(|a| a.is_empty()).unwrap_or(true) && !norm["failed"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        call(ss, "add_audio_effect", &json!({"clip_id": music_clip_id, "kind": "compressor", "params": {"threshold_db": -24.0, "ratio": 4.0}}))?;
+        norm = call(ss, "batch_normalize_loudness", &json!({"clip_ids": [music_clip_id.clone()], "target_lufs": target_lufs}))?;
+    }
+    // applied carries gain_db when normalize_loudness actually ran; already_on_target means it was within
+    // tolerance already (no change, gain 0dB) -- either way this is the real gain now sitting in the clip's
+    // own volume prop, which the fade keys below must start from so they don't clobber the loudness pass.
+    let gain = norm["applied"].as_array().and_then(|r| r.first()).and_then(|r| r.get("gain_db")).and_then(|v| v.as_f64())
+        .map(|db| 10f64.powf(db / 20.0)).unwrap_or(1.0);
+    let period = { let mut g: Vec<f64> = grid.windows(2).map(|w| w[1].0 - w[0].0).collect(); g.sort_by(|x, y| x.total_cmp(y)); if g.is_empty() { 0.5 } else { g[g.len() / 2] } };
+    let fade_s = (fade_out_beats * period).min(duration);
+    if fade_s > 0.0 {
+        call(ss, "set_audio_volume_key", &json!({"clip_id": music_clip_id, "time": (duration - fade_s).max(0.0), "value": gain, "ease": "linear"}))?;
+        call(ss, "set_audio_volume_key", &json!({"clip_id": music_clip_id, "time": duration, "value": 0.0, "ease": "linear"}))?;
+    }
+    Ok(json!({"video_track_id": bc["track_id"], "music_clip_id": music_clip_id, "music_track_id": mc["track_id"], "cuts": bc["cuts"], "cut_times": beats_tl,
+        "beat_times_used": idxs.iter().map(|&i| grid[i].0 + shift).collect::<Vec<_>>(), "start": start, "end": end_tl, "duration": duration,
+        "beats_per_phrase": beats_per_phrase, "fade_out_s": fade_s, "music_gain_applied": gain, "loudness_normalize": norm,
+        "note": "every cut_time is a real audio_transients beat (shifted to the timeline), so cut_times and beat_times_used are identical by construction; shot length varies min_beats_per_shot..max_beats_per_shot beats with the beat's own strength, and the edit ends on a beats_per_phrase-aligned beat with the music faded out over the last fade_out_beats"}))
+}
+
 pub fn commands() -> Vec<Command> { vec![
     Command { name: "score_windows", description: "Read-only: score each clip's windows for sharpness, exposure, subject framing, motion and shake, so a montage can keep only the strongest footage. Scores window_s windows (default 1.0s) across every given clip_id on an absolute, cross-clip-comparable scale: sharpness (focus_series' own lap_var, normalized against this call's own global max across every window given), exposure (frame_quality's own crushed_frac+clipped_frac, already absolute), subject framing (pick_thumbnail's own subject_score) and motion (frozen_frames' own frame-to-frame diff), plus one shake number per whole clip_id (stabilize_clip's own read-only raw-path-vs-smoothed-path correction, max_correction_px/deg -- scoped per clip, not per window, since a handheld take is shaky throughout). Returns every window with its score, score_parts, raw measurements and a kept bool (score>=min_score and shake_px<=max_shake_px); nothing is cut.", mutates: false,
         schema: obj(vec![("clip_ids", json!({"type":"array","items":{"type":"string"},"description":"clips already on the timeline to score"})),
@@ -198,4 +286,15 @@ pub fn commands() -> Vec<Command> { vec![
             ("min_exposure", n("0..1, default 0.25")),
             ("max_shake_px", n("0..500, default 12.0"))], &["clip_ids"]),
         run: best_segments },
+    Command { name: "beat_sync_montage", description: "Beat-synced montage cuts: lay the kept clips end to end, cutting exactly on the music's own beats, shot length varying with its energy. Reads audio_transients' own beat-mode grid (per-beat strength, no new beat tracker), walks it choosing a min_beats_per_shot..max_beats_per_shot step at each beat from that beat's own strength (a stronger beat makes a shorter shot, a quieter one a longer shot), hands the resulting cut times straight to the existing beat_cut tool as its own beats array (every cut is a real detected beat, not an approximation), and stops on a beats_per_phrase-aligned beat so the edit ends on a bar line, not mid-phrase. Lays the music (add_audio_clip), normalizes it to target_lufs (batch_normalize_loudness) before keying the fade so the tail's own silence doesn't drag the integrated measurement down, then fades it out over the last fade_out_beats so the montage never stops dead on the final frame.", mutates: true,
+        schema: obj(vec![("clip_ids", json!({"type":"array","items":{"type":"string"},"description":"kept montage clips already on the timeline, in order (e.g. best_segments' own kept_clips)"})),
+            ("music_asset_id", s("an imported music asset to beat-track and lay under the montage")),
+            ("beats_per_phrase", n("beats per musical phrase/bar, 1..32, default 4 (4/4 time): the edit ends on a beat whose index is this many beats on from the first beat used")),
+            ("min_beats_per_shot", n("shortest shot length in beats, 1..16, default 1")),
+            ("max_beats_per_shot", n("longest shot length in beats, 1..16, default 4")),
+            ("fade_out_beats", n("beats of fade-out at the very end, 0..16, default 2")),
+            ("target_lufs", n("music integrated loudness target, -36..-5, default -14")),
+            ("target_duration", n("optional: stop the energy walk once this many seconds are covered (still snaps to the next phrase boundary after)")),
+            ("start", n("timeline seconds to begin the montage at, default 0"))], &["clip_ids", "music_asset_id"]),
+        run: beat_sync_montage },
 ] }

@@ -111,3 +111,70 @@ fn shaky(name: &str, dur: f64) -> String {
     assert!(total_kept < 3.0, "only the sharp half (~2s) should survive, not the whole 4s clip: {r}");
     assert!(total_kept > 0.5, "something real should survive: {r}");
 }
+
+
+/// A synthetic click track with KNOWN beat times (every click_period seconds) so the test can assert cuts land
+/// exactly on them -- no reliance on audio_transients' own beat-tracking accuracy on real music.
+fn clicks(name: &str, period: f64, n: usize) -> String {
+    let p = dir().join(name); if p.exists() { return p.to_string_lossy().into_owned(); }
+    let dur = period * n as f64 + 1.0;
+    let expr = format!("0.7*exp(-mod(t\\,{period})*40)*sin(2*PI*1200*mod(t\\,{period}))");
+    ffmpeg(&["-f", "lavfi", "-i", &format!("aevalsrc='{expr}':s=48000:d={dur}"), "-c:a", "pcm_s16le", p.to_str().unwrap()]);
+    p.to_string_lossy().into_owned()
+}
+/// A click track peaky enough that a single plain-gain normalize would clip (exercises the compressor-retry path),
+/// but not so extreme (a gentler decay than `clicks`, more sustain) that one compressor pass can't fix it either.
+fn peaky_clicks(name: &str, period: f64, n: usize) -> String {
+    let p = dir().join(name); if p.exists() { return p.to_string_lossy().into_owned(); }
+    let dur = period * n as f64 + 1.0;
+    let expr = format!("0.55*exp(-mod(t\\,{period})*8)*sin(2*PI*800*mod(t\\,{period}))");
+    ffmpeg(&["-f", "lavfi", "-i", &format!("aevalsrc='{expr}':s=48000:d={dur}"), "-c:a", "pcm_s16le", p.to_str().unwrap()]);
+    p.to_string_lossy().into_owned()
+}
+
+#[test] fn beat_sync_montage_cuts_land_exactly_on_real_beats_and_ends_on_a_phrase() {
+    let mut ss = proj();
+    // 0.5s period = 120bpm, 40 beats (10 bars of 4/4) -- plenty of room for an energy walk plus a phrase-aligned end.
+    let music = sid(&call(&mut ss, "import_media", json!({"path": clicks("beat_music.wav", 0.5, 40)})), "asset_id");
+    let a = sid(&call(&mut ss, "import_media", json!({"path": good("montage1.mp4", 8.0)})), "asset_id");
+    let b = sid(&call(&mut ss, "import_media", json!({"path": good("montage2.mp4", 8.0)})), "asset_id");
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let c1 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": a, "start": 0.0, "duration": 8.0, "in_point": 0.0})), "clip_id");
+    let c2 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": b, "start": 8.0, "duration": 8.0, "in_point": 0.0})), "clip_id");
+    let r = call(&mut ss, "beat_sync_montage", json!({"clip_ids": [c1, c2], "music_asset_id": music, "beats_per_phrase": 4, "min_beats_per_shot": 1, "max_beats_per_shot": 2, "target_duration": 10.0}));
+    let cut_times: Vec<f64> = r["cut_times"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(cut_times.len() >= 3, "{r}");
+    // every cut time must land within 1 frame (1/30s) of an actual 0.5s-period beat
+    for ct in &cut_times {
+        let nearest_beat = (ct / 0.5).round() * 0.5;
+        assert!((ct - nearest_beat).abs() < 1.0 / 30.0 + 1e-6, "cut at {ct} is not within 1 frame of a beat (nearest {nearest_beat}): {r}");
+    }
+    // the edit must end on a beats_per_phrase (4-beat = 2s) boundary
+    let end = r["end"].as_f64().unwrap();
+    let nearest_phrase = (end / 2.0).round() * 2.0;
+    assert!((end - nearest_phrase).abs() < 1.0 / 30.0 + 1e-6, "end {end} is not on a 4-beat phrase boundary: {r}");
+    // the music clip must actually be on the timeline, normalized, and have a fade (two volume keys)
+    let music_clip_id = r["music_clip_id"].as_str().unwrap();
+    let mc = ss.project.find_clip(music_clip_id).unwrap();
+    assert!(mc.audio.volume.keys.len() >= 2, "expected a fade-out (>=2 volume keys), got {:?}", mc.audio.volume.keys);
+    assert!(r["fade_out_s"].as_f64().unwrap() > 0.0, "{r}");
+}
+
+
+#[test] fn beat_sync_montage_reaches_loudness_target_even_on_a_peaky_music_bed() {
+    // A sharp, peaky click track (like the one above) refuses a plain normalize_loudness gain without pushing
+    // sample peaks over -1dBFS -- beat_sync_montage must take the refusal's own suggested fix (a light compressor)
+    // and retry, not silently leave the music quiet (gain stuck at 1.0, loudness untouched).
+    let mut ss = proj();
+    let music = sid(&call(&mut ss, "import_media", json!({"path": peaky_clicks("peaky_music.wav", 0.5, 30)})), "asset_id");
+    let a = sid(&call(&mut ss, "import_media", json!({"path": good("montage3.mp4", 8.0)})), "asset_id");
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let c1 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": a, "start": 0.0, "duration": 8.0, "in_point": 0.0})), "clip_id");
+    let r = call(&mut ss, "beat_sync_montage", json!({"clip_ids": [c1], "music_asset_id": music, "target_lufs": -14.0}));
+    let norm = &r["loudness_normalize"];
+    let applied = norm["applied"].as_array().unwrap();
+    assert!(!applied.is_empty(), "normalize should have succeeded (directly or via the compressor retry), not stayed in failed/skipped: {norm}");
+    let gain_db = applied[0]["gain_db"].as_f64().unwrap();
+    assert!(gain_db.abs() > 0.5, "a real gain correction should have been applied (not a no-op): {gain_db} dB, {norm}");
+    assert!((r["music_gain_applied"].as_f64().unwrap() - 1.0).abs() > 0.05, "music_gain_applied should reflect the real correction, not the 1.0 failure fallback: {r}");
+}
