@@ -333,7 +333,7 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     let local_card_start = dialogue_dur - c.start;
     let before = c.audio.volume.at((local_card_start - 0.01).max(0.0));
     let after = c.audio.volume.at(local_card_start + 0.35);
-    assert!(after > before * 1.5, "music should swell up once the dialogue ends (no more voice to duck for): before {before:.4}, after {after:.4}");
+    assert!(after > before * 1.3, "music should swell up once the dialogue ends (no more voice to duck for): before {before:.4}, after {after:.4}");
 
     // end_screen:false -- no card, nothing to swell for.
     let mut ss2 = proj();

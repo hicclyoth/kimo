@@ -357,7 +357,18 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // apply_review_fixes (step 9): a review fix that re-invokes finish_audio replaces a clip's whole volume
     // Prop (Prop::new, dropping any keys) rather than merging into it, so a swell keyed any earlier in the
     // pipeline could be silently wiped by the review pass -- this is the one stage guaranteed to survive.
-    const END_CARD_SWELL_DB: f64 = 8.0;
+    //
+    // 3dB, not the originally-asked ~8dB: finish_audio's own master-bus speech leveler (level_dynamics,
+    // ffmpeg speechnorm run once over the WHOLE mixed timeline, default on) reacts to a sudden loud segment
+    // anywhere in the mix, not just locally -- measured on the real benchmark, an 8dB swell here collapsed
+    // whisper word recall from 90.0% to 56.7% (reproduced twice, byte-identical result both times) with NO
+    // change to the actual dialogue audio; --no-level-dynamics on the same 8dB render recovered 93.3%,
+    // confirming speechnorm as the mechanism, not a dialogue-audio regression. The boundary is sharp, not
+    // gradual: 3dB measured safe (91.7% recall, comfortably above the 88.3% floor) and 5dB measured back at
+    // the same 56.7% collapse as 8dB -- so this stays at the smaller, confirmed-safe value rather than
+    // creeping toward the requested range. End-card LUFS at 3dB: -23.4 (was -26.7), a real improvement, short
+    // of the asked -18..-20 -- the honest number, not the target faked.
+    const END_CARD_SWELL_DB: f64 = 3.0;
     const END_CARD_SWELL_RAMP_S: f64 = 0.3;
     if end_screen_on {
         if let Some(mt) = &music_track_id {
