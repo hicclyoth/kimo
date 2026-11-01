@@ -132,3 +132,29 @@ fn melt_drip_streaks_more_toward_the_far_edge_and_is_opt_in() {
     let f2 = frame(&s2, 0.2);
     assert_eq!(differs(&base, &f2), 0, "outside its start_time..end_time window melt_drip must leave the frame untouched");
 }
+
+#[test]
+fn apply_vfx_preset_dreamy_glitch_and_vertigo_all_change_the_frame() {
+    let (s0, v0) = scene(); let base = frame(&s0, 1.0); let _ = v0;
+    for preset in ["dreamy", "glitch"] {
+        let (mut s, v) = scene();
+        let r = dispatch(&mut s, "apply_vfx_preset", &json!({"clip_id": v, "preset": preset, "intensity": 0.7}));
+        assert!(r.is_ok(), "apply_vfx_preset {preset} must exist: {}", r.unwrap_err());
+        let f = frame(&s, 1.0);
+        assert!(differs(&base, &f) > 300, "preset {preset} must visibly change the frame");
+    }
+    // vertigo needs depth_clip_id and reuses add_vertigo_zoom under the hood
+    let (mut s, v, m) = depth_scene();
+    let r = dispatch(&mut s, "apply_vfx_preset", &json!({"clip_id": v, "preset": "vertigo", "depth_clip_id": m, "intensity": 0.6, "start_time": 0.0, "end_time": 2.0}));
+    assert!(r.is_ok(), "apply_vfx_preset vertigo must exist: {}", r.unwrap_err());
+    let f = frame(&s, 1.9);
+    for (x, y) in [(70, 45), (80, 45), (90, 45)] { assert!(green(&f, x, y), "vertigo preset must still lock the subject"); }
+    // echo reuses the existing set_echo tool
+    let (mut s2, v2) = scene();
+    let r2 = dispatch(&mut s2, "apply_vfx_preset", &json!({"clip_id": v2, "preset": "echo", "intensity": 0.5}));
+    assert!(r2.is_ok(), "apply_vfx_preset echo must exist: {}", r2.unwrap_err());
+    assert!(dispatch(&mut s2, "add_effect", &json!({"clip_id": v2, "kind": "not_a_real_kind", "params": {}})).is_err(), "sanity: bad kind still refused (project untouched by the preset's own calls)");
+    // vertigo preset without depth_clip_id is refused, not silently ignored
+    let (mut s3, v3) = scene();
+    assert!(dispatch(&mut s3, "apply_vfx_preset", &json!({"clip_id": v3, "preset": "vertigo", "intensity": 0.5})).is_err(), "vertigo preset without depth_clip_id must be refused");
+}

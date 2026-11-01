@@ -180,4 +180,48 @@ pub fn commands() -> Vec<Command> { vec![
             let c = ss.project.find_clip_mut(&cid).unwrap();
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = Default::default(); true } else { c.effects.push(Effect { id: eid.clone(), kind: "melt_drip".into(), params, strings: Default::default() }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "intensity": intensity, "window": [start, end], "amount_px": amount})) } },
+
+    Command { name: "apply_vfx_preset", description: "One-call surreal look: dreamy (soft glow + halation + a touch of chromatic fringe + vignette), glitch (datamosh pixel-sort + digital tear blocks + chromatic split + VHS noise), vertigo (Hitchcock dolly-zoom, needs depth_clip_id), or echo (ghost-trail frame blending). intensity (0..1) scales every sub-effect together so a small model doesn't have to tune each one by hand.", mutates: true,
+        schema: obj(vec![("clip_id", s("clip to apply the preset to")),
+            ("preset", json!({"type":"string","enum":PRESETS,"description":"dreamy | glitch | vertigo | echo"})),
+            ("intensity", n("0..1, how strong the whole look reads, default 0.4 (subtle)")),
+            ("start_time", n("clip-local seconds the look starts (dreamy/glitch/echo apply for the clip's whole visible range regardless; vertigo ramps across this window), default 0")),
+            ("end_time", n("clip-local seconds the look ends (vertigo only), default the clip's own duration")),
+            ("depth_clip_id", s("required for preset=vertigo: the depth map clip (see add_vertigo_zoom)"))], &["clip_id", "preset"]),
+        run: |ss, a| {
+            for k in a.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() { if !PRESET_ARGS.contains(&k.as_str()) { return Err(format!("apply_vfx_preset: unknown argument '{k}' (valid: {})", PRESET_ARGS.join(", "))); } }
+            let cid = a.get("clip_id").and_then(|v| v.as_str()).ok_or("apply_vfx_preset needs clip_id")?.to_string();
+            if ss.project.find_clip(&cid).is_none() { return Err(format!("no such clip {cid}")); }
+            let preset = a.get("preset").and_then(|v| v.as_str()).ok_or("apply_vfx_preset needs preset")?.to_string();
+            if !PRESETS.contains(&preset.as_str()) { return Err(format!("preset must be one of {}, got {preset}", PRESETS.join(", "))); }
+            let intensity = num(&a, "intensity", 0.4, 0.0, 1.0)?;
+            let mut applied = vec![];
+            match preset.as_str() {
+                "dreamy" => {
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "glow", "params": {"amount": 0.15 + 0.35 * intensity, "radius": 14.0, "threshold": 0.62}}))?; applied.push("glow");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "halation", "params": {"threshold": 0.75, "radius": 20.0, "amount": 0.5 * intensity}}))?; applied.push("halation");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "chromatic_aberration", "params": {"amount": 1.0 + 2.0 * intensity}}))?; applied.push("chromatic_aberration");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "vignette", "params": {"amount": 0.15 + 0.3 * intensity}}))?; applied.push("vignette"); }
+                "glitch" => {
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "pixel_sort", "params": {"threshold": 0.55 - 0.3 * intensity, "max_run": 150.0 + 300.0 * intensity}}))?; applied.push("pixel_sort");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "glitch_blocks", "params": {"amount": 10.0 + 40.0 * intensity, "slices": 10.0, "rate": 10.0}}))?; applied.push("glitch_blocks");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "chromatic_aberration", "params": {"amount": 2.0 + 6.0 * intensity}}))?; applied.push("chromatic_aberration");
+                    crate::commands::dispatch(ss, "add_effect", &json!({"clip_id": cid, "kind": "vhs", "params": {"wobble": 1.0 + 4.0 * intensity, "bleed": 2.0 + 6.0 * intensity, "noise": 0.08 + 0.2 * intensity, "bands": 1.0}}))?; applied.push("vhs"); }
+                "vertigo" => {
+                    let m = a.get("depth_clip_id").and_then(|v| v.as_str()).ok_or("preset=vertigo needs depth_clip_id (the depth map clip)")?.to_string();
+                    let dur = ss.project.find_clip(&cid).unwrap().duration;
+                    let start = num(&a, "start_time", 0.0, 0.0, dur)?; let end = num(&a, "end_time", dur, start, dur)?;
+                    crate::commands::dispatch(ss, "add_vertigo_zoom", &json!({"clip_id": cid, "depth_clip_id": m, "intensity": intensity, "start_time": start, "end_time": end}))?; applied.push("vertigo_zoom (depth_parallax)"); }
+                "echo" => {
+                    let count = (3.0 + intensity * 7.0).round(); let spacing = 0.02 + intensity * 0.03; let decay = 0.55 + intensity * 0.3;
+                    crate::commands::dispatch(ss, "set_echo", &json!({"clip_id": cid, "count": count, "spacing": spacing, "decay": decay, "mode": "composite"}))?; applied.push("set_echo"); }
+                _ => unreachable!(),
+            }
+            Ok(json!({"clip_id": cid, "preset": preset, "intensity": intensity, "sub_effects": applied})) } },
 ] }
+
+
+const PRESET_ARGS: [&str; 6] = ["clip_id", "preset", "intensity", "start_time", "end_time", "depth_clip_id"];
+const PRESETS: [&str; 4] = ["dreamy", "glitch", "vertigo", "echo"];
+
+
