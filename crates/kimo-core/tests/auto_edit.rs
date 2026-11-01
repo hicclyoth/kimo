@@ -451,3 +451,29 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(r2["ok"] == json!(true), "{r2}");
     assert_eq!(r2["stages"]["captions"]["position"].as_str().unwrap_or(""), "bottom", "an explicit caption_position should still be honoured over the face check: {r2}");
 }
+
+
+/// V8.2V job 4: a short whip/zoom-blur transition into each b-roll cutaway, on by default, never applied to
+/// the talking-head punch-in clips (those stay hard cuts on purpose).
+#[test] fn job4_broll_gets_a_short_whip_transition_by_default() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("j4_th.mp4", &[(0.0, 4.0), (4.5, 8.0)], 0.0)})), "asset_id");
+    let bm = sid(&call(&mut ss, "import_media", json!({"path": broll("j4_broll.mp4", 2.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "broll_asset_ids": [bm], "captions": false, "grade": false, "punch_ins": false, "push_in": false, "broll_color_match": false, "end_screen": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let broll_clip_id = sid(&r["stages"]["broll"]["clips"][0], "clip_id");
+    let c = ss.project.find_clip(&broll_clip_id).unwrap();
+    let tr = c.transition_in.as_ref().unwrap_or_else(|| panic!("expected a transition_in on the b-roll clip by default: {r}"));
+    assert!(tr.kind == "zoom_blur" || tr.kind == "whip_left", "expected a whip/zoom-blur transition kind, got {}: {r}", tr.kind);
+    assert!(tr.duration > 0.0 && tr.duration <= 0.6, "expected a short transition, got {}s: {r}", tr.duration);
+
+    // off switch: no transition at all.
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": talk("j4_off_th.mp4", &[(0.0, 4.0), (4.5, 8.0)], 0.0)})), "asset_id");
+    let bm2 = sid(&call(&mut ss2, "import_media", json!({"path": broll("j4_off_broll.mp4", 2.0)})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "broll_asset_ids": [bm2], "captions": false, "grade": false, "punch_ins": false, "push_in": false, "broll_color_match": false, "end_screen": false, "broll_transitions": false}));
+    assert!(r2["ok"] == json!(true), "{r2}");
+    let broll_clip_id2 = sid(&r2["stages"]["broll"]["clips"][0], "clip_id");
+    let c2 = ss2.project.find_clip(&broll_clip_id2).unwrap();
+    assert!(c2.transition_in.is_none(), "broll_transitions:false should leave the clip with no transition: {r2}");
+}

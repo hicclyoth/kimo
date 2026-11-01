@@ -81,6 +81,8 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let punch_on = a.get("punch_ins").and_then(|v| v.as_bool()).unwrap_or(true);
     let push_in_on = a.get("push_in").and_then(|v| v.as_bool()).unwrap_or(true);
     let push_in_zoom = opt_num(a, "push_in_zoom", 1.05).clamp(1.01, 1.3);
+    let broll_transitions_on = a.get("broll_transitions").and_then(|v| v.as_bool()).unwrap_or(true);
+    let broll_transition_duration = opt_num(a, "broll_transition_duration", 0.25).clamp(0.1, 0.6);
     let grade_on = a.get("grade").and_then(|v| v.as_bool()).unwrap_or(true);
     // V8.0Q: on by default whenever there's a dialogue clip and at least one b-roll clip to match -- the
     // free color-cohesion win a raw auto-cut never gets (measured on the real benchmark: an indoor warm
@@ -170,6 +172,24 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         stages.insert("broll".into(), br);
     } else {
         warnings.push("no broll_asset_ids given: the talking head runs with no cutaways".into());
+    }
+
+    // 2a2. V8.2V job 4: a short, subtle whip into each b-roll cutaway -- the thing a top editor does between
+    // the head and a cutaway, never on every jump-cut punch-in (those stay hard cuts on purpose; this is
+    // scoped to the b-roll boundary only, so it never fires more than place_broll already decided to cut
+    // to b-roll). zoom_blur is the gentlest of the engine's whip-style kinds (a quick radial blur + push,
+    // not a hard directional wipe), alternated with a directional whip for variety on edits with more than
+    // one cutaway. Skipped on a clip too short for the transition to fit.
+    if broll_transitions_on && !broll_clip_ids.is_empty() {
+        const KINDS: [&str; 2] = ["zoom_blur", "whip_left"];
+        for (i, cid) in broll_clip_ids.iter().enumerate() {
+            let dur = ss.project.find_clip(cid).map_or(0.0, |c| c.duration);
+            if dur < broll_transition_duration * 1.5 { continue; }
+            let kind = KINDS[i % KINDS.len()];
+            if let Err(e) = call(ss, "add_transition", &json!({"clip_id": cid, "kind": kind, "duration": broll_transition_duration})) {
+                warnings.push(format!("b-roll transition skipped on clip {cid}: {e}"));
+            }
+        }
     }
 
     // 2b. Slow push-in (V8.2V, Ken Burns): a gentle, eased push-in on every static b-roll cutaway -- the
@@ -490,6 +510,8 @@ pub fn commands() -> Vec<Command> {
                 ("punch_max_static", n("force an extra split so no dialogue stretch sits static past this many seconds, default 4.5, clamped 1.5..20")),
                 ("push_in", json!({"type": "boolean", "description": "default true: slow Ken Burns push-in on static b-roll cutaways"})),
                 ("push_in_zoom", n("push-in target scale by the cutaway's end, default 1.05 (5%), clamped 1.01..1.3")),
+                ("broll_transitions", json!({"type": "boolean", "description": "default true: a short whip/zoom-blur transition into each b-roll cutaway (never on the talking-head punch-ins)"})),
+                ("broll_transition_duration", n("b-roll whip transition length, seconds, default 0.25, clamped 0.1..0.6")),
                 ("grade", json!({"type": "boolean", "description": "default true: auto_grade every clip"})),
                 ("broll_color_match", json!({"type": "boolean", "description": "default true (with b-roll): match b-roll's look to the talking head's"})),
                 ("target_lufs", n("final mix loudness target, default -14 (YouTube)")),
