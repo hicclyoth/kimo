@@ -50,6 +50,7 @@ add_shape_modifier 95434f64dd11932f
 add_shard_burst d5d23132405a5039
 add_smart_punch 841bcd969ba8ab27
 add_speed_lines 0db4bddd46e7a057
+add_subject_clone 92626178b82ee907
 add_text e504fc3dce60034a
 add_text_animator 7c837530f3da76ca
 add_title ef78e3db77ecd193

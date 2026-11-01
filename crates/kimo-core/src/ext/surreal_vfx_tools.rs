@@ -21,6 +21,7 @@ fn ramp_prop(start: f64, end: f64, peak: f64, fade: f64) -> Prop {
 
 const DROSTE_ARGS: [&str; 9] = ["clip_id", "intensity", "start_time", "end_time", "cx", "cy", "twist", "drift", "remove"];
 const PORTAL_ARGS: [&str; 10] = ["clip_id", "intensity", "start_time", "end_time", "cx", "cy", "radius", "flip_vertical", "invert_color", "remove"];
+const CLONE_ARGS: [&str; 11] = ["clip_id", "mask_clip_id", "intensity", "start_time", "end_time", "count", "dx", "dy", "decay", "mask_channel", "mask_threshold"];
 const VERTIGO_ARGS: [&str; 7] = ["clip_id", "depth_clip_id", "intensity", "start_time", "end_time", "direction", "focal_depth"];
 
 fn num(a: &Value, k: &str, d: f64, lo: f64, hi: f64) -> Result<f64, String> {
@@ -121,4 +122,37 @@ pub fn commands() -> Vec<Command> { vec![
             let c = ss.project.find_clip_mut(&cid).unwrap();
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = strings; true } else { c.effects.push(Effect { id: eid.clone(), kind: "depth_parallax".into(), params, strings }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "depth": {"clip_id": m, "focal_depth": focal}, "dolly_target": target, "window": [start, end], "note": "same effect kind as add_depth_parallax (depth_parallax) -- this is a keyframed convenience over it, not a separate effect"})) } },
+
+    Command { name: "add_subject_clone", description: "Clone/multiply the subject: duplicates whatever a mask clip marks as the subject (white = subject) at growing spatial offsets, each copy a little dimmer -- the subject appears to repeat across the frame. Needs a mask/matte clip the same way add_depth_parallax needs a depth map. Ramps in/out across start_time..end_time.", mutates: true,
+        schema: obj(vec![("clip_id", s("clip to clone the subject of")),
+            ("mask_clip_id", s("mask/matte clip: another clip read per pixel, white = subject, black = background (hidden, same convention as add_depth_parallax's depth map)")),
+            ("intensity", n("0..1, overall clone opacity, default 0.5 (subtle)")),
+            ("start_time", n("clip-local seconds the clones ramp in from, default 0")),
+            ("end_time", n("clip-local seconds the clones ramp out by, default the clip's own duration")),
+            ("count", n("number of extra copies, 1..8, default 3")),
+            ("dx", n("x offset per copy in px, default 55")),
+            ("dy", n("y offset per copy in px, default 0")),
+            ("decay", n("opacity falloff per further copy, 0..1, default 0.6 (each copy 60% of the one before it)")),
+            ("mask_channel", json!({"type":"string","enum":crate::layerfx::CHANNELS,"description":"channel of the mask read as subject coverage, default luma"})),
+            ("mask_threshold", n("mask value at/above which a pixel counts as subject, 0..1, default 0.5"))], &["clip_id", "mask_clip_id"]),
+        run: |ss, a| {
+            for k in a.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() { if !CLONE_ARGS.contains(&k.as_str()) { return Err(format!("add_subject_clone: unknown argument '{k}' (valid: {})", CLONE_ARGS.join(", "))); } }
+            let cid = a.get("clip_id").and_then(|v| v.as_str()).ok_or("add_subject_clone needs clip_id")?.to_string();
+            let dur = ss.project.find_clip(&cid).ok_or_else(|| format!("no such clip {cid}"))?.duration;
+            let m = a.get("mask_clip_id").and_then(|v| v.as_str()).ok_or("add_subject_clone needs mask_clip_id (the clip read as the subject mask: white = subject)")?.to_string();
+            if m == cid { return Err(format!("mask_clip_id: a clip cannot be its own subject mask ({m} is the cloned clip itself)")); }
+            if ss.project.find_clip(&m).is_none() { return Err(format!("mask_clip_id: no such clip {m}")); }
+            let intensity = num(&a, "intensity", 0.5, 0.0, 1.0)?;
+            let start = num(&a, "start_time", 0.0, 0.0, dur)?; let end = num(&a, "end_time", dur, start, dur)?;
+            let count = num(&a, "count", 3.0, 1.0, 8.0)?; let dx = num(&a, "dx", 55.0, -2000.0, 2000.0)?; let dy = num(&a, "dy", 0.0, -2000.0, 2000.0)?;
+            let decay = num(&a, "decay", 0.6, 0.0, 1.0)?; let thr = num(&a, "mask_threshold", 0.5, 0.0, 1.0)?;
+            let ch = match a.get("mask_channel") { None | Some(Value::Null) => "luma".to_string(), Some(v) => { let c = v.as_str().unwrap_or(""); if !crate::layerfx::CHANNELS.contains(&c) { return Err(format!("mask_channel must be one of {}, got {v}", crate::layerfx::CHANNELS.join(", "))); } c.to_string() } };
+            let fade = ((end - start) * 0.2).max(0.1);
+            let mut params: std::collections::BTreeMap<String, Prop> = [("count", count), ("dx", dx), ("dy", dy), ("decay", decay), ("mask_threshold", thr)].iter().map(|(k, v)| (k.to_string(), Prop::new(*v))).collect();
+            params.insert("amount".into(), ramp_prop(start, end, intensity.max(0.05), fade));
+            let strings: std::collections::BTreeMap<String, String> = [("mask_clip".to_string(), m.clone()), ("mask_channel".to_string(), ch.clone())].into_iter().collect();
+            let eid = { let existing = ss.project.find_clip(&cid).unwrap().effects.iter().find(|e| e.kind == "subject_clone").map(|e| e.id.clone()); existing.unwrap_or_else(|| ss.project.gen_id("fx")) };
+            let c = ss.project.find_clip_mut(&cid).unwrap();
+            let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = strings; true } else { c.effects.push(Effect { id: eid.clone(), kind: "subject_clone".into(), params, strings }); false };
+            Ok(json!({"effect_id": eid, "updated": replaced, "mask": {"clip_id": m, "channel": ch, "threshold": thr}, "count": count, "window": [start, end]})) } },
 ] }

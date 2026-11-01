@@ -16,7 +16,7 @@ use crate::model::Effect;
 
 pub const CHANNELS: &[&str] = &["red", "green", "blue", "alpha", "luma", "hue", "saturation", "lightness"];
 pub const EDGES: &[&str] = &["clamp", "wrap", "transparent"];
-pub const KINDS: &[&str] = &["displacement_map", "set_matte", "lens_blur", "depth_parallax", "channel_combiner", "set_channels", "match_grain"];
+pub const KINDS: &[&str] = &["displacement_map", "set_matte", "lens_blur", "depth_parallax", "channel_combiner", "set_channels", "match_grain", "subject_clone"];
 pub const MAP_SPACES: &[&str] = &["screen", "clip"];
 
 /// Where the clip lands on the canvas: f = c + (dx, dy) + R(rot) * scale * (q - c), c the canvas centre, y down (render.rs transform_bb).
@@ -25,7 +25,7 @@ impl Place { pub fn identity(&self) -> bool { (self.scale - 1.0).abs() < 1e-9 &&
 
 /// The string key holding the driving clip's id.
 /// lens_blur carries one only when add_lens_blur was given a depth map (depth_clip); without it the lens blur is an ordinary effect.
-pub fn source_key(kind: &str) -> Option<&'static str> { match kind { "displacement_map" => Some("map_clip"), "set_matte" => Some("matte_clip"), "lens_blur" | "depth_parallax" => Some("depth_clip"), "channel_combiner" | "set_channels" | "match_grain" => Some("ref_clip"), _ => None } }
+pub fn source_key(kind: &str) -> Option<&'static str> { match kind { "displacement_map" => Some("map_clip"), "set_matte" => Some("matte_clip"), "lens_blur" | "depth_parallax" => Some("depth_clip"), "channel_combiner" | "set_channels" | "match_grain" => Some("ref_clip"), "subject_clone" => Some("mask_clip"), _ => None } }
 /// True when the effect is driven by another clip right now (its source key is set).
 pub fn driven(e: &Effect) -> bool { source_key(&e.kind).is_some_and(|k| e.strings.contains_key(k)) }
 
@@ -190,4 +190,33 @@ pub fn depth_parallax(e: &Effect, f: &mut Frame, map: &Frame, lt: f64) {
         let i = (y * w + x) * 4; f.d[i..i + 4].copy_from_slice(&out);
     } }
 }
-pub fn apply(e: &Effect, f: &mut Frame, src: &Frame, lt: f64, place: Option<Place>, seed: u64) { match e.kind.as_str() { "displacement_map" => displace(e, f, src, lt, place), "set_matte" => set_matte(e, f, src), "lens_blur" => lens_depth(e, f, src, lt), "depth_parallax" => depth_parallax(e, f, src, lt), "channel_combiner" => channel_combiner(e, f, src, lt), "set_channels" => set_channels(e, f, src, lt), "match_grain" => match_grain(e, f, src, lt, seed), _ => {} } }
+/// Clone/multiply the subject: a second clip (mask_clip, e.g. a person matte) rendered at the same time marks the subject
+/// (its channel, mask_channel default luma, at or above mask_threshold = subject, white-on-black convention same as a matte).
+/// `count` extra copies of exactly that masked region (the subject's OWN original pixels, not re-warped) are pasted at growing
+/// offsets (dx, dy) * k px, each dimmer by decay^(k-1) * amount, painted farthest-first so the real subject (already in f,
+/// never moved) always reads on top and sharpest -- the classic "duplicate yourself through the frame" look.
+pub fn subject_clone(e: &Effect, f: &mut Frame, mask: &Frame, lt: f64) {
+    if mask.w == 0 || mask.h == 0 || f.w == 0 || f.h == 0 { return; }
+    let count = (num(e, "count", lt, 2.0).round() as i64).clamp(0, 8);
+    let amount = num(e, "amount", lt, 1.0).clamp(0.0, 1.0);
+    if count == 0 || amount <= 0.0 { return; }
+    let (dx, dy) = (num(e, "dx", lt, 40.0) as f64, num(e, "dy", lt, 0.0) as f64);
+    let decay = num(e, "decay", lt, 0.6).clamp(0.0, 1.0);
+    let (ch, thr) = (word(e, "mask_channel", "luma"), num(e, "mask_threshold", lt, 0.5).clamp(0.0, 1.0));
+    let (w, h) = (f.w, f.h);
+    let subject = f.d.clone(); // the subject's own look, lifted before any copy is pasted so copies never sample an already-cloned frame
+    let mut cov = vec![0f32; w * h];
+    for y in 0..h { for x in 0..w { let m = channel(at(mask, f, x, y), ch, 0.0); cov[y * w + x] = if m >= thr { 1.0 } else { 0.0 }; } }
+    for k in (1..=count).rev() {
+        let op = amount * decay.powi((k - 1) as i32);
+        if op <= 0.002 { continue; }
+        let (ox, oy) = ((dx * k as f64).round() as i64, (dy * k as f64).round() as i64);
+        for y in 0..h { for x in 0..w {
+            let (sx, sy) = (x as i64 - ox, y as i64 - oy); if sx < 0 || sy < 0 || sx >= w as i64 || sy >= h as i64 { continue; }
+            let (sxu, syu) = (sx as usize, sy as usize); if cov[syu * w + sxu] < 0.5 { continue; }
+            let si = (syu * w + sxu) * 4; let a = subject[si + 3] * op; if a <= 0.001 { continue; }
+            let di = (y * w + x) * 4; for j in 0..3 { f.d[di + j] = f.d[di + j] * (1.0 - a) + subject[si + j] * a; } f.d[di + 3] += a * (1.0 - f.d[di + 3]);
+        } }
+    }
+}
+pub fn apply(e: &Effect, f: &mut Frame, src: &Frame, lt: f64, place: Option<Place>, seed: u64) { match e.kind.as_str() { "displacement_map" => displace(e, f, src, lt, place), "set_matte" => set_matte(e, f, src), "lens_blur" => lens_depth(e, f, src, lt), "depth_parallax" => depth_parallax(e, f, src, lt), "channel_combiner" => channel_combiner(e, f, src, lt), "set_channels" => set_channels(e, f, src, lt), "match_grain" => match_grain(e, f, src, lt, seed), "subject_clone" => subject_clone(e, f, src, lt), _ => {} } }

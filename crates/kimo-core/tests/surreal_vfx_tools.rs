@@ -88,3 +88,29 @@ fn vertigo_zoom_locks_the_subject_and_moves_the_background() {
     for x in [5, 20, 140] { assert!((px(&f0, x, 45)[0] - ramp(x) as f32 / 255.0).abs() < 0.02, "at start_time (dolly=0) the background at x={x} must sit exactly at its own ramp colour"); }
     let _ = base;
 }
+
+#[test]
+fn subject_clone_pastes_a_dimmer_copy_of_the_subject_and_is_opt_in() {
+    // mask clip: white square marks the subject, same shape/position as the picture's own green square
+    let (mut s, v) = scene();
+    let mask_path = png("mask", |x, y| if in_sq(x, y) { [255, 255, 255, 255] } else { [0, 0, 0, 255] });
+    let t2 = id(&c(&mut s, "add_track", json!({})), "track_id");
+    let am = id(&c(&mut s, "import_media", json!({"path": mask_path})), "asset_id");
+    let m = id(&c(&mut s, "add_clip", json!({"track_id": t2, "source_type": "media", "asset_id": am, "start": 0, "duration": 2.0})), "clip_id");
+    let r = dispatch(&mut s, "add_subject_clone", &json!({"clip_id": v, "mask_clip_id": m, "intensity": 1.0, "start_time": 0.0, "end_time": 2.0, "count": 1, "dx": 50, "dy": 0, "decay": 1.0}));
+    assert!(r.is_ok(), "add_subject_clone must exist: {}", r.unwrap_err());
+    let f = frame(&s, 1.0);
+    // the square itself (65..95) must still be green (the real subject, never moved, painted last/on top)
+    for x in [70, 80, 90] { assert!(green(&f, x, 45), "the real subject must still be green at x={x}, got {:?}", px(&f, x, 45)); }
+    // a clone appears 50px to the right of the square: just past the original's right edge (x=95) must now show green too
+    assert!(green(&f, 120, 45), "a cloned copy of the subject must appear ~50px to the right (square 65..95 + 50 = 115..145), got {:?}", px(&f, 120, 45));
+    // the mask clip itself must never be directly visible (it is hidden, same convention as a depth map)
+    assert!(!green(&f, 10, 10) && px(&f, 10, 10)[0] < 0.2, "the mask clip must be hidden");
+    // intensity 0 / count 0 must be a no-op (opt-in)
+    let (mut s2, v2) = scene();
+    let t3 = id(&c(&mut s2, "add_track", json!({})), "track_id"); let am2 = id(&c(&mut s2, "import_media", json!({"path": mask_path})), "asset_id");
+    let m2 = id(&c(&mut s2, "add_clip", json!({"track_id": t3, "source_type": "media", "asset_id": am2, "start": 0, "duration": 2.0})), "clip_id");
+    c(&mut s2, "add_subject_clone", json!({"clip_id": v2, "mask_clip_id": m2, "intensity": 0.0, "start_time": 0.0, "end_time": 2.0, "dx": 50}));
+    let f2 = frame(&s2, 1.0);
+    assert!(!green(&f2, 120, 45), "intensity=0 must leave no visible clone");
+}
