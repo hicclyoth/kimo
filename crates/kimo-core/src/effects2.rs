@@ -12,6 +12,7 @@ pub const CATALOG2: &[(&str, &str, &[C])] = &[
     ("turbulent_displace", "Noise-driven displacement (heat haze, liquid, organic warp)", &[("amount", 20.0, "px"), ("size", 80.0, "noise px"), ("speed", 0.5, "evolution/s")]),
     ("droste_zoom", "Droste/Escher infinite recursive zoom: the frame repeats into itself in a self-similar spiral tunnel (log-polar radius wrap, not a simple crop-zoom). mix fades the whole effect in/out (0 = untouched frame); drift spirals it inward over time; keyframe mix for a clean start/end window.", &[("cx", 0.5, "0..1"), ("cy", 0.5, "0..1"), ("zoom", 1.6, "recursion ratio per ring, >1.02"), ("twist", 12.0, "deg rotation added per ring, for a spiral rather than a plain tunnel"), ("drift", 0.12, "spiral inward speed, rings/s"), ("mix", 1.0, "0..1 blend with the untouched frame, 0 = off")]),
     ("portal_mirror", "Portal into an inverted world: a soft-edged circular window shows the same frame flipped and colour-inverted, like a doorway into upside-down reality. Combine with set_effect_mask for a non-circular portal shape, or with another clip's mask for a subject-shaped portal.", &[("cx", 0.5, "0..1"), ("cy", 0.5, "0..1"), ("radius", 0.28, "portal radius, fraction of the short side"), ("feather", 0.08, "edge softness, fraction of the short side"), ("invert_color", 1.0, "0/1, invert colour inside the portal"), ("flip_vertical", 1.0, "0/1, flip the world vertically inside the portal"), ("mix", 1.0, "0..1 blend with the untouched frame, 0 = off")]),
+    ("melt_drip", "Directional dripping/melting warp: the image streaks downward (or any angle) with smear growing toward the far edge, driven by per-column noise -- a one-way melt, distinct from turbulent_displace's symmetric organic wobble.", &[("amount", 18.0, "px of maximum drip at the far edge"), ("size", 40.0, "noise feature width px, controls how wide each drip streak reads"), ("speed", 0.3, "drip animation speed"), ("angle", 90.0, "drip direction deg, 90 = straight down"), ("mix", 1.0, "0..1 blend with the untouched frame, 0 = off")]),
     ("offset", "Offset with wrap-around", &[("dx", 0.0, "px"), ("dy", 0.0, "px")]),
     ("motion_tile", "Tile the frame (optionally mirrored)", &[("tiles", 2.0, "per axis"), ("mirror", 0.0, "0/1")]),
     ("spin_blur", "Rotational blur", &[("angle", 10.0, "degrees"), ("cx", 0.5, "0..1"), ("cy", 0.5, "0..1")]),
@@ -328,6 +329,13 @@ pub fn apply2(kind: &str, pr: &Params, f: &mut Frame, t: f64, seed: u64) -> Resu
                 for y in 0..h { for x in 0..w { let (dx, dy) = (x as f32 - cx, y as f32 - cy); let d = (dx * dx + dy * dy).sqrt(); let inside = ((radius + feather - d) / feather).clamp(0.0, 1.0); if inside <= 0.0 { continue; }
                     let (sx, sy) = if flip_v { (x as f32, cy - dy) } else { (x as f32, y as f32) }; let mut v = sample(&src, w, h, sx, sy); if invert_color { for j in 0..3 { v[j] = 1.0 - v[j]; } }
                     let i = (y * w + x) * 4; let k = inside * mix; for j in 0..4 { f.d[i + j] = f.d[i + j] * (1.0 - k) + v[j] * k; } } } } }
+        "melt_drip" => { let amount = g("amount", 18.0); let size = g("size", 40.0).max(4.0); let speed = g("speed", 0.3); let angle = g("angle", 90.0).to_radians(); let mix = g("mix", 1.0).clamp(0.0, 1.0);
+            if mix > 0.001 { let (ux, uy) = (angle.cos(), angle.sin()); let tt = t as f32 * speed; let sd = seed as u32; let src = f.d.clone(); let span = (wf * ux.abs() + hf * uy.abs()).max(1.0);
+                for y in 0..h { for x in 0..w {
+                    // perp picks which noise "drip column" this pixel falls under; along grows from 0 (the edge the drip flows from) to ~1 (the far edge)
+                    let perp = (x as f32 * -uy + y as f32 * ux) / size; let along = ((x as f32 * ux + y as f32 * uy) / span).clamp(0.0, 1.0);
+                    let n = fbm(perp, tt, 3, sd); let drip = amount * along * along * n;
+                    let v = sample(&src, w, h, x as f32 - ux * drip, y as f32 - uy * drip); let i = (y * w + x) * 4; for j in 0..4 { f.d[i + j] = src[i + j] * (1.0 - mix) + v[j] * mix; } } } } }
         other => return crate::color::apply3(other, pr, f, t, seed),
     }
     Ok(())

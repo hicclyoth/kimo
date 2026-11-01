@@ -114,3 +114,21 @@ fn subject_clone_pastes_a_dimmer_copy_of_the_subject_and_is_opt_in() {
     let f2 = frame(&s2, 1.0);
     assert!(!green(&f2, 120, 45), "intensity=0 must leave no visible clone");
 }
+
+#[test]
+fn melt_drip_streaks_more_toward_the_far_edge_and_is_opt_in() {
+    let (s0, v0) = scene(); let base = frame(&s0, 1.0); let _ = v0;
+    let (mut s, v) = scene();
+    c(&mut s, "add_melt_drip", json!({"clip_id": v, "intensity": 0.9, "start_time": 0.0, "end_time": 2.0, "angle": 90.0, "size": 30.0}));
+    let f = frame(&s, 1.0);
+    assert!(differs(&base, &f) > 300, "melt_drip at high intensity must visibly change the frame");
+    // with a straight-down drip, the square's content drags downward -- just below its original bottom edge (y=65, normally
+    // background) picks up green (dripped square content) more than just above its original top edge (y=25, also background)
+    let below_diff = (0..W).filter(|&x| green(&f, x, 65) && !green(&base, x, 65)).count();
+    let above_diff = (0..W).filter(|&x| green(&f, x, 25) && !green(&base, x, 25)).count();
+    assert!(below_diff > above_diff, "a straight-down drip must drag the subject downward (new green below its old edge) more than upward, below={below_diff} above={above_diff}");
+    // outside its window it must be a no-op
+    let (mut s2, v2) = scene(); c(&mut s2, "add_melt_drip", json!({"clip_id": v2, "intensity": 0.9, "start_time": 1.2, "end_time": 1.6}));
+    let f2 = frame(&s2, 0.2);
+    assert_eq!(differs(&base, &f2), 0, "outside its start_time..end_time window melt_drip must leave the frame untouched");
+}

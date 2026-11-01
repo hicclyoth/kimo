@@ -17,7 +17,7 @@ add_depth_parallax cc1c6063f0930b13
 add_detection_box e740cc0690940b44
 add_displacement_map be79622940cf29ef
 add_droste_zoom 6613207b378704f2
-add_effect 6d34af40ebc8bd49
+add_effect 09b7806e1b83c791
 add_emitter 163900fc22436efa
 add_glitch_confetti ea3c9845ccf22d20
 add_glow_text 11957bdb81e0bc57
@@ -28,6 +28,7 @@ add_managed_linear_effect 15e7663749141579
 add_marker 13b9c5a2e2022d94
 add_mask 128b6203f759a55c
 add_match_grain a1b28d4e072f25b9
+add_melt_drip 860ba2e733e594b1
 add_modifier 881425bab098ce59
 add_morph_cut f5aea6965892fcd5
 add_multicam f0d46cf978e1e7f9

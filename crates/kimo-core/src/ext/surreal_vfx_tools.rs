@@ -21,6 +21,7 @@ fn ramp_prop(start: f64, end: f64, peak: f64, fade: f64) -> Prop {
 
 const DROSTE_ARGS: [&str; 9] = ["clip_id", "intensity", "start_time", "end_time", "cx", "cy", "twist", "drift", "remove"];
 const PORTAL_ARGS: [&str; 10] = ["clip_id", "intensity", "start_time", "end_time", "cx", "cy", "radius", "flip_vertical", "invert_color", "remove"];
+const MELT_ARGS: [&str; 7] = ["clip_id", "intensity", "start_time", "end_time", "size", "speed", "angle"];
 const CLONE_ARGS: [&str; 11] = ["clip_id", "mask_clip_id", "intensity", "start_time", "end_time", "count", "dx", "dy", "decay", "mask_channel", "mask_threshold"];
 const VERTIGO_ARGS: [&str; 7] = ["clip_id", "depth_clip_id", "intensity", "start_time", "end_time", "direction", "focal_depth"];
 
@@ -155,4 +156,28 @@ pub fn commands() -> Vec<Command> { vec![
             let c = ss.project.find_clip_mut(&cid).unwrap();
             let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = strings; true } else { c.effects.push(Effect { id: eid.clone(), kind: "subject_clone".into(), params, strings }); false };
             Ok(json!({"effect_id": eid, "updated": replaced, "mask": {"clip_id": m, "channel": ch, "threshold": thr}, "count": count, "window": [start, end]})) } },
+
+    Command { name: "add_melt_drip", description: "Directional dripping/melting warp: the image streaks and sags toward one edge (default straight down), like wet paint or a melting frame -- distinct from the existing symmetric liquid wobble (turbulent_displace). Ramps in/out across start_time..end_time.", mutates: true,
+        schema: obj(vec![("clip_id", s("clip to apply it to")),
+            ("intensity", n("0..1, how far it drips at its strongest, default 0.3 (subtle)")),
+            ("start_time", n("clip-local seconds the drip ramps in from, default 0")),
+            ("end_time", n("clip-local seconds the drip ramps out by, default the clip's own duration")),
+            ("size", n("noise feature width px, how wide each drip streak reads, default 40")),
+            ("speed", n("drip animation speed, default 0.3")),
+            ("angle", n("drip direction in degrees, 90 = straight down, default 90"))], &["clip_id"]),
+        run: |ss, a| {
+            for k in a.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() { if !MELT_ARGS.contains(&k.as_str()) { return Err(format!("add_melt_drip: unknown argument '{k}' (valid: {})", MELT_ARGS.join(", "))); } }
+            let cid = a.get("clip_id").and_then(|v| v.as_str()).ok_or("add_melt_drip needs clip_id")?.to_string();
+            let dur = ss.project.find_clip(&cid).ok_or_else(|| format!("no such clip {cid}"))?.duration;
+            let intensity = num(&a, "intensity", 0.3, 0.0, 1.0)?;
+            let start = num(&a, "start_time", 0.0, 0.0, dur)?; let end = num(&a, "end_time", dur, start, dur)?;
+            let size = num(&a, "size", 40.0, 4.0, 400.0)?; let speed = num(&a, "speed", 0.3, 0.0, 5.0)?; let angle = num(&a, "angle", 90.0, -360.0, 360.0)?;
+            // amount scales with intensity: up to 60px of drip at full intensity
+            let amount = intensity * 60.0; let fade = ((end - start) * 0.2).max(0.1);
+            let mut params: std::collections::BTreeMap<String, Prop> = [("amount", amount), ("size", size), ("speed", speed), ("angle", angle)].iter().map(|(k, v)| (k.to_string(), Prop::new(*v))).collect();
+            params.insert("mix".into(), ramp_prop(start, end, 1.0, fade));
+            let eid = { let existing = ss.project.find_clip(&cid).unwrap().effects.iter().find(|e| e.kind == "melt_drip").map(|e| e.id.clone()); existing.unwrap_or_else(|| ss.project.gen_id("fx")) };
+            let c = ss.project.find_clip_mut(&cid).unwrap();
+            let replaced = if let Some(e) = c.effects.iter_mut().find(|e| e.id == eid) { e.params = params; e.strings = Default::default(); true } else { c.effects.push(Effect { id: eid.clone(), kind: "melt_drip".into(), params, strings: Default::default() }); false };
+            Ok(json!({"effect_id": eid, "updated": replaced, "intensity": intensity, "window": [start, end], "amount_px": amount})) } },
 ] }
