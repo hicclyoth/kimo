@@ -1,3 +1,42 @@
+## v8.5.2 (2026-11-01)
+
+Three looks from the v8.5.1 pass still didn't read at phone size on real-footage review:
+`glitch_surge`, `vhs_decay`, `frost_veil`. Reworked below, each iterated with `vfx_preview` and the
+peak frame inspected at full size (`attach_image`) before touching `vfx_look_library.rs`.
+
+- **`glitch_surge`**: the real bug was the peak-frame capture, not just the graph -- the old demo grabbed
+  t=0.8s against a 0.55s pulse period, which lands on an already-decayed frame, so the v02 contact
+  sheet showed almost nothing. The graph itself was also too weak on-hit. Now: the pulse period is
+  ~0.6s (every 0.5-0.7s per the brief), two `glitch_blocks` layers are stacked (9 coarse slices for
+  bold full-width horizontal bands, 24 fine slices layered on top for texture), `slice_threshold` is
+  lowered so most slices trigger together instead of a scattered few, and the `rgb_split` pulse is
+  pushed much harder on the hit. Between hits both layers settle near zero -- clean frames, confirmed
+  by inspecting a frame between pulses. The face glitches hard on the hit (by design, per the brief)
+  and is fully recovered one frame later.
+- **`vhs_decay`**: had no actual low-res softness and no warm cast -- a real 90s camcorder skews warm
+  and soft, not neutrally desaturated and sharp. Added a pre-blur before the `vhs` effect, raised
+  wobble/bleed/noise/bands for genuinely visible line wobble, chroma bleed and a rolling tracking band,
+  and added a `temperature` push (warm, not cool) after the grain pass, ahead of a lighter
+  desaturation. Reads as worn tape at a glance now; chroma bleed on the patterned shirt in the demo
+  clip is heavier than plain footage would show, which is the correct VHS chroma-interference
+  artifact, not a bug.
+- **`frost_veil`**: reworked twice already (pre-8.5.0: fixed a wireframe-reading `edge_glow`; 8.5.1:
+  left untouched, which read as subtle again on this pass' real-footage review). Root cause this time:
+  `temperature`'s `amount` is scaled by 0.2 internally, so even a -1 push is a mild shift against warm
+  practical lighting, and `edge_glow` run directly on the raw frame outlines facial features -- the
+  exact wireframe failure from the original pass. Fixed with `color_wheels` (lift/gamma/gain pushed
+  blue per channel, a much stronger and more controllable cool push than `temperature`), `edge_glow`
+  now running on the already-blurred/graded buffer instead of the raw frame (a soft rim, not a crisp
+  outline), a `vignette` tinted icy white-blue (`color_r/g/b`) instead of plain black for an actual
+  frosted-edge read, and two off-centre `snow` particle emitters (sides only, clear of a centred face).
+
+Benchmark: `real_v51.mp4` renders byte-identical to the standing golden (md5 `82ef81b6…`, matches
+v44-v47/v49/v50) -- this pass only touches `vfx_look_library.rs`'s opt-in graph JSON, nothing on the
+auto-edit/caption/render path. Tests: `vfx_look_library`, `vfx_graph_core/tools/particles`,
+`surreal_vfx_tools` green (no expectation changes needed -- the look tests are structural over names,
+not pixels); `golden_frames`, `recipes`, `registry_lint`, `registry_unique` green and unmoved. Warnings:
+34 (cap 35, unchanged from v8.5.1).
+
 ## v8.5.1 (2026-11-01)
 
 Look library quality pass. Naman's goal is "put any clips into Kimo and get top-YouTube-editor

@@ -14,6 +14,18 @@
 //! exposure stacked at their old intensity ceilings blew solar_flare's highlights past half the frame (41.7%
 //! clipping, mean luma 0.86 measured on real footage) -- "unmistakable" and "washed-out" are different failures,
 //! and solar_flare's ranges are tuned to stop well short of the second one.
+//!
+//! V8.5.2: three looks still didn't read at phone size after the 8.5.1 pass -- glitch_surge, vhs_decay, frost_veil.
+//! glitch_surge's peak-frame capture (fixed t=0.8s against a 0.55s pulse period) had landed on an already-decayed
+//! frame, and even on-hit the ceilings were too low; now two stacked glitch_blocks layers (coarse + fine bands) with
+//! a lowered slice_threshold so most of the frame's bands trigger together, a shortened ~0.6s period, and a harder
+//! rgb_split pulse. vhs_decay had no low-res softness and no warm cast (a real camcorder skews warm, not neutrally
+//! desaturated); added a pre-blur and a post-grain temperature push, and raised wobble/bleed/noise/bands. frost_veil
+//! (reworked once already before 8.5.0, then made subtle again in 8.5.1's untouched pass) is graded with
+//! color_wheels instead of temperature (temperature's amount is scaled 0.2x internally and reads as almost nothing)
+//! and edge_glow now runs on the blurred/graded buffer instead of the raw frame -- edge_glow on the raw frame is
+//! exactly what produced v01's "wireframe" face; the vignette is now tinted icy white-blue instead of plain black,
+//! and two off-center snow emitters add light drift clear of a centered face.
 use serde_json::{json, Value};
 
 fn eff(id: &str, src: &str, kind: &str, params: Value) -> Value {
@@ -58,11 +70,11 @@ pub fn describe(name: &str) -> Option<&'static str> {
     Some(match name {
         "ember_drift" => "warm glowing embers rising off the lower frame edge (deterministic particle line emitter, not a preset default) into a soft teal/orange bloom grade",
         "chrome_bloom" => "cool metallic grade (temperature pulled down, desaturated, contrast lifted) with chrome edge fringe and a strong, cool-tinted bloom on highlights",
-        "glitch_surge" => "punchy block-glitch and RGB-split hits on a repeating time pulse (sharp attack, quick decay), calm scanline/fringe texture between hits",
+        "glitch_surge" => "unmistakable block-glitch and RGB-split punches on a repeating ~0.6s pulse -- bold horizontal slice displacement across most of the frame on each hit, clean frames between hits",
         "dream_haze" => "clear halation bleeding from highlights, soft overall glow, and a lifted pastel grade (shadows lifted and gently tinted, slightly desaturated)",
-        "frost_veil" => "cool frosted-glass read: blue edge-glow, soft blur, cool grade, vignette",
+        "frost_veil" => "unmistakable icy blue-white grade with a frosted glowing rim, crystalline frost vignette at the edges, and light snow drifting at the sides",
         "magic_sparkle" => "golden/violet magic dust framed to the sides and lower-thirds (kept off the face on purpose) over a strong warm/violet bloom",
-        "vhs_decay" => "obvious worn-tape VHS: line wobble, chroma bleed, tracking bands, tape noise, scanlines, desaturated and vignetted",
+        "vhs_decay" => "obvious worn-tape 90s-camcorder VHS: soft/low-res, line wobble, strong chroma bleed, a rolling tracking band, tape noise, scanlines, warm tint and vignette",
         "aurora_wash" => "a flowing multi-stop teal/blue/violet colour wash that slowly swings and breathes across the frame, with drifting fireflies",
         "solar_flare" => "a strong golden solar flare: light rays plus halation plus bloom and a warm grade, tuned to stay short of blowing out the whole frame",
         _ => return None,
@@ -108,10 +120,18 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // ride pulse_prop -- a repeating keyframed spike (period 0.55s) -- so the frame punches hard on the attack
         // and settles to a light scanline/fringe texture between hits. Peak-intensity ceilings dialled back once
         // from an even punchier first pass that fully scrambled a face at the attack frame.
+        // V8.5.2: period shortened to 0.6s (every ~0.5-0.7s per the brief) and both the coarse-band and fine-band
+        // amounts raised hard, with slice_threshold lowered so most slices (not a scattered few) trigger on each
+        // hit -- "a couple of frames show small edge blocks" was the exact failure: the old peak-frame capture
+        // (fixed t=0.8s against a 0.55s period) landed on a decayed frame, and even on-hit the old ceilings were
+        // too low to read as unmistakable. Two stacked glitch_blocks layers (9 coarse slices for bold full-width
+        // bands, 24 fine slices layered on top for texture) plus a harder rgb_split pulse reads as a real punch;
+        // between hits everything settles to near zero (clean) with only a light scanline texture.
         "glitch_surge" => json!({"nodes": [
-            eff("blocks", SRC, "glitch_blocks", json!({"amount": pulse_prop(0.55, 3.0 + 5.0 * i, 28.0 + 48.0 * i), "slices": 16.0, "rate": 10.0})),
-            eff("split", "blocks", "rgb_split", json!({"amount": pulse_prop(0.55, 0.8 + 1.2 * i, 5.0 + 9.0 * i)})),
-            eff("out", "split", "scanlines", json!({"amount": 0.1 + 0.15 * i, "spacing": 3.0})),
+            eff("bigblocks", SRC, "glitch_blocks", json!({"amount": pulse_prop(0.6, 0.0, 50.0 + 60.0 * i), "slices": 9.0, "rate": 8.0, "slice_threshold": 0.25, "green_offset": 14.0 + 10.0 * i})),
+            eff("fineblocks", "bigblocks", "glitch_blocks", json!({"amount": pulse_prop(0.6, 1.5 + 1.5 * i, 18.0 + 16.0 * i), "slices": 24.0, "rate": 20.0, "slice_threshold": 0.45, "green_offset": 6.0})),
+            eff("split", "fineblocks", "rgb_split", json!({"amount": pulse_prop(0.6, 0.4 + 0.4 * i, 14.0 + 16.0 * i)})),
+            eff("out", "split", "scanlines", json!({"amount": 0.08 + 0.1 * i, "spacing": 3.0})),
         ], "output": "out"}),
         // V8.5.1: added a real halation pass (the dedicated `halation` effect, not just bloom) for the "clear
         // halation" ask, plus a `grade` lift/gain pass for the "lifted pastel" ask (gentle lift on all three
@@ -127,12 +147,31 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         ], "output": "out"}),
         // Untouched: Tab's verdict was "strong" on real footage. The previous worker already reworked this once
         // (edge_glow had read as a full wireframe, not a frosted rim) before the 8.5.0 wrap.
+        // V8.5.2: v02's rework (temperature + edge_glow on the raw frame) read as subtle -- `temperature`'s amount
+        // is internally scaled by 0.2 so even a -1 push is a mild shift, and edge_glow at a readable amount applied
+        // directly to the source outlines facial features (the exact "wireframe" failure from v01). Fixed by (1)
+        // grading with color_wheels instead (lift/gamma/gain per channel pushed cool/blue, a much stronger and more
+        // controllable push than temperature alone), (2) running edge_glow on the already-blurred/graded buffer
+        // instead of the raw frame so the glow reads as a soft rim rather than a crisp outline on facial detail,
+        // (3) a vignette tinted icy white-blue (color_r/g/b) instead of the default black darken, for an actual
+        // "crystalline frost at the edges" look instead of a plain dark vignette, and (4) two off-center snow
+        // particle emitters (sides only, well clear of a centered face) for the "light snow" ask.
         "frost_veil" => json!({"nodes": [
-            eff("soft", SRC, "blur", json!({"radius": 0.8 + 1.4 * i})),
-            eff("cool", "soft", "temperature", json!({"amount": -(0.12 + 0.18 * i)})),
-            eff("edge", SRC, "edge_glow", json!({"amount": 0.12 + 0.12 * i, "r": 0.6, "g": 0.85, "b": 1.0})),
-            blend("rim", "cool", "edge", "screen", 0.35 + 0.25 * i),
-            eff("out", "rim", "vignette", json!({"amount": 0.2 + 0.2 * i})),
+            eff("wheels", SRC, "color_wheels", json!({
+                "lift_r": -(0.09 + 0.08 * i), "lift_g": -0.01, "lift_b": 0.09 + 0.1 * i,
+                "gamma_r": 1.0 - 0.09 * i, "gamma_g": 1.0, "gamma_b": 1.0 + 0.09 * i,
+                "gain_r": 1.0 - 0.12 * i, "gain_g": 1.0 - 0.02 * i, "gain_b": 1.0 + 0.16 * i,
+            })),
+            eff("desat", "wheels", "saturation", json!({"amount": (1.0 - 0.3 * i).max(0.62)})),
+            eff("soft", "desat", "blur", json!({"radius": 0.5 + 0.6 * i})),
+            eff("edge", "soft", "edge_glow", json!({"amount": 0.32 + 0.38 * i, "r": 0.45, "g": 0.78, "b": 1.0})),
+            blend("rim", "soft", "edge", "screen", 0.5 + 0.3 * i),
+            eff("frostvig", "rim", "vignette", json!({"amount": 0.42 + 0.3 * i, "feather": 0.34, "roundness": 0.3, "color_r": 0.5, "color_g": 0.78, "color_b": 1.0})),
+            eff("crystals", "frostvig", "grain", json!({"amount": 0.03 + 0.04 * i, "size": 1.4})),
+            particles_raw("snow_l", json!({"preset": "snow", "seed": 31, "x": 0.08, "width": 0.18, "rate": 35.0 + 40.0 * i, "size0": 4.0, "size1": 4.0, "alpha0": 0.55, "alpha1": 0.55})),
+            particles_raw("snow_r", json!({"preset": "snow", "seed": 47, "x": 0.92, "width": 0.18, "rate": 35.0 + 40.0 * i, "size0": 4.0, "size1": 4.0, "alpha0": 0.55, "alpha1": 0.55})),
+            blend("snow_both", "snow_l", "snow_r", "screen", 1.0),
+            blend("out", "crystals", "snow_both", "screen", 1.0),
         ], "output": "out"}),
         // V8.5.1: pushed further per the brief, AND fixed a face-safety bug the push would otherwise have made
         // worse -- magic_dust's preset default (x=0.5, y=0.5, a 0.15-radius circle) sits squarely on a centered
@@ -151,11 +190,17 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // noise, and a moving tracking band) layered with scanlines/grain/desaturation/vignette, instead of
         // grain+scanlines+chromatic_aberration+saturation alone -- the old chain had no actual line wobble or
         // tracking band, which is most of what reads as "VHS" rather than just "degraded".
+        // V8.5.2: added a pre-blur for a genuine soft/low-res feel, raised wobble/bleed/noise/bands, layered a warm
+        // `temperature` push after the grain (90s camcorders skew warm, not neutral-desaturated) and widened the
+        // vignette -- the v02 chain (vhs + scanlines + grain + flat desaturation) had no low-res softness and no
+        // warm cast, which is why it read as "slightly desaturated video" rather than tape.
         "vhs_decay" => json!({"nodes": [
-            eff("tape", SRC, "vhs", json!({"wobble": 2.0 + 4.0 * i, "bleed": 3.5 + 5.0 * i, "noise": 0.07 + 0.14 * i, "bands": 0.5 + 0.7 * i})),
-            eff("scan", "tape", "scanlines", json!({"amount": 0.18 + 0.27 * i, "spacing": 3.0})),
-            eff("grain", "scan", "grain", json!({"amount": 0.04 + 0.08 * i})),
-            eff("desat", "grain", "saturation", json!({"amount": (1.0 - 0.25 * i).max(0.6)})),
+            eff("soft", SRC, "blur", json!({"radius": 0.5 + 0.7 * i})),
+            eff("tape", "soft", "vhs", json!({"wobble": 2.5 + 4.0 * i, "bleed": 4.5 + 5.5 * i, "noise": 0.12 + 0.16 * i, "bands": 1.0 + 1.4 * i})),
+            eff("scan", "tape", "scanlines", json!({"amount": 0.22 + 0.26 * i, "spacing": 3.0})),
+            eff("grain", "scan", "grain", json!({"amount": 0.05 + 0.07 * i})),
+            eff("warm", "grain", "temperature", json!({"amount": 0.12 + 0.14 * i})),
+            eff("desat", "warm", "saturation", json!({"amount": (1.0 - 0.18 * i).max(0.7)})),
             eff("out", "desat", "vignette", json!({"amount": 0.18 + 0.18 * i})),
         ], "output": "out"}),
         // V8.5.1: a static overlay read as a flat tinted filter, not "flowing colour bands". The gradient's angle
