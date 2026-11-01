@@ -178,3 +178,56 @@ fn peaky_clicks(name: &str, period: f64, n: usize) -> String {
     assert!(gain_db.abs() > 0.5, "a real gain correction should have been applied (not a no-op): {gain_db} dB, {norm}");
     assert!((r["music_gain_applied"].as_f64().unwrap() - 1.0).abs() > 0.05, "music_gain_applied should reflect the real correction, not the 1.0 failure fallback: {r}");
 }
+
+
+/// A warm-tinted clip (boosted red/reduced blue) and a cool-tinted clip (boosted blue/reduced red) from the same
+/// source -- two shots that would read as an obvious colour mismatch cut together.
+fn warm(name: &str, dur: f64) -> String {
+    let p = dir().join(name); if p.exists() { return p.to_string_lossy().into_owned(); }
+    ffmpeg(&["-f", "lavfi", "-i", &format!("testsrc2=s=640x360:r=30:d={dur}"), "-vf", "colorchannelmixer=rr=1.0:gg=0.75:bb=0.35", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", p.to_str().unwrap()]);
+    p.to_string_lossy().into_owned()
+}
+fn cool(name: &str, dur: f64) -> String {
+    let p = dir().join(name); if p.exists() { return p.to_string_lossy().into_owned(); }
+    ffmpeg(&["-f", "lavfi", "-i", &format!("testsrc2=s=640x360:r=30:d={dur}"), "-vf", "colorchannelmixer=rr=0.35:gg=0.75:bb=1.0", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", p.to_str().unwrap()]);
+    p.to_string_lossy().into_owned()
+}
+
+#[test] fn montage_color_match_pulls_other_clips_toward_the_first_clips_look() {
+    let mut ss = proj();
+    let aw = sid(&call(&mut ss, "import_media", json!({"path": warm("warm.mp4", 2.0)})), "asset_id");
+    let ac = sid(&call(&mut ss, "import_media", json!({"path": cool("cool.mp4", 2.0)})), "asset_id");
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let c1 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": aw, "start": 0.0, "duration": 2.0, "in_point": 0.0})), "clip_id");
+    let c2 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": ac, "start": 2.0, "duration": 2.0, "in_point": 0.0})), "clip_id");
+    let r = call(&mut ss, "montage_color_match", json!({"clip_ids": [c1, c2], "strength": 0.8}));
+    assert_eq!(r["anchor_clip_ids"], json!([c1]), "{r}");
+    assert_eq!(r["matched_clip_ids"], json!([c2]), "{r}");
+    let matched = r["match_shot_look_result"]["matched"].as_array().unwrap();
+    assert_eq!(matched.len(), 1, "{r}");
+    // c2 (cool: low R gain, high B gain) matched toward c1 (warm: high R gain, low B gain) should push its red
+    // channel gain UP and its blue channel gain DOWN -- the match is actually pulling the right direction, not
+    // just running and reporting "ok".
+    let gain = matched[0]["gain"].as_array().unwrap();
+    let (r_gain, b_gain) = (gain[0].as_f64().unwrap(), gain[2].as_f64().unwrap());
+    assert!(r_gain > 1.05, "expected red gain pushed up to warm the cool clip, got {r_gain}: {r}");
+    assert!(b_gain < 0.95, "expected blue gain pushed down to warm the cool clip, got {b_gain}: {r}");
+}
+
+#[test] fn montage_color_match_honours_an_explicit_reference_and_rejects_all_clips_as_reference() {
+    let mut ss = proj();
+    let aw = sid(&call(&mut ss, "import_media", json!({"path": warm("warm2.mp4", 2.0)})), "asset_id");
+    let ac = sid(&call(&mut ss, "import_media", json!({"path": cool("cool2.mp4", 2.0)})), "asset_id");
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let c1 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": aw, "start": 0.0, "duration": 2.0, "in_point": 0.0})), "clip_id");
+    let c2 = sid(&call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": ac, "start": 2.0, "duration": 2.0, "in_point": 0.0})), "clip_id");
+    // explicit reference = the cool clip this time -- the warm one should be the one that moves.
+    let r = call(&mut ss, "montage_color_match", json!({"clip_ids": [c1, c2], "reference_clip_ids": [c2], "strength": 0.8}));
+    assert_eq!(r["anchor_clip_ids"], json!([c2]), "{r}");
+    assert_eq!(r["matched_clip_ids"], json!([c1]), "{r}");
+    // everything also listed as its own reference must error cleanly, not silently no-op.
+    let mut ss2 = Session::new();
+    call(&mut ss2, "project_set", json!({"width": 640, "height": 360, "fps": 30}));
+    let err = dispatch(&mut ss2, "montage_color_match", &json!({"clip_ids": ["x", "y"], "reference_clip_ids": ["x", "y"]}));
+    assert!(err.is_err(), "expected an error when every clip_id is also a reference_clip_id (nothing left to match)");
+}

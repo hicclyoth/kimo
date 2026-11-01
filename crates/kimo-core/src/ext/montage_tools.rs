@@ -269,6 +269,26 @@ fn beat_sync_montage(ss: &mut Session, a: &Value) -> Result<Value, String> {
         "note": "every cut_time is a real audio_transients beat (shifted to the timeline), so cut_times and beat_times_used are identical by construction; shot length varies min_beats_per_shot..max_beats_per_shot beats with the beat's own strength, and the edit ends on a beats_per_phrase-aligned beat with the music faded out over the last fade_out_beats"}))
 }
 
+// ---------------------------------------------------------------- montage_color_match (job 3)
+fn montage_color_match(ss: &mut Session, a: &Value) -> Result<Value, String> {
+    let clip_ids = str_list(a, "clip_ids")?;
+    if clip_ids.len() < 2 { return Err("need at least 2 clip_ids to match a look across".into()); }
+    let strength = num(a, "strength", 0.6, 0.0, 1.0)?;
+    // match_shot_look itself skips any target that is also a reference clip (the reference clip IS the look, it
+    // doesn't get pulled toward itself) -- so the default anchor is simply the first clip given, and every other
+    // listed clip is the target set. An explicit reference_clip_ids lets a caller pick a different anchor (or
+    // several, averaged) instead of "whichever clip came first in the list".
+    let reference_clip_ids: Vec<String> = a.get("reference_clip_ids").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![clip_ids[0].clone()]);
+    let target_clip_ids: Vec<String> = clip_ids.iter().filter(|id| !reference_clip_ids.contains(id)).cloned().collect();
+    if target_clip_ids.is_empty() { return Err("every clip_id given is also in reference_clip_ids; nothing left to match toward it".into()); }
+    let r = call(ss, "match_shot_look", &json!({"reference_clip_ids": reference_clip_ids, "target_clip_ids": target_clip_ids, "strength": strength}))?;
+    Ok(json!({"anchor_clip_ids": reference_clip_ids, "matched_clip_ids": target_clip_ids, "strength": strength, "match_shot_look_result": r,
+        "note": "every clip in matched_clip_ids was pulled `strength` of the way toward anchor_clip_ids' averaged look via match_shot_look; anchor_clip_ids are left untouched (they ARE the target look)"}))
+}
+
 pub fn commands() -> Vec<Command> { vec![
     Command { name: "score_windows", description: "Read-only: score each clip's windows for sharpness, exposure, subject framing, motion and shake, so a montage can keep only the strongest footage. Scores window_s windows (default 1.0s) across every given clip_id on an absolute, cross-clip-comparable scale: sharpness (focus_series' own lap_var, normalized against this call's own global max across every window given), exposure (frame_quality's own crushed_frac+clipped_frac, already absolute), subject framing (pick_thumbnail's own subject_score) and motion (frozen_frames' own frame-to-frame diff), plus one shake number per whole clip_id (stabilize_clip's own read-only raw-path-vs-smoothed-path correction, max_correction_px/deg -- scoped per clip, not per window, since a handheld take is shaky throughout). Returns every window with its score, score_parts, raw measurements and a kept bool (score>=min_score and shake_px<=max_shake_px); nothing is cut.", mutates: false,
         schema: obj(vec![("clip_ids", json!({"type":"array","items":{"type":"string"},"description":"clips already on the timeline to score"})),
@@ -297,4 +317,9 @@ pub fn commands() -> Vec<Command> { vec![
             ("target_duration", n("optional: stop the energy walk once this many seconds are covered (still snaps to the next phrase boundary after)")),
             ("start", n("timeline seconds to begin the montage at, default 0"))], &["clip_ids", "music_asset_id"]),
         run: beat_sync_montage },
+    Command { name: "montage_color_match", description: "Shot-to-shot colour consistency for a montage: pulls every clip toward one anchor's look. The anchor is the first clip_id given, or your own reference_clip_ids; every other listed clip is pulled toward it with the existing match_shot_look (already used for broll-vs-talking-head, reused verbatim, not re-implemented) -- the one-call way to tie a whole montage of travel/sports/pet clips shot in different light to one consistent look, instead of hand-picking reference/target pairs yourself clip by clip.", mutates: true,
+        schema: obj(vec![("clip_ids", json!({"type":"array","items":{"type":"string"},"description":"montage clips to bring to one consistent look; the first one is the anchor unless reference_clip_ids is given"})),
+            ("reference_clip_ids", json!({"type":"array","items":{"type":"string"},"description":"optional: one or more of clip_ids (or other clips) whose averaged look is the anchor, instead of defaulting to clip_ids[0]"})),
+            ("strength", n("0..1, default 0.6 -- same tasteful-nudge default as match_shot_look itself"))], &["clip_ids"]),
+        run: montage_color_match },
 ] }
