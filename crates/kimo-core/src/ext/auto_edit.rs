@@ -69,6 +69,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let hook_text = a.get("hook_text").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
     let hook_style = a.get("hook_style").and_then(|v| v.as_str()).unwrap_or("hook_box").to_string();
     let caption_style = a.get("caption_style").and_then(|v| v.as_str()).unwrap_or("pop").to_string();
+    let caption_position = a.get("caption_position").and_then(|v| v.as_str()).unwrap_or("auto").to_string();
     let captions_on = a.get("captions").and_then(|v| v.as_bool()).unwrap_or(true);
     let target_lufs = opt_num(a, "target_lufs", -14.0);
     let level_dynamics = a.get("level_dynamics").and_then(|v| v.as_bool());
@@ -234,7 +235,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // 4. Captions: word-synced, from the transcript taken in step 1b (same words b-roll relevance used --
     // one recognizer pass for the whole edit, not two).
     if captions_on {
-        let mut cap_args = json!({"style": caption_style, "position": "bottom"});
+        let mut cap_args = json!({"style": caption_style, "position": caption_position});
         if !transcript_words.is_empty() { cap_args["words"] = json!(transcript_words); }
         else { cap_args["clip_ids"] = json!(dialogue_clips.iter().map(|(id, _, _)| id).collect::<Vec<_>>()); }
         let cap = call(ss, "auto_captions", &cap_args)?;
@@ -482,6 +483,7 @@ pub fn commands() -> Vec<Command> {
                 ("hook_text", s("optional: a cold-open hook line for the first few seconds; omit to skip the hook honestly rather than invent one")),
                 ("hook_style", s("add_title style for the hook, default hook_box")),
                 ("caption_style", s("auto_captions style: pop (default)|karaoke|clean|boxed|impact")),
+                ("caption_position", s("auto_captions position: auto (default, avoids the face when a safe band can be found)|bottom|middle|top")),
                 ("captions", json!({"type": "boolean", "description": "default true"})),
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),

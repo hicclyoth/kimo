@@ -418,3 +418,36 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     assert!(r["ok"] == json!(true), "{r}");
     assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("punch-ins skipped")), "a 6s take under a 30s ceiling should be left as one clip (pre-existing not-enough-clips warning): {r}");
 }
+
+
+/// V8.2V job 3: auto_edit's captions now default to position "auto" (auto_captions' own default), which
+/// steers around a face/skin band reaching into the normal caption strip -- auto_edit used to hardcode
+/// "bottom" unconditionally, so a low, close-up face could sit right under the captions. Proven with a
+/// synthetic "selfie" shot: a skin-toned fill in the lower half of the frame should push captions to the
+/// top band by default, and an explicit caption_position still overrides it when asked.
+#[test] fn job3_caption_position_defaults_to_auto_and_avoids_a_low_face() {
+    let p = dir().join("job3_lowface_th.mp4");
+    if !p.exists() {
+        let a = "aevalsrc='(between(t,0,3))*0.6*(0.25*sin(2*PI*140*t)+0.15*sin(2*PI*280*t+1)+0.1*sin(2*PI*420*t+2))*(0.55+0.45*sin(2*PI*4.3*t))':s=48000:d=3";
+        let st = Command::new("ffmpeg").args(["-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=0x222222:s=640x360:d=3",
+            "-f", "lavfi", "-i", a,
+            "-filter_complex", "[0:v]drawbox=x=0:y=216:w=640:h=144:color=0xC68863:t=fill[v]",
+            "-map", "[v]", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", p.to_str().unwrap()])
+            .stdin(Stdio::null()).status().expect("ffmpeg");
+        assert!(st.success());
+    }
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": p.to_str().unwrap()})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "grade": false, "punch_ins": false, "push_in": false, "end_screen": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let pos = r["stages"]["captions"]["position"].as_str().unwrap_or("").to_string();
+    assert_eq!(pos, "top", "a low skin/face band should push captions to the top band by default (auto_edit's own hardcoded \"bottom\" used to prevent this): {r}");
+
+    let mut ss2 = proj();
+    let a2 = sid(&call(&mut ss2, "import_media", json!({"path": p.to_str().unwrap()})), "asset_id");
+    let r2 = call(&mut ss2, "auto_edit", json!({"talking_head_asset_ids": [a2], "grade": false, "punch_ins": false, "push_in": false, "end_screen": false, "caption_position": "bottom"}));
+    assert!(r2["ok"] == json!(true), "{r2}");
+    assert_eq!(r2["stages"]["captions"]["position"].as_str().unwrap_or(""), "bottom", "an explicit caption_position should still be honoured over the face check: {r2}");
+}
