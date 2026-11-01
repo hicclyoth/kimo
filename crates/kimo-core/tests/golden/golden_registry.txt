@@ -75,7 +75,7 @@ auto_captions eb2ea2f83777efbd
 auto_chapters fff8eaf584738d1c
 auto_color 86d35765cf0dcf74
 auto_duck 782881168d8430d5
-auto_edit e1b7838fbe4be371
+auto_edit 1b232f5bc427569c
 auto_grade 64db55ba3dd926ff
 auto_reframe 62c25d0e6fc84dd1
 auto_rough_cut 0dc325c5f230d88f

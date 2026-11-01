@@ -1,5 +1,68 @@
 # Changelog
 
+## v8.2.0 (2026-11-01)
+
+V8.2-V visual finish quality pass: "if I put some clips into it, be it of anything, I get top YouTube
+editor quality work" -- scoped to how the finished video LOOKS (no voice/audio work this pass, per
+steer). Every item wires an existing, already-tested engine tool into `auto_edit`'s own defaults; no
+new tools (522, unchanged).
+
+- **Slow Ken Burns push-in on static b-roll cutaways**, new `push_in` auto_edit stage (default on).
+  Wires `add_smart_punch` (saliency-driven continuous push-in, already registered and tested, never
+  called from `auto_edit`) onto every static b-roll clip (no pre-existing scale/x/y animation) at
+  least 1.2s long. New options `push_in` (bool, default true) and `push_in_zoom` (default 1.05 = 5%,
+  clamped 1.01..1.3, inside the asked 3-6% range).
+  - TDD: `push_in_animates_static_broll_by_default` (a real keyframed ramp, 2.5-7% over the shot, plus
+    the off switch) and `push_in_skips_very_short_broll` (<1.2s left alone).
+  - Verified on the real benchmark footage: `real_v41.mp4` vs the prior render at the identical 6.5s
+    timestamp in the coffee-cup b-roll shows the push-in clearly by eye (background crossbars shifted,
+    cups larger); the engine's own returned keyframes confirm it numerically (scale 1.0 -> 1.025 ->
+    1.05). Audio completely unchanged: -13.996 LUFS, 90.0%/91.67% recall, identical to the prior render.
+- **Punch-ins now force a split on any dialogue stretch that would sit static past `punch_max_static`
+  seconds** (new option, default 4.5, clamped 1.5..20). Natural-pause splitting (`auto_rough_cut`,
+  `tighten_pauses`) already keeps most real takes short enough for the existing `add_punch_ins` to
+  alternate wide/tight on (the real benchmark footage's longest natural stretch was already 3.2s,
+  unaffected by this change) -- but a continuous sentence with no breath, or a single long uncut take,
+  could leave one giant clip with nothing to alternate against. New `split_points` helper finds the
+  nearest real word-pause (>=0.12s gap between two transcript words) to each `punch_max_static` mark
+  and splits there via the existing `split_clip`, falling back to a plain interval cut when no clean
+  pause is nearby.
+  - TDD: `job2_splits_a_long_uncut_dialogue_take_for_punch_ins` (a 10s single take splits into pieces
+    all <=4.5s, at least one punched) and `job2_punch_max_static_is_configurable` (set high, a short
+    take is left as one clip, matching the pre-existing behaviour and its warning).
+  - Verified on the real footage with `pacing` disabled (so natural-pause splitting couldn't paper over
+    the gap): the one long ~12.5s dialogue stretch split into 4.5/4.4/4.5/0.5s pieces, each with its own
+    wide/tight zoom; frames right at one of the new cuts show a clean, real jump-cut by eye.
+- **Captions default to `auto` placement** (new `caption_position` option, default `"auto"`, was a
+  hardcoded `"bottom"`). `auto_captions` already had a real face-aware `auto` mode (samples the source
+  footage for a skin-toned band, moves the caption strip to the top when a face/body reaches into the
+  normal bottom band) that `auto_edit` simply never used.
+  - TDD: `job3_caption_position_defaults_to_auto_and_avoids_a_low_face` (a synthetic low-face shot gets
+    its captions pushed to the top band by default; an explicit `caption_position` still overrides it).
+  - On the real benchmark footage the speaker's face sits clear of the bottom band already, so `auto`
+    resolves to `"bottom"` exactly as before -- verified audio-identical to the prior render and looked
+    at captions at 3 timestamps: clean, readable, inside safe margins, never over the face. (The
+    word-by-word pop itself -- active word coloured + scaled up to 1.22x, synced to exact word timing --
+    already existed in the caption styles `auto_edit` uses; placement was the one real gap.)
+- **A short whip/zoom-blur transition into each b-roll cutaway**, new `broll_transitions` stage
+  (default on; new `broll_transition_duration`, default 0.25s, clamped 0.1..0.6). Wires the existing
+  `add_transition` tool's `zoom_blur`/`whip_left` kinds (already in the engine, never called from
+  `auto_edit`) onto each b-roll clip's own `transition_in`, alternating kinds across multiple cutaways.
+  Scoped strictly to the b-roll boundary -- never applied to the talking-head's own jump-cut punch-ins,
+  which stay hard cuts on purpose.
+  - TDD: `job4_broll_gets_a_short_whip_transition_by_default` (a b-roll clip gets a short
+    zoom_blur/whip_left `transition_in` by default; the off switch leaves it with none).
+  - Verified by eye mid-transition on the real footage: a clean, tasteful blur-blend, not jarring;
+    audio unaffected.
+- Not attempted this pass: any voice/audio work (explicitly steered off partway through: "Work on more
+  features except voice now").
+
+Tests: full workspace suite green apart from the pre-existing exempt failures named in this pass's own
+brief (`director_small`'s text-crowding test and its CPU-timing lint_edit perf test; `readme_count`,
+the `robust_est` doctest, the `search_tools` `fit_clip_duration` tie, one `xform_lint` read -- none
+touched this pass). Goldens unchanged (no new tools, no default changed in a way that moves rendered
+pixels on an existing golden's own call shape). Warnings: 34 (cap 35, unchanged from v8.1.0).
+
 ## v8.1.0 (2026-11-01)
 
 V8.1-Q quality pass: fixing the real cause behind two V8.0-Q compromises, instead of

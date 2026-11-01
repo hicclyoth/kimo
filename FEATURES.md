@@ -1,5 +1,15 @@
 # kimo features
 
+New in v8.2.0: visual finish quality -- a slow Ken Burns push-in on static b-roll cutaways
+(`add_smart_punch`, already in the registry, now wired into `auto_edit` as `push_in`, default on,
+zoom 5%); the talking-head jump-cut punch-ins now force a split on any uncovered stretch that would
+otherwise sit static past `punch_max_static` seconds (default 4.5), so a continuous take with no
+natural pause still alternates wide/tight; captions default to `auto` placement (`caption_position`),
+which steers around a low face/skin band instead of `auto_edit`'s old hardcoded bottom; a short
+whip/zoom-blur transition into each b-roll cutaway (`broll_transitions`, default on), never on the
+talking-head's own jump-cuts. No voice/audio work this pass (steered off). No new tools -- every piece
+wires an existing, already-tested engine tool into `auto_edit`'s defaults. Tools: 522 (unchanged).
+
 New in v8.1.0: `level_dynamics` (the master-bus speech leveler) scoped to the dialogue span instead of
 the whole mix, so an end card or music-only tail can no longer be reached by it; the benchmark's
 whisper-recall gate now scores dialogue-span recall separately from a whole-file number (the real
@@ -18,6 +28,50 @@ New in v7.9.0: a real-footage voice-dynamics pass (honest, partial -- see below)
 option on `place_broll`'s b-roll cut-ins and `auto_edit`'s hook title, synthesized at call time like the
 existing pop SFX -- built, TDD'd, and left OFF by default after it measurably cost whisper word recall on
 real footage even ducked low. Tools: 521 -> 523.
+
+## v8.2-V: visual finish quality -- push-in, forced punch-in splits, face-aware captions, b-roll whip transitions
+
+Scope per the brief: finished-video LOOK only, no audio/voice work. Every item below wires an
+existing, already-tested engine tool into `auto_edit`'s own defaults -- nothing here duplicates
+another tool's logic, matching this file's own `auto_edit` design note.
+
+- [x] **Slow Ken Burns push-in on static b-roll (`push_in`, default on).** `add_smart_punch`
+  (saliency-driven continuous push-in, already in the registry, never previously called from
+  `auto_edit`) now runs on every static b-roll cutaway (no pre-existing scale/x/y animation) at least
+  1.2s long, `push_in_zoom` default 1.05 (5%, inside the 3-6% ask), focus following the engine's own
+  spectral-residual saliency so the eye stays put while the shot pushes in. Scoped to b-roll only: the
+  talking head gets its own cut-zoom treatment (next item), so the two never compete. Verified on the
+  real benchmark footage: `real_v41.mp4` vs the prior render at the identical timestamp shows the
+  push-in clearly by eye, and audio stayed bit-for-bit unchanged (-13.996 LUFS, 90.0%/91.67% recall).
+- [x] **Punch-ins now force a split on a long uncut take (`punch_max_static`, default 4.5s).**
+  Natural-pause splitting (`auto_rough_cut`, `tighten_pauses`) already breaks most real takes short
+  enough for the existing `add_punch_ins` to alternate wide/tight on (checked: this benchmark's
+  longest natural stretch was already 3.2s) -- but a continuous sentence with no breath, or a single
+  long uncut take, could leave one giant clip with nothing to alternate against. A new step splits any
+  uncovered dialogue stretch longer than `punch_max_static` at the nearest real word-pause to each
+  ~4.5s mark (falls back to a plain interval cut when no clean pause is nearby). Verified on the real
+  footage with `pacing` disabled (so the usual natural-pause splitting couldn't paper over the gap):
+  the one long ~12.5s stretch broke into 4.5/4.4/4.5/0.5s pieces, each getting its own wide/tight zoom,
+  confirmed by eye at one of the new cuts. The standard (pacing-on) real-benchmark render is unaffected
+  byte-for-byte.
+- [x] **Captions default to `auto` placement (`caption_position`, default `auto`), avoiding a low
+  face.** `auto_captions` already has a real face-aware `auto` mode (samples the source footage for a
+  skin-toned band and moves the caption strip to the top when a face/body reaches into the normal
+  bottom band) -- `auto_edit` hardcoded `"bottom"` unconditionally regardless of framing. Switched the
+  default and exposed `caption_position` so a caller can still force bottom/middle/top. Proved with a
+  synthetic low-face ("selfie") shot: captions correctly jump to the top band by default; an explicit
+  override still works. On the real benchmark footage the speaker's face sits clear of the bottom band
+  already, so `auto` resolves to `bottom` exactly as before -- audio and visuals unaffected. The
+  word-by-word caption pop itself (active word coloured + scaled up to 1.22x, synced to exact word
+  timing) already existed in the styles `auto_edit` uses; this was the one real placement gap.
+- [x] **A short whip/zoom-blur transition into each b-roll cutaway (`broll_transitions`, default
+  on).** `add_transition`'s `zoom_blur`/`whip_left` kinds already existed in the engine and were never
+  called from `auto_edit`. Applied only at the b-roll boundary (alternating the two kinds across
+  multiple cutaways for variety), never on the talking-head's own jump-cut punch-ins, which stay hard
+  cuts on purpose. `broll_transition_duration` default 0.25s. Verified by eye mid-transition on the
+  real footage: a clean, tasteful blur-blend, not jarring; audio unaffected.
+- Not attempted this pass: any voice/audio work (explicitly steered off -- "Work on more features
+  except voice now").
 
 ## v8.1-Q: level_dynamics scoped to dialogue, the real cause of the recall "collapse" found and fixed, end-card swell raised to spec
 
