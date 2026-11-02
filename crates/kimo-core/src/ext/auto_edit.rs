@@ -19,6 +19,15 @@ use crate::model::Source;
 /// speech re-detection, which this duration is compared against) treats as "the same" instant.
 fn r3(v: f64) -> f64 { (v * 1000.0).round() / 1000.0 }
 
+/// V8.5.5 end-card background tuning: freeze an earlier, calmer source frame instead of the literal last
+/// one; blur it gently rather than into mush; scale it up a touch so the blur's edge falloff never shows;
+/// darken it slightly so the white pill/text/dot pop against it. See the end_screen stage below.
+const END_CARD_BG_FREEZE_BACK_S: f64 = 0.5;
+const END_CARD_BG_BLUR_RADIUS: f64 = 9.0;
+const END_CARD_BG_SCALE: f64 = 1.08;
+const END_CARD_BG_DARKEN_STOPS: f64 = -0.2; // 2^-0.2 ≈ 0.87x brightness, about -13%
+
+
 fn atomic(ss: &mut Session, a: &Value, f: fn(&mut Session, &Value) -> Result<Value, String>) -> Result<Value, String> {
     let before = ss.project.clone();
     match f(ss, a) { Ok(v) => Ok(v), Err(e) => { ss.project = before; Err(e) } }
@@ -397,12 +406,24 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
             .and_then(|c| if let Source::Media { asset } = &c.source { Some((asset.clone(), c.in_point, c.duration)) } else { None }) {
             let bg_tt = new_track(ss)?;
             let proj_fps = if ss.project.fps > 0.0 { ss.project.fps } else { 30.0 };
-            let last_source_t = (last_in + last_dur - 1.0 / proj_fps).max(last_in);
+            // V8.5.5: the literal last frame of a talking-head take is usually mid-gesture, mouth open --
+            // the worst possible frame to freeze and blur for a background. Stepping back about half a
+            // second lands on a calmer moment far more often, cheaply (no pose/motion data to pick a true
+            // rest frame exists in this codebase yet), clamped so a clip shorter than that just uses its
+            // own first available frame instead of going negative into the previous clip.
+            let last_source_t = (last_in + last_dur - 1.0 / proj_fps - END_CARD_BG_FREEZE_BACK_S).max(last_in);
             let bg = call(ss, "add_clip", &json!({"track_id": bg_tt, "source_type": "media", "asset_id": last_asset, "start": edit_duration, "duration": end_screen_duration, "in_point": last_source_t, "fit": "cover"}))?;
             if let Some(bg_cid) = bg["clip_id"].as_str() {
                 call(ss, "freeze_frame", &json!({"clip_id": bg_cid, "at": edit_duration}))?;
                 call(ss, "set_audio", &json!({"clip_id": bg_cid, "mute": true}))?;
-                call(ss, "add_effect", &json!({"clip_id": bg_cid, "kind": "blur", "params": {"radius": 18.0}}))?;
+                // Scaled up before the blur so the blur's own edge falloff (which softens toward
+                // transparent/black past the clip's own bounds) never shows as a visible seam at the
+                // canvas edge once "cover" framing has already filled the frame.
+                call(ss, "set_property", &json!({"clip_id": bg_cid, "property": "scale", "value": END_CARD_BG_SCALE}))?;
+                call(ss, "add_effect", &json!({"clip_id": bg_cid, "kind": "blur", "params": {"radius": END_CARD_BG_BLUR_RADIUS}}))?;
+                // A touch darker so the white pill/text/dot pop a little more against whatever was on
+                // screen, without going so dark the background reads as flat black.
+                call(ss, "add_effect", &json!({"clip_id": bg_cid, "kind": "exposure", "params": {"stops": END_CARD_BG_DARKEN_STOPS}}))?;
                 // a dark scrim over the blurred freeze so white pill/text/dot stay legible against whatever
                 // was on screen (a bright shirt, a window) rather than fighting it for contrast.
                 let scrim = call(ss, "add_shape", &json!({"track_id": bg_tt, "shape": "rect", "start": edit_duration, "duration": end_screen_duration, "width": ss.project.width as f64 * 1.2, "height": ss.project.height as f64 * 1.2, "fill": [0.0, 0.0, 0.0]}))?;

@@ -1,3 +1,56 @@
+## v8.5.5 (2026-11-02)
+
+A fresh review of the 8.5.4 montage (same 3-look real-footage cut, re-rendered with the 8.5.4 fixes in)
+found three more things that still read as amateur. Fixed below, each with a failing-first test.
+
+- **The end-card background froze on the literal last frame of the talking-head take -- usually mid-
+  gesture, mouth open -- then blurred it hard enough (radius 18) to go unreadable mush.** The freeze now
+  grabs a frame about half a second earlier (`last_source_t - 0.5s`, clamped to the clip's own start), the
+  blur is down to radius 9, the background clip is scaled up 1.08x so the gentler blur's own edge falloff
+  never shows a seam at the canvas edge, and it is darkened a touch (-0.2 stops, about -13%) so the white
+  pill/text/dot pop a little more against it.
+- **`chrome_bloom` snapped from a warm baseline to a near-total cool inversion in well under a fifth of a
+  second -- it read as a white-balance glitch, not a grade.** Its `color_wheels` push is pulled back to
+  about half (`gain_b` ~1.25-1.3, `gain_r` floor ~0.82-0.85 at full intensity, lift halved to match), and
+  a new per-look `min_fade` floor lengthens its own top-level mix fade-in to about 0.4-0.5s on a short
+  clip (never shortening an already-slower fade on a longer one) so the push lands as a ramp instead of a
+  snap. Still reads clearly cooler and shinier than the baseline, with 0% clipping.
+- **The 8.5.4 dot fix put `subscribe_pop`'s badge dot OUTSIDE the pill, so it read as floating loose,
+  disconnected from the badge.** `dot_x_for_pill`'s formula now places the dot INSIDE the pill, 14px
+  (scaled) clear of its own left edge, and both the initial `subscribe_pop` build (`titles.rs`) and the
+  `text_too_small` lint resize-fix (`director_tools.rs`) now grow the pill by the dot's own footprint (a
+  new `dot_room` helper) so the two never drift apart and the dot never has to compete with the text for
+  room. The dot's left-edge padding comes out constant (14px scaled) regardless of pill width, by
+  construction.
+- **Follow-up (same day): moving the dot inside the pill only fixed the overlap, not the cramped read --
+  on `real_v57.mp4` at 20.5s the dot sat about 3px from the "S" of SUBSCRIBE, jammed up against the text
+  rather than clear of it.** `dot_room`'s formula is widened so the dot-to-text gap lands at ~0.9x the
+  dot's own diameter (the dot's 14px left-edge clearance from the pill is unchanged): because the text
+  clip is never given its own x and stays centred on the pill, widening the pill only delivers HALF of
+  that width as real gap (the other half opens equally on the pill's right side), so `dot_room` solves for
+  twice the room actually wanted -- the derivation is spelled out on `dot_room`'s own doc comment. Applied
+  identically on both the `subscribe_pop` build path and the `text_too_small` lint resize-fix path (both
+  already shared `dot_room`/`dot_x_for_pill`, so this is a formula-only change, no call-site drift
+  possible). `director_small`'s dot test now asserts the gap is >= 0.7x the dot's diameter, before AND
+  after the resize fix (measured ~0.93x and ~2.6x respectively on the real inputs).
+
+**The pinned real-footage benchmark md5 changes again**, from `36c25e57765e76a311a54bfe14ec8f10`
+(real_v56) to `db90ea441ab927521e0168da8a9899da` (real_v58, superseding the intermediate real_v57). Cause:
+the end-card background fix above (earlier freeze frame, lower blur radius, scale, darken) changes the end
+card's own pixels, as intended -- `auto_edit` does not use `chrome_bloom` anywhere in this benchmark
+(grepped, confirmed), so that fix is not a factor here. The dot-spacing follow-up above also lands inside
+the same end-card frames (it only moves the dot and widens the pill, both already part of that region's
+diff), so real_v58's own `framemd5` diff lands in the identical range as real_v57's did against real_v56:
+frames 0-560 bit-identical against real_v57 (and audio identical throughout), frames 561-655 (the end
+card, ~18.70s to the finish) differing as expected. Against the earlier real_v56 pin, frames 0-544 are
+bit-identical and frames 566-655 (the end card) differ as expected (mean pixel delta ~13.5/255); frames
+545-565 (21 frames, ~0.7s, inside x264's default 40-frame lookahead) also carry a tiny diff -- mean
+<1/255, max 74/255, invisible -- traced to the encoder's own mb-tree/lookahead reacting to the now-softer
+end-card transition rather than to any change in the dialogue content itself: those same frames are
+bit-identical up to 544, and the same kind of comparison between the two prior end-card-only builds
+(real_v53 vs real_v55, which did not touch the transition's softness) showed a perfectly clean cut with
+zero bleed at exactly the frame boundary.
+
 ## v8.5.4 (2026-11-02)
 
 A real-footage review montage (3 looks, boxed captions, driven end to end through the MCP tools an AI

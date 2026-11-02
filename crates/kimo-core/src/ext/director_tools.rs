@@ -1027,10 +1027,15 @@ fn lint_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
             let want_dot_role = format!("dot_for:{}", c.id);
             let dot = ss.project.tracks.iter().flat_map(|t| t.clips.iter()).find(|o| o.role.as_deref() == Some(want_dot_role.as_str()));
             let then = pill.map(|p| {
-                let new_pill_w = crate::titles::pill_width_for_text(text, font, new_size, w, k);
+                // 8.5.5: the pill's resized width must carry the SAME dot_room growth the initial
+                // subscribe_pop build adds (titles.rs), or a pill resized by this fix ends up narrower than
+                // the one the dot was actually laid out for -- pushing the dot (now positioned INSIDE the
+                // pill per dot_x_for_pill) back out past the pill's own edge, or into the text.
+                let dot_w_opt = dot.and_then(|d| if let Source::Shape { width, .. } = &d.source { Some(*width) } else { None });
+                let new_pill_w = crate::titles::pill_width_for_text(text, font, new_size, w, k) + dot_w_opt.map(|dw| crate::titles::dot_room(dw, k)).unwrap_or(0.0);
                 let mut pill_fix = json!({"tool": "set_shape_size", "args": {"clip_id": p.id, "width": r3(new_pill_w)}});
-                if let Some(d) = dot { if let Source::Shape { width: dot_w, .. } = &d.source {
-                    let new_dot_x = crate::titles::dot_x_for_pill(new_pill_w, *dot_w, k);
+                if let Some(d) = dot { if let Some(dot_w) = dot_w_opt {
+                    let new_dot_x = crate::titles::dot_x_for_pill(new_pill_w, dot_w, k);
                     pill_fix["then"] = json!({"tool": "set_property", "args": {"clip_id": d.id, "property": "x", "value": r3(new_dot_x)}});
                 } }
                 pill_fix

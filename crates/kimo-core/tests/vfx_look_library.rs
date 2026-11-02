@@ -85,8 +85,21 @@ fn chrome_bloom_cool_push_reads_clearly_on_warm_real_footage_without_clipping() 
     // "cool" means blue rises and red falls relative to the source -- the net red->blue swing is the
     // one-number proxy for "reads as a deliberate cool/chrome grade" rather than "a nice grade".
     let cool_swing = (out_rgb[2] - src_rgb[2]) - (out_rgb[0] - src_rgb[0]);
-    assert!(cool_swing > 0.20, "chrome_bloom@0.45 on warm footage should swing clearly blue-over-red, got {cool_swing:.4} (src {src_rgb:?} -> out {out_rgb:?}) -- temperature's internal 0.2x scale is the known trap (see frost_veil's own 8.5.2 fix)");
+    assert!(cool_swing > 0.15, "chrome_bloom@0.45 on warm footage should swing clearly blue-over-red, got {cool_swing:.4} (src {src_rgb:?} -> out {out_rgb:?}) -- temperature's internal 0.2x scale is the known trap (see frost_veil's own 8.5.2 fix)");
     assert!(clipped_pct < 25.0, "chrome_bloom@0.45 should not wash out highlights: {clipped_pct:.1}% of the frame clipped");
+
+    // V8.5.5: the montage review's #2 finding -- the OLD push swung an R-B delta of about +123 (0..255
+    // scale) vs the source at full intensity, reading as a near-total warm->cool inversion (a white-balance
+    // glitch) rather than a grade. This ceilings the swing at full intensity so chrome_bloom stays "clearly
+    // cooler and shinier" without crossing into that inversion read; 80 sits comfortably above the new
+    // push's own ~66 and well under the old push's ~123, so a regression back toward the old strength trips
+    // it.
+    let g_full = vfx_look_library::graph_for("chrome_bloom", 1.0).unwrap();
+    let out_full = run_graph(&g_full.to_string(), &src, None, 0.5, 1).unwrap();
+    let (out_full_rgb, clipped_full_pct) = mean_rgb_and_clipped_pct(&out_full);
+    let full_swing_255 = ((out_full_rgb[2] - src_rgb[2]) - (out_full_rgb[0] - src_rgb[0])) * 255.0;
+    assert!(full_swing_255 <= 80.0, "chrome_bloom@1.0's red->blue swing vs source should stay well short of a full color inversion (ceiling ~80 on a 0..255 scale); got {full_swing_255:.1}");
+    assert!(clipped_full_pct < 25.0, "chrome_bloom@1.0 should not wash out highlights: {clipped_full_pct:.1}% of the frame clipped");
 }
 
 #[test]
@@ -155,4 +168,38 @@ fn apply_vfx_preset_rejects_an_unknown_preset_with_the_full_list() {
     let cid = make_clip(&mut ss);
     let err = dispatch(&mut ss, "apply_vfx_preset", &json!({"clip_id": cid, "preset": "nope"})).unwrap_err();
     assert!(err.contains("dreamy") && err.contains("ember_drift"), "{err}");
+}
+
+
+/// V8.5.5: the montage review's #2 finding, part two. chrome_bloom's own color_wheels push (see
+/// vfx_look_library.rs) was pulled back, but on a short real cutaway the generic top-level mix fade (15%
+/// of the clip-local window -- here 1.83s, the montage's own chrome beat clip, giving ~0.27s) still landed
+/// close to the "about 0.18s" snap the review flagged. chrome_bloom's own min_fade floor lengthens this to
+/// about 0.4-0.5s on a clip this short, without shortening an already-longer fade on a longer clip.
+#[test]
+fn chrome_bloom_mix_fade_in_is_lengthened_on_a_short_clip_but_not_shortened_on_a_long_one() {
+    let mut ss = Session::new();
+    dispatch(&mut ss, "project_set", &json!({"width": 32, "height": 32, "fps": 30.0})).unwrap();
+    let tr = dispatch(&mut ss, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
+    let cid = dispatch(&mut ss, "add_shape", &json!({"track_id": tr, "shape": "rect", "width": 32, "height": 32, "color": [0.4, 0.3, 0.5], "start": 0, "duration": 1.83})).unwrap()["clip_id"].as_str().unwrap().to_string();
+    dispatch(&mut ss, "apply_vfx_preset", &json!({"clip_id": cid, "preset": "chrome_bloom", "intensity": 0.45})).unwrap();
+    let c = ss.project.find_clip(&cid).unwrap();
+    let e = c.effects.iter().find(|e| e.kind == "vfx_graph").unwrap();
+    let mix = e.params.get("mix").unwrap_or_else(|| panic!("no mix param: {e:?}"));
+    assert_eq!(mix.keys.len(), 4, "{:?}", mix.keys);
+    let fade = mix.keys[1].t - mix.keys[0].t;
+    let generic_default = 1.83 * 0.15;
+    assert!(fade >= 0.4 && fade <= 0.5, "chrome_bloom's mix fade-in should be lengthened to about 0.4-0.5s on a clip this short (generic default would be {generic_default:.3}s), got {fade}s");
+
+    // a long clip's already-slower default fade must not be shortened by the floor.
+    let mut ss2 = Session::new();
+    dispatch(&mut ss2, "project_set", &json!({"width": 32, "height": 32, "fps": 30.0})).unwrap();
+    let tr2 = dispatch(&mut ss2, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
+    let cid2 = dispatch(&mut ss2, "add_shape", &json!({"track_id": tr2, "shape": "rect", "width": 32, "height": 32, "color": [0.4, 0.3, 0.5], "start": 0, "duration": 10.0})).unwrap()["clip_id"].as_str().unwrap().to_string();
+    dispatch(&mut ss2, "apply_vfx_preset", &json!({"clip_id": cid2, "preset": "chrome_bloom", "intensity": 0.45})).unwrap();
+    let c2 = ss2.project.find_clip(&cid2).unwrap();
+    let e2 = c2.effects.iter().find(|e| e.kind == "vfx_graph").unwrap();
+    let mix2 = e2.params.get("mix").unwrap();
+    let fade2 = mix2.keys[1].t - mix2.keys[0].t;
+    assert!((fade2 - 1.5).abs() < 0.01, "a 10s clip's default 15%-of-window fade (1.5s) should not be shortened by chrome_bloom's 0.45s floor, got {fade2}s");
 }

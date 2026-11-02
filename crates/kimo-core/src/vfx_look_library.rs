@@ -117,6 +117,16 @@ pub fn pulse_period(name: &str) -> Option<f64> {
     match name { "glitch_surge" => Some(0.6), _ => None }
 }
 
+/// V8.5.5: a floor on the top-level mix ramp's fade-in/out for a look whose own push is strong enough that
+/// apply_vfx_preset's generic default (15% of the clip-local window) lands it on screen too fast to read as
+/// a graded look rather than a hard cut -- chrome_bloom's own color_wheels push snapped a warm beat to cool
+/// in well under a fifth of a second on a short real cutaway (the montage review's #2 finding). None for
+/// looks where the generic default already reads fine. Applied as a floor, not a fixed value, so a longer
+/// clip's already-longer 15%-of-window fade is left alone.
+pub fn min_fade(name: &str) -> Option<f64> {
+    match name { "chrome_bloom" => Some(0.45), _ => None }
+}
+
 pub const NAMES: [&str; 9] = ["ember_drift", "chrome_bloom", "glitch_surge", "dream_haze", "frost_veil", "magic_sparkle", "vhs_decay", "aurora_wash", "solar_flare"];
 
 pub fn describe(name: &str) -> Option<&'static str> {
@@ -168,12 +178,19 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // Replaced with `color_wheels` (lift/gain pushed blue over highlights and shadows both), the same fix
         // frost_veil used: far stronger and controllable, with no flat internal scale-down. Chromatic aberration,
         // sharpen and bloom are left exactly as they were (the moire/washout ceilings already tuned for those).
+        // V8.5.5: the montage review's #2 finding -- this push was itself about twice what the beat needed,
+        // reading as a near-total warm->cool inversion (an R-B swing of roughly +10 to -44 in about 0.18s on
+        // real footage) rather than a graded look -- a white-balance-glitch read. Pulled back to about half
+        // (gain_b ~1.25-1.3, gain_r floor ~0.82-0.85 at full intensity, lift halved to match) and the outer
+        // mix fade-in lengthened below (see apply_vfx_preset in surreal_vfx_tools.rs) so the push lands over
+        // ~0.4-0.5s instead of ~0.18s. Still reads clearly cooler and shinier than the baseline -- see
+        // chrome_bloom_cool_push_reads_clearly_on_warm_real_footage_without_clipping.
         "chrome_bloom" => json!({"nodes": [
             eff("split", SRC, "chromatic_aberration", json!({"amount": 1.3 + 2.8 * i})),
             eff("sharp", "split", "sharpen", json!({"amount": 0.12 + 0.18 * i})),
             eff("cool", "sharp", "color_wheels", json!({
-                "lift_r": -(0.02 + 0.03 * i), "lift_b": 0.02 + 0.03 * i,
-                "gain_r": 1.0 - (0.14 + 0.22 * i), "gain_g": 1.0 - (0.02 + 0.03 * i), "gain_b": 1.0 + (0.22 + 0.3 * i),
+                "lift_r": -(0.01 + 0.015 * i), "lift_b": 0.01 + 0.015 * i,
+                "gain_r": 1.0 - (0.07 + 0.11 * i), "gain_g": 1.0 - (0.02 + 0.03 * i), "gain_b": 1.0 + (0.11 + 0.15 * i),
             })),
             eff("desat", "cool", "saturation", json!({"amount": (1.0 - 0.22 * i).max(0.55)})),
             eff("contrast", "desat", "contrast", json!({"amount": 1.0 + 0.18 * i})),

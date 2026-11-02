@@ -477,3 +477,35 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     let c2 = ss2.project.find_clip(&broll_clip_id2).unwrap();
     assert!(c2.transition_in.is_none(), "broll_transitions:false should leave the clip with no transition: {r2}");
 }
+
+
+/// V8.5.5: the end-card background used to freeze on the literal last frame of the dialogue (often a
+/// mid-gesture, mouth-open frame) and blur it hard enough to go unreadable. This proves the freeze now
+/// grabs an earlier frame (about half a second before the clip's own end), the blur is gentler, and the
+/// clip is scaled up so a hard blur's edge falloff never shows a seam.
+#[test] fn end_screen_background_freezes_early_blurs_gently_and_scales_up() {
+    let mut ss = proj();
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("esbg2.mp4", &[(0.0, 2.0)], 0.3)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "captions": false, "grade": false, "punch_ins": false}));
+    let dur = r["duration"].as_f64().unwrap();
+    let total = r["total_duration"].as_f64().unwrap();
+    let dialogue_last = ss.project.tracks.iter().flat_map(|t| t.clips.iter())
+        .filter(|c| matches!(c.source, Source::Media { .. }) && c.start < dur - 0.01)
+        .max_by(|x, y| (x.start + x.duration).partial_cmp(&(y.start + y.duration)).unwrap())
+        .cloned().expect("expected a dialogue clip before the end card");
+    let bg = ss.project.tracks.iter().flat_map(|t| t.clips.iter())
+        .find(|c| matches!(c.source, Source::Media { .. }) && c.start >= dur - 0.05 && c.start + c.duration >= total - 0.05)
+        .expect("expected a media background clip covering the end screen").clone();
+
+    let proj_fps = 30.0;
+    let literal_last = dialogue_last.in_point + dialogue_last.duration - 1.0 / proj_fps;
+    assert!(bg.in_point < literal_last - 0.2, "end-card freeze should grab an earlier frame than the literal last one; literal last {literal_last}, got in_point {}", bg.in_point);
+    assert!(bg.in_point >= dialogue_last.in_point - 1e-6, "freeze time should not go before the clip's own start: {} < {}", bg.in_point, dialogue_last.in_point);
+
+    let blur = bg.effects.iter().find(|e| e.kind == "blur").expect("expected a blur effect on the end-card background");
+    let radius = blur.params.get("radius").map(|p| p.base).unwrap_or(0.0);
+    assert!((8.0..=10.0).contains(&radius), "blur radius should be 8..10, got {radius}");
+
+    let scale = bg.props.get("scale").map(|p| p.base).unwrap_or(1.0);
+    assert!((1.06..=1.1).contains(&scale), "background scale should be 1.06..1.1 so blur's edge falloff doesn't show, got {scale}");
+}

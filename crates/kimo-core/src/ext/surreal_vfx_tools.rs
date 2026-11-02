@@ -236,6 +236,14 @@ pub fn commands() -> Vec<Command> { vec![
                     if let Some(period) = crate::vfx_look_library::pulse_period(look) {
                         let capped = (((end - start) * 0.15).max(0.05)).min(period * 0.2);
                         vfx_args["fade"] = json!(capped);
+                    } else if let Some(min_fade) = crate::vfx_look_library::min_fade(look) {
+                        // V8.5.5: a floor, not a fixed value -- a look whose own color push is strong enough
+                        // to read as a hard cut at the generic 15%-of-window fade (chrome_bloom) gets at
+                        // least min_fade seconds to ramp in, but a longer clip's already-slower default fade
+                        // is left alone rather than shortened.
+                        let default_fade = ((end - start) * 0.15).max(0.05);
+                        let floor = min_fade.min(((end - start) / 2.0).max(0.05));
+                        vfx_args["fade"] = json!(default_fade.max(floor));
                     }
                     crate::commands::dispatch(ss, "add_vfx_graph", &vfx_args)?;
                     applied.push("vfx_graph"); }

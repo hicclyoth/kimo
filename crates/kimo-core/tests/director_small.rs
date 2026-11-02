@@ -717,38 +717,88 @@ fn gray_pixels(png: &str, w: usize, h: usize) -> Vec<u8> {
     fn shape_wh(ss: &Session, id: &str) -> (f64, f64) {
         match &ss.project.find_clip(id).unwrap().source { Source::Shape { width, height, .. } => (*width, *height), s => panic!("not a shape: {s:?}") }
     }
-    // dot's clearance past the pill's own left edge, both read at mid-clip (where lint_edit measures too)
-    fn dot_gap(ss: &Session, pill_id: &str, dot_id: &str) -> f64 {
+    // 8.5.5: the dot moved from OUTSIDE the pill (8.5.4, a "small bell badge" that on a real render read as
+    // the dot floating loose, disconnected from the badge) to INSIDE it, left-aligned with padding. This
+    // reads the dot's clearance PAST THE PILL'S LEFT EDGE (i.e. how far inside the pill its own left edge
+    // sits) at mid-clip, where lint_edit measures too. Positive means inside; the old "outside" bug would
+    // show as negative here.
+    fn dot_left_pad(ss: &Session, pill_id: &str, dot_id: &str) -> f64 {
         let pill = ss.project.find_clip(pill_id).unwrap(); let dot = ss.project.find_clip(dot_id).unwrap();
         let (pill_w, _) = shape_wh(ss, pill_id); let (dot_w, _) = shape_wh(ss, dot_id);
         let pill_x = kimo_core::render::resolve_xform(&ss.project, pill, pill.duration / 2.0).x;
         let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
-        (pill_x - pill_w / 2.0) - (dot_x + dot_w / 2.0) // pill's left edge minus the dot's right edge
+        (dot_x - dot_w / 2.0) - (pill_x - pill_w / 2.0) // dot's left edge minus the pill's left edge
+    }
+    // the dot's right edge must never cross the pill's own right edge either (it should sit well inside,
+    // near the left, but this is a real sanity check, not a tautology, once the dot is positioned relative
+    // to a pill whose width keeps changing).
+    fn dot_right_clearance(ss: &Session, pill_id: &str, dot_id: &str) -> f64 {
+        let pill = ss.project.find_clip(pill_id).unwrap(); let dot = ss.project.find_clip(dot_id).unwrap();
+        let (pill_w, _) = shape_wh(ss, pill_id); let (dot_w, _) = shape_wh(ss, dot_id);
+        let pill_x = kimo_core::render::resolve_xform(&ss.project, pill, pill.duration / 2.0).x;
+        let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
+        (pill_x + pill_w / 2.0) - (dot_x + dot_w / 2.0) // pill's right edge minus the dot's right edge
     }
 
-    let gap_before = dot_gap(&ss, &pill_id, &dot_id);
-    assert!(gap_before > 0.0, "the dot must start clear of the pill, outside its left edge: gap {gap_before}px");
+    let pad_before = dot_left_pad(&ss, &pill_id, &dot_id);
+    assert!(pad_before > 0.0, "the dot must sit INSIDE the pill, past its left edge, not floating outside it: left_pad {pad_before}px");
+    assert!(dot_right_clearance(&ss, &pill_id, &dot_id) > 0.0, "the dot must not poke out the pill's right edge either");
 
     let fixes = call(&mut ss, "apply_review_fixes", json!({"codes": ["text_too_small"]}));
     assert_eq!(fixes["failed"], json!([]), "{fixes}");
     assert!(ss.project.find_clip(&dot_id).is_some(), "the dot clip must survive the fix chain");
 
-    let gap_after = dot_gap(&ss, &pill_id, &dot_id);
-    assert!((gap_after - gap_before).abs() < 0.5,
-        "the dot's clearance past the pill's edge must carry forward unchanged by the resize: was {gap_before}px, now {gap_after}px");
+    let pad_after = dot_left_pad(&ss, &pill_id, &dot_id);
+    assert!(pad_after > 0.0, "the dot must still sit inside the pill after the resize: left_pad {pad_after}px");
+    assert!((pad_after - pad_before).abs() < 0.5,
+        "the dot's padding past the pill's left edge must carry forward unchanged by the resize (the formula makes it a constant, independent of pill width): was {pad_before}px, now {pad_after}px");
+    assert!(dot_right_clearance(&ss, &pill_id, &dot_id) > 0.0, "the dot must still not poke out the pill's right edge after the resize");
 
-    // the thing Tab actually saw on the render: the dot's own bbox must not intersect the (now bigger) text's bbox
+    // the thing Tab actually saw on the render: the dot's own bbox must not intersect the (now bigger) text's bbox,
+    // AND the two must have real breathing room between them -- 8.5.5's first pass only fixed the overlap,
+    // leaving the dot about 3px from the "S" of SUBSCRIBE (reads as "\u25cfSUBSCRIBE" jammed together).
+    // dot-to-text gap must be at least 0.7x the dot's own diameter (the fix targets ~0.9x), both before
+    // AND after the resize fix, so a short label (never resized) reads just as clean as the enlarged one.
+    fn dot_text_gap(ss: &mut Session, dot_id: &str, text_id: &str, cw: f64) -> f64 {
+        let (dot_w, _) = { match &ss.project.find_clip(dot_id).unwrap().source { Source::Shape { width, height, .. } => (*width, *height), s => panic!("not a shape: {s:?}") } };
+        let dot = ss.project.find_clip(dot_id).unwrap();
+        let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
+        let dot_right_canvas = cw / 2.0 + dot_x + dot_w / 2.0;
+        let text_dur = ss.project.find_clip(text_id).unwrap().duration;
+        let bounds = call(ss, "compute_text_bounds", json!({"clip_id": text_id, "t": text_dur / 2.0}));
+        let rect = bounds["canvas_rect"].as_array().unwrap_or_else(|| panic!("no canvas_rect: {bounds}"));
+        let text_left_canvas = rect[0].as_f64().unwrap();
+        text_left_canvas - dot_right_canvas
+    }
+
     let (cw, _) = (1280.0_f64, 720.0_f64);
     let (dot_w, _) = shape_wh(&ss, &dot_id);
     let dot = ss.project.find_clip(&dot_id).unwrap();
     let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
     let dot_right_canvas = cw / 2.0 + dot_x + dot_w / 2.0;
 
-    let bounds = call(&mut ss, "compute_text_bounds", json!({"clip_id": text_id}));
+    let text_dur = ss.project.find_clip(&text_id).unwrap().duration;
+    let bounds = call(&mut ss, "compute_text_bounds", json!({"clip_id": text_id, "t": text_dur / 2.0}));
     let rect = bounds["canvas_rect"].as_array().unwrap_or_else(|| panic!("no canvas_rect: {bounds}"));
     let text_left_canvas = rect[0].as_f64().unwrap();
     assert!(dot_right_canvas <= text_left_canvas + 0.5,
         "the dot (right edge at {dot_right_canvas}px) must sit clear, left of the enlarged text (starting at {text_left_canvas}px) -- this is the exact overlap Tab saw on the montage's end card");
+
+    let gap_after = dot_text_gap(&mut ss, &dot_id, &text_id, cw);
+    assert!(gap_after >= 0.7 * dot_w,
+        "the dot-to-text gap after the resize fix must be at least 0.7x the dot's diameter ({dot_w}px) for real breathing room, not just non-overlapping: gap was {gap_after}px");
+
+    // same check on a SHORT label that the text_too_small fix never touches (never resized, so this is
+    // the build-time path's own spacing, not the fix path's).
+    let mut ss2 = Session::new(); call(&mut ss2, "project_set", json!({"width": 1920, "height": 1080, "fps": 30}));
+    let t2 = sid(&call(&mut ss2, "add_track", json!({})), "track_id");
+    let r2 = call(&mut ss2, "add_title", json!({"track_id": t2, "style": "subscribe_pop", "text": "SUB", "start": 0.0, "duration": 2.5}));
+    let ids2: Vec<String> = r2["clip_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let dot_id2 = ids2[1].clone(); let text_id2 = ids2[2].clone();
+    let (dot_w2, _) = shape_wh(&ss2, &dot_id2);
+    let gap_before = dot_text_gap(&mut ss2, &dot_id2, &text_id2, 1920.0);
+    assert!(gap_before >= 0.7 * dot_w2,
+        "the dot-to-text gap on a freshly built (never resized) subscribe_pop badge must also be at least 0.7x the dot's diameter ({dot_w2}px): gap was {gap_before}px");
 }
 
 
