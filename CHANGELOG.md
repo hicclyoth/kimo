@@ -1,3 +1,72 @@
+## v8.5.8 (2026-11-02)
+
+The montage review (`montage_v85_v08_review_sheet.png`) ranked the end card as the #1 remaining weakness:
+one frozen, heavily blurred frame held completely still for the whole 3s card (~14% of the edit's runtime,
+frame-diff <2 across 2s), and the "SUBSCRIBE FOR MORE" pill read small (about 220px wide on a 1280-wide
+frame).
+
+Three changes, all scoped to `auto_edit`'s own `end_screen` stage (`crates/kimo-core/src/ext/auto_edit.rs`):
+
+- **The backdrop drifts instead of sitting frozen.** The background clip's `scale` is now keyframed
+  (`END_CARD_BG_SCALE` -> `END_CARD_BG_SCALE_END`, 1.08 -> 1.15) across the whole card in one eased
+  (`in_out`) segment, a slow Ken Burns push-in rather than a flat value -- smooth and monotonic (proven by
+  sampling the keyed prop at 21 points: no reversal, no step bigger than 4x the average step), so the card
+  reads as a designed, moving background instead of a stuck frame.
+- **Less mush.** `END_CARD_BG_BLUR_RADIUS` dropped from 9.0 to 5.5 -- the subject stays recognisable,
+  clearly soft behind the CTA, not an unreadable smear.
+- **The CTA actually reads.** The `subscribe_pop` badge (pill + dot + text) is rebuilt at
+  `END_CARD_PILL_SCALE` (1.4x) instead of `titles.rs`'s own 1x design size: the text's own already-built
+  font size and the dot's own already-built width are read back and multiplied by the same factor, then the
+  pill width and the dot's room/position are recomputed with the exact same shared formulas `titles.rs`
+  itself uses (`pill_width_for_text`, `dot_room`, `dot_x_for_pill`) at a proportionally scaled `k` -- every
+  one of those functions is parametrized entirely by `k`, so scaling `k` by the same factor as the text/dot
+  reproduces the identical padding and the 8.5.5 dot-inside-pill gap guarantee, just bigger, instead of a
+  naive uniform `scale` transform that would leave the dot's own px-pinned clearance (`dot_x_for_pill`'s
+  `14.0 * k`) out of step with the grown pill.
+
+New/updated TDD coverage in `tests/auto_edit.rs`: `end_screen_background_freezes_early_blurs_gently_and_scales_up`
+now samples the keyed `scale` prop at start/middle/end (clip-local time) and asserts the push-in is
+monotonic and smooth (no outsized jumps), and checks the lowered blur radius; a new
+`end_card_pill_is_scaled_up_and_dot_gap_still_holds` builds the same badge unscaled on a fresh 1280x720
+project as a baseline, proves the real end card's pill is meaningfully bigger and clears "roughly 300+ px
+wide on 1280", and re-proves the 8.5.5 dot-inside-pill and dot-to-text-gap (>=0.7x the dot's own diameter)
+geometry on the now-bigger badge using the same rendered-position technique as
+`subscribe_pop_dot_clears_the_text_after_the_pill_resize_fix` (`tests/director_small.rs`). `golden_frames.txt`
+and `recipe_frames.txt` are byte-identical; `golden_registry.txt` is untouched (no tool description changed).
+
+Verified against the real-footage benchmark: `real_v62.mp4`, md5 `dac36d18de29f81da090006d262c46c2` (was
+`real_v61.mp4`, md5 `41caa0f5048e5cfa193b5071f2367953`). `framemd5` showed frames 538-656 differ
+(t=17.9-21.83s); a per-pixel diff against a side-by-side rebuild of the OLD 8.5.7 binary isolated the real
+content change to frame 566 onward (t=18.87s, exactly the end card's own start -- mean pixel delta jumps
+from <1 to 2.4 there and climbs through the card as the push-in and the bigger pill take effect), while
+frames 538-565 carry only ordinary encoder lookahead/mb-tree ripple (mean <1, max ~24-45 of 255, invisible),
+the same class already documented here for `real_v57`-`real_v61`.
+
+One honest side effect, examined and left as-is rather than worked around: `lint_edit`'s own review (which
+`auto_edit` always runs) now reports one `text_over_subject` warning at 18.93s that real_v61 did not have.
+Isolating each change independently traced it to the bigger pill alone (the backdrop's lower blur radius and
+Ken Burns drift, tested in isolation, stay lint-clean): this clip's last trailing ASR caption ("about it.")
+holds at full opacity until about 19.1s, a little past where the end card begins, and the bigger pill's own
+solid, high-contrast shape -- not a face -- is what the saliency check reads as a "subject" once it is large
+enough to reach that screen position. Viewed the actual frame: the opaque pill simply draws over the
+caption (end-card content is on a later, higher track than the caption track, same ordering as every earlier
+version), which is the correct, intended result -- a trailing caption hidden behind the new end card, not
+corrupted or double-exposed. `apply_review_fixes` already auto-fixes the first occurrence it finds
+(`16.66s`) and correctly declines to chase this second, introduced one further (the system's own documented
+"a fix introduced a new problem, not auto-chased" shape, exactly as `apply_review_fixes.rs`'s existing tests
+describe) -- left for a human/agent call rather than silently special-cased, and judged here to be a benign
+interaction with this specific clip's caption timing, not a real visual defect, so left unfixed rather than
+distorting the pill's geometry or touching caption timing (out of this stage's scope) to chase a warning
+away.
+
+Montage rebuilt the same way as `montage_v85_v08` (same driver, same 3 looks at the same clips/windows --
+`glitch_surge`/city b-roll, `aurora_wash`/typing b-roll, `chrome_bloom`/final beat, confirmed via
+`--dump-timeline` that every clip id is unchanged): `montage_v85_v09.mp4`, 4.2MB. Comparison sheet at
+`endcard_v08_vs_v09.png` (frames at 19.0/20.0/21.0/21.8s, v08 row vs v09 row) viewed at full size and
+zoomed on the pill: v08 is static and heavily blurred across all four frames with a small pill; v09 visibly
+drifts (the shirt's pattern and the subject's position shift gently across the four frames), stays
+recognisable rather than mush, and the pill reads as a real, legible call to action.
+
 ## v8.5.7 (2026-11-02)
 
 The montage review (`montage_v85_v06.mp4`) and the benchmark (`real_v59.mp4`) both flagged the

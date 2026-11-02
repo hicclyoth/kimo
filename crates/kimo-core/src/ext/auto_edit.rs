@@ -22,10 +22,28 @@ fn r3(v: f64) -> f64 { (v * 1000.0).round() / 1000.0 }
 /// V8.5.5 end-card background tuning: freeze an earlier, calmer source frame instead of the literal last
 /// one; blur it gently rather than into mush; scale it up a touch so the blur's edge falloff never shows;
 /// darken it slightly so the white pill/text/dot pop against it. See the end_screen stage below.
+///
+/// V8.5.8: the 8.5.5 tuning held the frozen frame dead still for the whole card (zero motion across the
+/// last ~14% of the edit's runtime, flagged as the #1 weakness in a montage review) and blurred it hard
+/// enough to read as mush rather than a soft backdrop. Two changes, both scoped to the end card alone:
+/// a slow Ken Burns drift on the backdrop's own `scale` (END_CARD_BG_SCALE -> END_CARD_BG_SCALE_END, eased
+/// across the whole card so it never jumps) so the card reads as a designed background in motion, not a
+/// freeze-frame slide; and a lighter blur radius so the subject stays recognisable, clearly soft, not mush.
 const END_CARD_BG_FREEZE_BACK_S: f64 = 0.5;
-const END_CARD_BG_BLUR_RADIUS: f64 = 9.0;
+const END_CARD_BG_BLUR_RADIUS: f64 = 5.5;
 const END_CARD_BG_SCALE: f64 = 1.08;
+/// V8.5.8: the scale the backdrop's slow push-in has reached by the card's own end (started at
+/// END_CARD_BG_SCALE); the drift runs the full end_screen_duration, eased in/out so it never jumps.
+const END_CARD_BG_SCALE_END: f64 = 1.15;
 const END_CARD_BG_DARKEN_STOPS: f64 = -0.2; // 2^-0.2 ≈ 0.87x brightness, about -13%
+/// V8.5.8: the subscribe_pop badge (pill + dot + text) is built once by `add_title` at the design's own
+/// 1x size (titles.rs, k = min(h,w)/1080) -- about 220px wide on a 1280-wide frame, read as too small for
+/// the CTA to pop in a montage review. Rebuilding the badge's own text size and dot width at k * this
+/// factor and recomputing the pill (`pill_width_for_text`) and the dot's room/position (`dot_room`,
+/// `dot_x_for_pill`) at that same scaled k reproduces the exact same proportions -- side padding, and
+/// critically the dot-inside-pill gap those two functions guarantee -- just bigger, so the 8.5.5 geometry
+/// holds unchanged at any size.
+const END_CARD_PILL_SCALE: f64 = 1.4;
 
 
 fn atomic(ss: &mut Session, a: &Value, f: fn(&mut Session, &Value) -> Result<Value, String>) -> Result<Value, String> {
@@ -441,7 +459,15 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
                 // Scaled up before the blur so the blur's own edge falloff (which softens toward
                 // transparent/black past the clip's own bounds) never shows as a visible seam at the
                 // canvas edge once "cover" framing has already filled the frame.
+                // V8.5.8: a slow, eased push-in across the whole card instead of one flat scale -- two
+                // keyframes (one segment, in_out eased) so the drift is smooth and continuous with no
+                // jumps, reading as a deliberate Ken Burns move on a designed background rather than a
+                // stuck frame. set_property still stamps the same starting value onto the prop's own
+                // `base` first (unchanged from 8.5.5) so anything reading the base before the keys land
+                // sees the card's starting scale, not a stale default.
                 call(ss, "set_property", &json!({"clip_id": bg_cid, "property": "scale", "value": END_CARD_BG_SCALE}))?;
+                call(ss, "set_keyframe", &json!({"clip_id": bg_cid, "property": "scale", "time": 0.0, "value": END_CARD_BG_SCALE, "ease": "in_out"}))?;
+                call(ss, "set_keyframe", &json!({"clip_id": bg_cid, "property": "scale", "time": end_screen_duration, "value": END_CARD_BG_SCALE_END, "ease": "in_out"}))?;
                 call(ss, "add_effect", &json!({"clip_id": bg_cid, "kind": "blur", "params": {"radius": END_CARD_BG_BLUR_RADIUS}}))?;
                 // A touch darker so the white pill/text/dot pop a little more against whatever was on
                 // screen, without going so dark the background reads as flat black.
@@ -457,6 +483,43 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         let tt = new_track(ss)?;
         let title = call(ss, "add_title", &json!({"track_id": tt, "style": "subscribe_pop", "text": end_screen_text, "start": edit_duration, "duration": end_screen_duration}))?;
         if let Some(ws) = title["warnings"].as_array() { for w in ws { if let Some(s) = w.as_str() { warnings.push(s.to_string()); } } }
+        // V8.5.8: grow the whole subscribe_pop badge (pill + dot + text) to END_CARD_PILL_SCALE. subscribe_pop
+        // pushes its clips in a fixed order (titles.rs: pill, dot, text), so clip_ids[0]/[1]/[2] are known; read
+        // each clip's OWN already-built size/font back (rather than re-deriving k from scratch) so this stays
+        // correct even if titles.rs's own base sizes ever change, then rebuild the pill width and the dot's
+        // room/position with the SAME shared formulas titles.rs itself uses (pill_width_for_text, dot_room,
+        // dot_x_for_pill) at a proportionally scaled k -- every one of those is parametrized entirely by k, so
+        // scaling k by the same factor as the text/dot reproduces the identical padding and dot-gap ratio the
+        // 8.5.5 geometry guarantees, just bigger, instead of a plain uniform `scale` transform that would leave
+        // the dot's px-pinned clearance (dot_x_for_pill's `14.0 * k`) out of step with the grown pill.
+        let pill_ids: Vec<&str> = title["clip_ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+        if pill_ids.len() == 3 {
+            let (pill_id, dot_id, text_id) = (pill_ids[0], pill_ids[1], pill_ids[2]);
+            let (old_font, old_size) = match ss.project.find_clip(text_id).map(|c| c.source.clone()) {
+                Some(Source::Text { font, size, .. }) => (font, size),
+                _ => (String::new(), 0.0),
+            };
+            let old_dot_w = match ss.project.find_clip(dot_id).map(|c| c.source.clone()) {
+                Some(Source::Shape { width, .. }) => width,
+                _ => 0.0,
+            };
+            if !old_font.is_empty() && old_size > 0.0 && old_dot_w > 0.0 {
+                let k = ss.project.height.min(ss.project.width) as f64 / 1080.0;
+                let k_pill = k * END_CARD_PILL_SCALE;
+                let new_size = old_size * END_CARD_PILL_SCALE;
+                let new_dot_w = old_dot_w * END_CARD_PILL_SCALE;
+                call(ss, "set_text", &json!({"clip_id": text_id, "size": new_size}))?;
+                let new_pill_w = crate::titles::pill_width_for_text(&end_screen_text, &old_font, new_size, ss.project.width as f64, k_pill)
+                    + crate::titles::dot_room(new_dot_w, k_pill);
+                let new_pill_h = 66.0 * k_pill;
+                call(ss, "set_shape_size", &json!({"clip_id": pill_id, "width": new_pill_w, "height": new_pill_h}))?;
+                call(ss, "set_shape_size", &json!({"clip_id": dot_id, "width": new_dot_w, "height": new_dot_w}))?;
+                let new_dot_x = crate::titles::dot_x_for_pill(new_pill_w, new_dot_w, k_pill);
+                call(ss, "set_property", &json!({"clip_id": dot_id, "property": "x", "value": new_dot_x}))?;
+            } else {
+                warnings.push("end screen: could not read the subscribe_pop badge's own text/dot size back, leaving it at its default (unscaled) size".into());
+            }
+        }
         if let Some(cid) = title["clip_ids"].as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
             let fade_start = (end_screen_duration - 0.5).max(0.0);
             call(ss, "set_keyframe", &json!({"clip_id": cid, "property": "opacity", "time": fade_start, "value": 1.0}))?;
