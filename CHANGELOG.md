@@ -1,3 +1,57 @@
+## v8.5.6 (2026-11-02)
+
+The montage review (real-footage cut, `montage_v85_v05.mp4`) flagged a long talking-head stretch that read
+as static to the eye, about 9.0-16.1s. Digging in: `auto_edit`'s existing job-2c logic (added back in
+`7b6fcda`) already forces a split and a punch-in on any uncovered dialogue run longer than
+`punch_max_static` (then 4.5s default), so a cut and a small zoom WERE already landing inside that window
+(at 11.573s). The zoom just never registered -- it was a soft 0.2s eased ramp from 1.0x up to ~1.16x, so
+for the first several frames after the cut the two clips looked almost the same size, and the whole 7.1s
+span read as one static take even though it technically was not.
+
+Fixed:
+
+- **The punch-in ease is now a hard, instant jump (`duration: 0.0`, was `0.2`) instead of a soft ramp.**
+  The scale lands at its full target value on the very first frame after the cut, so the punch is
+  synced to the cut itself -- the "cut-on-phrase, hard punch" style top editors actually use, not a creep
+  that is easy to miss. Scale targets (the existing randomized ~1.13-1.16x, alternating pattern) are
+  unchanged.
+- **`punch_max_static`'s default is tightened from 4.5s to 3.5s**, and `split_points()`'s own slack is
+  removed: the old code could let a forced segment overshoot the cap by up to `max_static * 0.3 + 0.5s`
+  when hunting for a natural pause past the ideal split mark, or let the final segment run up to
+  `max_static + 0.5s` past the clip's own end. Both are now hard bounds -- no synthetic split's segment can
+  exceed the cap, guaranteed by a new unit test (`split_points_never_lets_a_segment_exceed_the_cap`) built
+  from synthetic long takes with no natural pauses at all, where the old slack was reachable.
+  `punch_max_static_is_configurable`'s existing 30.0-second override test is untouched (nothing here
+  changes the knob itself, only its default and its guarantee).
+- New TDD coverage: a synthetic long uncut take gets forced split points such that the max static span is
+  <= 3.6s; the resulting punch scales alternate (not every segment lands on the same side); nothing from
+  job-2c's forced splitting ever lands inside b-roll coverage or the end card (both already excluded by
+  the existing `covered_fraction` gate, now asserted directly).
+
+Verified against this real-footage benchmark's own talking-head take specifically: its natural dialogue
+pauses already happen to split every uncovered stretch at <=3.19s (`clip17`, 13.033-16.226s) even under
+the OLD 4.5s cap, and its one >4.5s uncovered-looking stretch (`clip9`, 3.233-7.893s, 4.66s) is 94%
+covered by b-roll and correctly exempt either way -- so for THIS asset the split-point structure is
+byte-identical old vs new (checked directly, clip-by-clip, against a side-by-side old-binary rebuild). The
+3.5s default and the slack fix are a correctness hardening that matters on footage whose natural pauses
+don't already satisfy the cap, which the new unit tests exercise directly; what changed this benchmark's
+own pixels is the ease hardening above, landing exactly at the one punch this footage already had
+(11.573s).
+
+**The pinned real-footage benchmark md5 changes**, from `db90ea441ab927521e0168da8a9899da` (real_v58) to
+`9740b7c1b1f481db441d2f1f871e748e` (real_v59). `framemd5` against real_v58: frames 0-236 and 239-310
+bit-identical; frames 237-238 (~7.90-7.97s) differ -- the first couple of frames of the one other
+pre-existing punch in this take (`clip15`, onset 7.893s), now landing at full scale immediately instead of
+a fraction of the way through a 0.2s ramp; frames 311-565 (~10.37-18.87s) differ -- the real content change
+is the `clip10` punch onset at 11.573s landing instantly instead of easing in (confirmed by a direct
+frame-11.6s visual diff: the subject is visibly larger in `real_v59` at that exact frame, same framing,
+face fully in shot), and the remainder of that range is the encoder's own mb-tree/lookahead reacting to
+those now-different frames rather than any further content change -- a frame pulled from well past the
+ramp window (13.3s) is visually identical between the two files (max per-pixel delta 46/255, mean
+1.48/255, not visible), the same propagation class already documented for `real_v57` vs `real_v56` above.
+Frames 0-236, 239-310 and 566-655 (the end card) are untouched, as expected: `auto_edit`'s job-2c and
+`add_punch_ins` never touch b-roll, captions timing, audio, or the end card.
+
 ## v8.5.5 (2026-11-02)
 
 A fresh review of the 8.5.4 montage (same 3-look real-footage cut, re-rendered with the 8.5.4 fixes in)

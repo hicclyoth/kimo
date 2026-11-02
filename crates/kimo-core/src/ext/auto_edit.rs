@@ -46,10 +46,13 @@ fn covered_fraction(s: f64, e: f64, cover: &[(f64, f64)]) -> f64 {
     (covered / span).clamp(0.0, 1.0)
 }
 
-/// V8.2V job 2: where to split a long uncovered dialogue stretch so no piece sits static past `max_static`
-/// seconds. Prefers a real pause in the words (a gap of >=0.12s between two consecutive words, the nearest
-/// one to each ~max_static mark) so a cut lands between sentences/phrases, not mid-word; where no such pause
-/// exists nearby (a single breathless take), splits at the plain interval instead, so the rule always holds.
+/// V8.2 job 2 / V8.5.6: where to split a long uncovered dialogue stretch so no piece sits static past
+/// `max_static` seconds -- a hard guarantee (including the final piece), not a best-effort one. Prefers a
+/// real pause in the words (a gap of >=0.12s between two consecutive words) so a cut lands between
+/// sentences/phrases, never mid-word; among the pauses that keep the segment within `max_static` of the
+/// last split, the one closest to the `max_static` mark is picked, so the jump-cut rhythm stays as even as
+/// the words allow. Where no such pause exists nearby (a single breathless take), splits at the plain
+/// `max_static` interval instead, so the rule always holds even on a take with no natural breath.
 fn split_points(clip_start: f64, clip_end: f64, words: &[Value], max_static: f64) -> Vec<f64> {
     let mut pauses: Vec<f64> = vec![];
     for w in words.windows(2) {
@@ -60,9 +63,12 @@ fn split_points(clip_start: f64, clip_end: f64, words: &[Value], max_static: f64
     let mut points = vec![];
     let mut last = clip_start;
     loop {
+        if clip_end - last <= max_static { break; } // the remaining tail is already short enough: done
         let ideal = last + max_static;
-        if ideal >= clip_end - 0.5 { break; }
-        let pick = pauses.iter().filter(|&&p| p > last + 1.0 && p <= ideal + max_static * 0.3).min_by(|x, y| (**x - ideal).abs().total_cmp(&(**y - ideal).abs()));
+        // Only a pause strictly within (last, ideal] is eligible: picking one past `ideal` would let this
+        // segment itself exceed max_static, which is exactly the slack job 2 used to allow (and the gap the
+        // 8.5.6 review caught). min_by finds the one nearest `ideal` from below, i.e. the latest safe pause.
+        let pick = pauses.iter().filter(|&&p| p > last + 1.0 && p <= ideal).min_by(|x, y| (ideal - **x).total_cmp(&(ideal - **y)));
         let t = *pick.unwrap_or(&ideal);
         points.push(t);
         last = t;
@@ -224,12 +230,16 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         if !pushed.is_empty() { stages.insert("push_in".into(), json!({"clips": pushed})); }
     }
 
-    // 2c. V8.2V job 2: force extra splits on any uncovered dialogue stretch that would otherwise sit static
-    // longer than punch_max_static -- natural-pause splitting (rough_cut, tighten_pauses) already breaks up
-    // most real takes, but a continuous sentence with no breath (or a single long uncut take) can leave one
-    // giant clip with nothing for add_punch_ins below to alternate against. A clip already mostly covered by
-    // b-roll is left alone (nobody sees its zoom anyway, same reasoning as the visibility filter just below).
-    let punch_max_static = opt_num(a, "punch_max_static", 4.5).clamp(1.5, 20.0);
+    // 2c. V8.2V job 2 / V8.5.6: force extra splits on any uncovered dialogue stretch that would otherwise sit
+    // static longer than punch_max_static -- natural-pause splitting (rough_cut, tighten_pauses) already
+    // breaks up most real takes, but a continuous sentence with no breath (or a single long uncut take) can
+    // leave one giant clip with nothing for add_punch_ins below to alternate against. A clip already mostly
+    // covered by b-roll is left alone (nobody sees its zoom anyway, same reasoning as the visibility filter
+    // just below). Default tightened 4.5 -> 3.5 in 8.5.6: the montage review (montage_v85_v05, ~9.0-16.1s)
+    // found a 7.1s stretch that technically alternated wide/punched every ~1.5-3.2s already but still read
+    // as a static dead zone -- a top editor's "never more than 3-4s on one setup" is tighter than 4.5s, and
+    // split_points now holds every piece (including the last) to the limit exactly, not just within a slop.
+    let punch_max_static = opt_num(a, "punch_max_static", 3.5).clamp(1.5, 20.0);
     if punch_on {
         let mut next_dialogue = Vec::with_capacity(dialogue_clips.len());
         for (id, s, e) in dialogue_clips.drain(..) {
@@ -254,7 +264,10 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if punch_on {
         let visible: Vec<String> = dialogue_clips.iter().filter(|(_, s, e)| covered_fraction(*s, *e, &broll_ranges) < 0.5).map(|(id, _, _)| id.clone()).collect();
         if visible.len() >= 2 {
-            let pin = call(ss, "add_punch_ins", &json!({"clip_ids": visible, "scale": punch_scale, "pattern": "alternate", "ease": 0.2, "variety": true}))?;
+            // 8.5.6: hard punch (ease 0), not an eased push-in -- a quick push-in reads as the shot drifting,
+            // where a hard jump-cut-on-phrase scale change is what a demanding editor's "alternate 1.0x /
+            // 1.12-1.18x" actually looks like (the subtlety was part of why the 9-16s stretch read as static).
+            let pin = call(ss, "add_punch_ins", &json!({"clip_ids": visible, "scale": punch_scale, "pattern": "alternate", "ease": 0.0, "variety": true}))?;
             stages.insert("punch_ins".into(), pin);
         } else {
             warnings.push(format!("punch-ins skipped: only {} dialogue clip(s) stay on screen past the b-roll coverage, not enough for wide/tight variation", visible.len()));
@@ -528,7 +541,7 @@ pub fn commands() -> Vec<Command> {
                 ("captions", json!({"type": "boolean", "description": "default true"})),
                 ("punch_ins", json!({"type": "boolean", "description": "default true"})),
                 ("punch_scale", n("punched-in zoom over wide, default 1.15")),
-                ("punch_max_static", n("force an extra split so no dialogue stretch sits static past this many seconds, default 4.5, clamped 1.5..20")),
+                ("punch_max_static", n("force an extra split so no dialogue stretch sits static past this many seconds, default 3.5, clamped 1.5..20")),
                 ("push_in", json!({"type": "boolean", "description": "default true: slow Ken Burns push-in on static b-roll cutaways"})),
                 ("push_in_zoom", n("push-in target scale by the cutaway's end, default 1.05 (5%), clamped 1.01..1.3")),
                 ("broll_transitions", json!({"type": "boolean", "description": "default true: a short whip/zoom-blur transition into each b-roll cutaway (never on the talking-head punch-ins)"})),
@@ -548,4 +561,73 @@ pub fn commands() -> Vec<Command> {
                 ("pacing", json!({"type": "boolean", "description": "tighten_pauses: shrink the dead air rough_cut leaves inside its own kept clips (a breath between phrases, the lead-in before the first word) down to a natural pad; default true"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
+}
+
+#[cfg(test)]
+mod split_points_tests {
+    use super::split_points;
+    use serde_json::json;
+
+    fn word(start: f64, end: f64) -> serde_json::Value { json!({"start": start, "end": end, "src": "w"}) }
+
+    /// 8.5.6: a synthetic long talking-head run with no transcript at all (the evenly-spaced fallback) must
+    /// still come out with every piece -- including the last one -- at or under the ~3.5s target, with
+    /// headroom to spare under the review's "never static past ~3-4s" bar (checked at 3.6s).
+    #[test]
+    fn split_points_never_leaves_a_span_over_3_6s_with_no_words() {
+        let points = split_points(0.0, 12.0, &[], 3.5);
+        let mut bounds = vec![0.0]; bounds.extend(points.iter().copied()); bounds.push(12.0);
+        for w in bounds.windows(2) {
+            assert!(w[1] - w[0] <= 3.6, "span {:.2}..{:.2} is {:.2}s, over the 3.6s bar: {bounds:?}", w[0], w[1], w[1] - w[0]);
+        }
+        assert!(points.len() >= 2, "a 12s take at a 3.5s cap needs at least 2 forced splits, got {}: {points:?}", points.len());
+    }
+
+    /// Same bound holds on an odd duration that does not divide evenly by max_static (a real take never
+    /// lands on a clean multiple), proving the guarantee is the loop's own invariant, not a lucky number.
+    #[test]
+    fn split_points_never_leaves_a_span_over_3_6s_on_an_odd_duration() {
+        for &dur in &[5.1, 9.9, 13.37, 20.0, 3.4, 3.6] {
+            let points = split_points(0.0, dur, &[], 3.5);
+            let mut bounds = vec![0.0]; bounds.extend(points.iter().copied()); bounds.push(dur);
+            for w in bounds.windows(2) {
+                assert!(w[1] - w[0] <= 3.6, "duration {dur}: span {:.2}..{:.2} is {:.2}s, over the 3.6s bar: {bounds:?}", w[0], w[1], w[1] - w[0]);
+            }
+        }
+    }
+
+    /// A real pause close to the ~max_static mark is preferred over the raw interval point, so the cut lands
+    /// between words, not mid-word -- the whole reason job 2 looks at the transcript before falling back.
+    #[test]
+    fn split_points_prefers_a_pause_near_the_mark_over_the_raw_interval() {
+        // clip 0..8, max_static 3.5: the raw interval point would be 3.5, but there is a real pause at 3.3
+        // (a 0.2s gap between two words) just before it -- that is what should get picked instead.
+        let words = vec![word(1.0, 3.1), word(3.3, 4.0), word(4.0, 7.5)];
+        let points = split_points(0.0, 8.0, &words, 3.5);
+        assert!(!points.is_empty());
+        assert!((points[0] - 3.3).abs() < 1e-9, "expected the real pause at 3.3, got {:?}", points);
+    }
+
+    /// 8.5.6 regression: the old job-2 window let a pause up to max_static*1.3 past the last split get
+    /// picked, which could itself push a segment past the limit (the exact slack the montage review's
+    /// static stretch rode in on). A pause that far out must now be ignored in favour of the plain interval
+    /// point, so the segment it closes still respects max_static.
+    #[test]
+    fn split_points_ignores_a_pause_past_the_max_static_mark() {
+        // clip 0..10, max_static 3.5: a pause at 4.6 is well past the 3.5 mark (within the OLD 1.3x = 4.55
+        // slack window) and must be rejected; the only pause inside (0, 3.5] is none, so the plain interval
+        // point (3.5) must be used instead.
+        let words = vec![word(1.0, 4.5), word(4.6, 9.9)];
+        let points = split_points(0.0, 10.0, &words, 3.5);
+        assert!(!points.is_empty(), "expected at least one forced split: {points:?}");
+        assert!(points[0] <= 3.5 + 1e-9, "picked {:.2}, which exceeds max_static (3.5) -- the old 1.3x slack bug: {points:?}", points[0]);
+    }
+
+    /// A take already short enough needs no forced split at all (job 2 does not force work that is not
+    /// needed) -- the companion fact to the "never over the cap" guarantee above.
+    #[test]
+    fn split_points_does_nothing_on_a_short_clip() {
+        assert!(split_points(0.0, 3.0, &[], 3.5).is_empty());
+        assert!(split_points(0.0, 3.5, &[], 3.5).is_empty(), "exactly at the cap needs no split");
+    }
 }

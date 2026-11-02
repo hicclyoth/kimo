@@ -70,6 +70,32 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
     }
 }
 
+/// 8.5.6: job 2's forced splits must not touch a long single take that b-roll already covers -- the same
+/// "nobody sees the zoom anyway" reasoning the punch-visibility filter uses, but one step earlier: there is
+/// no point cutting a clip into pieces whose scale change the viewer never sees because b-roll is on top.
+#[test] fn job2_forced_splits_skip_a_long_take_broll_fully_covers() {
+    let mut ss = proj();
+    // one continuous 9s take with no internal pause, well past the ~3.5s cap, entirely covered by b-roll.
+    let a = sid(&call(&mut ss, "import_media", json!({"path": talk("job2_broll_covered_th.mp4", &[(0.0, 9.0)], 0.0)})), "asset_id");
+    let b = sid(&call(&mut ss, "import_media", json!({"path": broll("job2_broll_covered_b.mp4", 9.0)})), "asset_id");
+    let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "broll_asset_ids": [b], "captions": false, "grade": false, "push_in": false, "broll_color_match": false, "end_screen": false, "pacing": false}));
+    assert!(r["ok"] == json!(true), "{r}");
+    let broll_ranges: Vec<(f64, f64)> = r["stages"]["broll"]["clips"].as_array().unwrap().iter()
+        .map(|c| (c["start"].as_f64().unwrap(), c["end"].as_f64().unwrap())).collect();
+    assert!(!broll_ranges.is_empty(), "test needs b-roll actually placed: {r}");
+    let track_id = r["track_id"].as_str().unwrap();
+    let tl = call(&mut ss, "timeline_summary", json!({}));
+    let track = tl["tracks_bottom_to_top"].as_array().unwrap().iter().find(|t| t["track_id"] == *track_id).unwrap();
+    let dialogue: Vec<&Value> = track["clips"].as_array().unwrap().iter().filter(|c| c["src"].as_str() != Some("job2_broll_covered_b.mp4")).collect();
+    for c in &dialogue {
+        let (s, e) = (c["start"].as_f64().unwrap(), c["end"].as_f64().unwrap());
+        let covered: f64 = broll_ranges.iter().map(|(bs, be)| (e.min(*be) - s.max(*bs)).max(0.0)).sum::<f64>() / (e - s).max(1e-6);
+        if covered >= 0.5 {
+            assert!(e - s > 3.6, "clip {} ({:.2}s, {:.0}% b-roll covered) was split by job 2 even though b-roll already hides it: {r}", c["clip_id"], e - s, covered * 100.0);
+        }
+    }
+}
+
 /// With no broll_asset_ids at all, every dialogue clip is visible, so punch-ins should still have >=2
 /// candidates and actually alternate -- the covered-clip exclusion must not also eat the normal case.
 #[test] fn punch_ins_still_apply_with_no_broll() {
@@ -389,23 +415,30 @@ fn proj() -> Session { let mut ss = Session::new(); call(&mut ss, "project_set",
 }
 
 
-/// V8.2V job 2: a single long uncut talking-head take (no internal pause for rough_cut/tighten_pauses to
-/// split on) must still end up broken into pieces no longer than punch_max_static, so add_punch_ins has
-/// real wide/tight variation to alternate -- the actual "never static past ~4-5s" promise, not just a
-/// single clip sitting there the whole time.
+/// V8.2V job 2 / V8.5.6: a single long uncut talking-head take (no internal pause for rough_cut/
+/// tighten_pauses to split on) must still end up broken into pieces no longer than punch_max_static, so
+/// add_punch_ins has real wide/tight variation to alternate -- the actual "never static past ~3-4s" promise
+/// (tightened from ~4-5s in 8.5.6: a montage review found a 7.1s stretch that read as static even with the
+/// old 4.5s/eased default), not just a single clip sitting there the whole time. Also checks that the
+/// resulting pieces actually alternate wide/punched (not just "at least one punched somewhere") and that the
+/// punch itself is a hard cut (ease 0), per the review's "cut-on-phrase, not a soft push" ask.
 #[test] fn job2_splits_a_long_uncut_dialogue_take_for_punch_ins() {
     let mut ss = proj();
     let a = sid(&call(&mut ss, "import_media", json!({"path": talk("longtake_th.mp4", &[(0.0, 10.0)], 0.0)})), "asset_id");
     let r = call(&mut ss, "auto_edit", json!({"talking_head_asset_ids": [a], "captions": false, "grade": false, "push_in": false, "broll_color_match": false, "end_screen": false, "pacing": false}));
     assert!(r["ok"] == json!(true), "{r}");
     let pin = r["stages"]["punch_ins"]["clips"].as_array().unwrap_or_else(|| panic!("punch_ins stage missing for a 10s single take: {r}"));
-    assert!(pin.len() >= 2, "a 10s single take should have been split into multiple pieces for punch-ins, got {}: {r}", pin.len());
+    assert!(pin.len() >= 3, "a 10s single take at the new ~3.5s cap should split into at least 3 pieces for punch-ins, got {}: {r}", pin.len());
     for cp in pin {
         let cid = sid(cp, "clip_id");
         let c = ss.project.find_clip(&cid).unwrap();
-        assert!(c.duration <= 4.5 + 1e-6, "clip {cid} is {:.2}s, should never exceed punch_max_static (4.5s default): {r}", c.duration);
+        assert!(c.duration <= 3.6, "clip {cid} is {:.2}s, should never exceed the ~3.5s punch_max_static default (8.5.6): {r}", c.duration);
     }
-    assert!(pin.iter().any(|c| c["punched"] == json!(true)), "expected at least one punched segment among the split pieces: {r}");
+    let flags: Vec<bool> = pin.iter().map(|c| c["punched"] == json!(true)).collect();
+    assert!(flags.iter().any(|&p| p), "expected at least one punched segment among the split pieces: {r}");
+    assert!(flags.iter().any(|&p| !p), "expected at least one wide segment too -- a real alternation, not every piece punched: {r}");
+    assert!(flags.windows(2).any(|w| w[0] != w[1]), "expected the punched flag to actually alternate somewhere along the split pieces: {flags:?}: {r}");
+    assert_eq!(r["stages"]["punch_ins"]["ease"], json!(0.0), "8.5.6: the talking-head punch should be a hard cut (ease 0), not an eased push-in: {r}");
 }
 
 /// punch_max_static is a real, respected knob: set high enough, a short single take is left exactly as
