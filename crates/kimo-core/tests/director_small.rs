@@ -1,6 +1,7 @@
 //! Small-model director prep (2026-10-21): a fixed eval (tools/director_eval) had small models drive kimo over MCP. Each test
 //! here is a failure they hit, or a tool that does in one call what they kept getting wrong in twenty.
 use kimo_core::commands::{dispatch, Session};
+use kimo_core::model::Source;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -626,6 +627,128 @@ fn gray_pixels(png: &str, w: usize, h: usize) -> Vec<u8> {
     let small: Vec<&Value> = r["problems"].as_array().unwrap().iter().filter(|p| p["code"] == json!("text_too_small")).collect();
     assert!(small.iter().any(|p| p["clip_id"] == json!(c)), "size 11 on a 640-high frame not flagged: {r}");
     assert!(!small.iter().any(|p| p["clip_id"] == json!(ok)), "size 40 flagged: {r}");
+}
+
+/// 8.5.4: lint_edit's own auto-fix for text_too_small used to write ONLY the clip's base `scale`
+/// value (via set_property). A Prop's base is never consulted again once it has any keyframes
+/// (keyframe.rs raw() returns the last key's value past the last key time, the interpolated value
+/// between keys otherwise) -- so on a text clip with a real entrance/exit pop-in scale animation
+/// (0 -> 1 -> 1 -> 0, the shape an end card like "SUBSCRIBE FOR MORE" actually uses), the old fix
+/// reported ok:true and changed nothing a viewer could see. The fix must now target the rendered
+/// size directly (font `size`, not the animated `scale`) so it survives a keyframed scale.
+#[test] fn text_too_small_fix_works_when_scale_is_keyframed() {
+    let mut ss = portrait(); let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let c = sid(&call(&mut ss, "add_text", json!({"track_id": t, "text": "SUBSCRIBE FOR MORE", "start": 0, "duration": 2, "size": 14})), "clip_id");
+    // entrance/exit pop-in: 0 -> 1 -> 1 -> 0 across the clip; lint_edit measures at mid-clip (t=1.0),
+    // which sits on the flat plateau at scale=1.0 -- exactly like the real end card.
+    call(&mut ss, "set_keyframe", json!({"clip_id": c, "property": "scale", "time": 0.0, "value": 0.0}));
+    call(&mut ss, "set_keyframe", json!({"clip_id": c, "property": "scale", "time": 0.3, "value": 1.0}));
+    call(&mut ss, "set_keyframe", json!({"clip_id": c, "property": "scale", "time": 1.7, "value": 1.0}));
+    call(&mut ss, "set_keyframe", json!({"clip_id": c, "property": "scale", "time": 2.0, "value": 0.0}));
+
+    let r = call(&mut ss, "lint_edit", json!({"platform": "none"}));
+    let hit = r["problems"].as_array().unwrap().iter().find(|p| p["code"] == json!("text_too_small") && p["clip_id"] == json!(c))
+        .unwrap_or_else(|| panic!("size 14 text (even with scale settled at 1.0 at mid-clip) should be flagged: {r}"));
+
+    let fix = hit["fix"].clone();
+    assert_eq!(fix["tool"], json!("set_text"), "the fix must target size, not the keyframed scale property: {fix}");
+    call(&mut ss, fix["tool"].as_str().unwrap(), fix["args"].clone());
+
+    let r2 = call(&mut ss, "lint_edit", json!({"platform": "none"}));
+    assert!(!r2["problems"].as_array().unwrap().iter().any(|p| p["code"] == json!("text_too_small") && p["clip_id"] == json!(c)),
+        "the old fix wrote only the base scale, which a keyframed Prop never reads again -- lint_edit must agree the fix actually reached the screen: {r2}");
+
+    // the pop-in animation itself must be untouched -- still animates 0 -> 1 -> 1 -> 0
+    let keys = &ss.project.find_clip(&c).unwrap().props["scale"].keys;
+    assert_eq!(keys.len(), 4, "the fix must not have touched the scale keyframes: {keys:?}");
+}
+
+/// 8.5.4: a real end card found by the montage review. subscribe_pop's own pill is correctly sized
+/// for its OWN default text size (text_size = 30*k) -- but that default is, by construction, always
+/// exactly half of lint_edit's min_px threshold (min_px = min(w,h)/18 = 2 * (30 * min(w,h)/1080)), so
+/// EVERY subscribe_pop end card on a non-1080p canvas gets flagged text_too_small and, once the fix
+/// above actually reaches the screen, gets its font size roughly doubled -- which overflows a pill
+/// that was never told the text grew. The pill must grow with it.
+#[test] fn subscribe_pop_pill_grows_with_the_text_too_small_fix() {
+    let mut ss = Session::new(); call(&mut ss, "project_set", json!({"width": 1280, "height": 720, "fps": 30}));
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let r = call(&mut ss, "add_title", json!({"track_id": t, "style": "subscribe_pop", "text": "SUBSCRIBE FOR MORE", "start": 0.0, "duration": 2.5}));
+    let ids: Vec<String> = r["clip_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let pill_id = ids[0].clone(); // subscribe_pop pushes [pill, dot, text]
+    let text_id = ids[2].clone();
+
+    let before = call(&mut ss, "lint_edit", json!({"platform": "none"}));
+    assert!(before["problems"].as_array().unwrap().iter().any(|p| p["code"] == json!("text_too_small") && p["clip_id"] == json!(text_id)),
+        "a subscribe_pop badge's own default text size should be flagged too-small on a 720p canvas: {before}");
+
+    let pill_w_before = match &ss.project.find_clip(&pill_id).unwrap().source { Source::Shape { width, .. } => *width, s => panic!("not a shape: {s:?}") };
+
+    let fixes = call(&mut ss, "apply_review_fixes", json!({"codes": ["text_too_small"]}));
+    assert_eq!(fixes["failed"], json!([]), "{fixes}");
+
+    let after = call(&mut ss, "lint_edit", json!({"platform": "none"}));
+    assert!(!after["problems"].as_array().unwrap().iter().any(|p| p["code"] == json!("text_too_small")), "the fix should clear the problem: {after}");
+
+    // the text actually got bigger (that's the part of this fix that was already proven above) ...
+    let bounds = call(&mut ss, "compute_text_bounds", json!({"clip_id": text_id}));
+    let text_w = bounds["canvas_rect"][2].as_f64().unwrap();
+    // ... and the pill grew to match it, rather than sitting at its original (now too-narrow) width.
+    let pill_w_after = match &ss.project.find_clip(&pill_id).unwrap().source { Source::Shape { width, .. } => *width, s => panic!("not a shape: {s:?}") };
+    assert!(pill_w_after > pill_w_before, "the pill must grow past its original {pill_w_before}px once the text behind it got bigger: now {pill_w_after}px");
+    assert!(pill_w_after > text_w, "the pill ({pill_w_after}px) must stay wider than the text it backs ({text_w}px) -- a narrower pill is the exact overflow Tab saw on the montage's end card");
+}
+
+
+/// 8.5.4, second pass (Tab's montage review of the pill fix above, at full render size): the
+/// text_too_small fix grows the pill to match the enlarged text, but subscribe_pop's own dot
+/// (tagged "dot_for:<text id>" in titles.rs, same convention as the pill's "pill_for:<text id>")
+/// was left at its OLD x -- the clearance it had past the OLD, narrower pill's left edge. Once the
+/// pill grows, that same edge moves further left than the dot, so the dot that used to sit clear of
+/// the badge now lands ON TOP of the enlarged text's first letter ("SUBSCRIBE FOR MORE"'s "B", on the
+/// real montage render Tab watched). The fix must carry the dot's own clearance forward, not just the
+/// pill's size: same gap past the pill's edge, no overlap with the (now bigger) text it sits beside.
+#[test] fn subscribe_pop_dot_clears_the_text_after_the_pill_resize_fix() {
+    let mut ss = Session::new(); call(&mut ss, "project_set", json!({"width": 1280, "height": 720, "fps": 30}));
+    let t = sid(&call(&mut ss, "add_track", json!({})), "track_id");
+    let r = call(&mut ss, "add_title", json!({"track_id": t, "style": "subscribe_pop", "text": "SUBSCRIBE FOR MORE", "start": 0.0, "duration": 2.5}));
+    let ids: Vec<String> = r["clip_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let pill_id = ids[0].clone(); let dot_id = ids[1].clone(); let text_id = ids[2].clone(); // subscribe_pop pushes [pill, dot, text]
+
+    fn shape_wh(ss: &Session, id: &str) -> (f64, f64) {
+        match &ss.project.find_clip(id).unwrap().source { Source::Shape { width, height, .. } => (*width, *height), s => panic!("not a shape: {s:?}") }
+    }
+    // dot's clearance past the pill's own left edge, both read at mid-clip (where lint_edit measures too)
+    fn dot_gap(ss: &Session, pill_id: &str, dot_id: &str) -> f64 {
+        let pill = ss.project.find_clip(pill_id).unwrap(); let dot = ss.project.find_clip(dot_id).unwrap();
+        let (pill_w, _) = shape_wh(ss, pill_id); let (dot_w, _) = shape_wh(ss, dot_id);
+        let pill_x = kimo_core::render::resolve_xform(&ss.project, pill, pill.duration / 2.0).x;
+        let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
+        (pill_x - pill_w / 2.0) - (dot_x + dot_w / 2.0) // pill's left edge minus the dot's right edge
+    }
+
+    let gap_before = dot_gap(&ss, &pill_id, &dot_id);
+    assert!(gap_before > 0.0, "the dot must start clear of the pill, outside its left edge: gap {gap_before}px");
+
+    let fixes = call(&mut ss, "apply_review_fixes", json!({"codes": ["text_too_small"]}));
+    assert_eq!(fixes["failed"], json!([]), "{fixes}");
+    assert!(ss.project.find_clip(&dot_id).is_some(), "the dot clip must survive the fix chain");
+
+    let gap_after = dot_gap(&ss, &pill_id, &dot_id);
+    assert!((gap_after - gap_before).abs() < 0.5,
+        "the dot's clearance past the pill's edge must carry forward unchanged by the resize: was {gap_before}px, now {gap_after}px");
+
+    // the thing Tab actually saw on the render: the dot's own bbox must not intersect the (now bigger) text's bbox
+    let (cw, _) = (1280.0_f64, 720.0_f64);
+    let (dot_w, _) = shape_wh(&ss, &dot_id);
+    let dot = ss.project.find_clip(&dot_id).unwrap();
+    let dot_x = kimo_core::render::resolve_xform(&ss.project, dot, dot.duration / 2.0).x;
+    let dot_right_canvas = cw / 2.0 + dot_x + dot_w / 2.0;
+
+    let bounds = call(&mut ss, "compute_text_bounds", json!({"clip_id": text_id}));
+    let rect = bounds["canvas_rect"].as_array().unwrap_or_else(|| panic!("no canvas_rect: {bounds}"));
+    let text_left_canvas = rect[0].as_f64().unwrap();
+    assert!(dot_right_canvas <= text_left_canvas + 0.5,
+        "the dot (right edge at {dot_right_canvas}px) must sit clear, left of the enlarged text (starting at {text_left_canvas}px) -- this is the exact overlap Tab saw on the montage's end card");
 }
 
 

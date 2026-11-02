@@ -64,6 +64,7 @@ pub fn commands() -> Vec<Command> { vec![
             ("mix", n("0..1, overall strength at full ramp, default 1.0")),
             ("start_time", n("clip-local seconds the effect ramps in from, default 0")),
             ("end_time", n("clip-local seconds the effect ramps out by, default the clip's own duration")),
+            ("fade", n("override: seconds the mix ramp takes in/out, default 15% of (end_time - start_time), minimum 0.05s. A caller whose graph pulses on its own internal period (e.g. a punch-and-recover glitch) can cap this below the generic default so a short clip's fade doesn't still be ramping through the FIRST pulse, muting it")),
             ("mask_clip_id", s("optional: another clip (e.g. a track_matte output) rendered at the SAME instant and exposed to the graph as the \"__mask_clip__\" input -- see vfx_graph_describe's time note")),
             ("effect_id", s("the effect_id returned by an earlier add_vfx_graph call, to update that same graph instead of adding a new one")),
             ("remove", json!({"type":"boolean","description":"true removes the clip's vfx_graph (or the one named by effect_id)"}))], &["clip_id"]),
@@ -83,7 +84,8 @@ pub fn commands() -> Vec<Command> { vec![
             let mix = num(a, "mix", 1.0, 0.0, 1.0)?;
             let start = num(a, "start_time", 0.0, 0.0, dur)?;
             let end = num(a, "end_time", dur, start, dur)?;
-            let fade = ((end - start) * 0.15).max(0.05);
+            let default_fade = ((end - start) * 0.15).max(0.05);
+            let fade = match a.get("fade").and_then(|v| v.as_f64()) { Some(f) if f.is_finite() && f > 0.0 => f, _ => default_fade };
             let mut params: std::collections::BTreeMap<String, Prop> = std::collections::BTreeMap::new();
             params.insert("mix".into(), ramp_prop(start, end, mix, fade));
             let mut strings: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();

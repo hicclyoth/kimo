@@ -1004,8 +1004,41 @@ fn lint_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         let Source::Text { text, font, size, .. } = &c.source else { continue };
         let scale = crate::render::resolve_xform(&ss.project, c, c.duration / 2.0).scale; let eff = size * scale;  // the drawn scale mid-clip, parenting included
         if eff < min_px && ss.project.editorial.captions.iter().all(|(_, g)| !g.clips.iter().any(|x| x == &c.id)) {
+            // The fix must reach the screen even when `scale` carries keyframes (an entrance/exit pop-in
+            // curve, e.g.): once a Prop has any keys, its `base` is never read again (see keyframe.rs's
+            // raw()), so writing only the base via set_property is a silent no-op there. Targeting the
+            // text's own `size` field (plain f64, not a Prop, so it has no keyframes to be overridden by)
+            // raises the SAME rendered pixel size at the point lint_edit measured (mid-clip, with
+            // whatever scale -- keyframed or not -- already applies there) without touching the animation.
+            let new_size = r3(size * min_px / eff.max(0.001));
+            // A subscribe_pop-style pill is tagged "pill_for:<this clip id>" on the Shape clip that backs
+            // it (titles.rs). Growing the text without it leaves a pill sized for the OLD, smaller text --
+            // exactly the "text overflows the pill on both sides" bug this fix must not re-introduce -- so
+            // chain a second step that re-measures and resizes that pill for the new size, same formula
+            // titles.rs used to build it in the first place. A subscribe_pop dot is tagged the same way
+            // ("dot_for:<this clip id>"); left at its old x it sits at the clearance it had past the OLD,
+            // narrower pill's edge -- once the pill above grows, that edge moves past the dot, landing the
+            // dot on top of the enlarged text's first letter (Tab's montage review, 8.5.4 second pass). A
+            // third chained step recomputes the dot's x with the SAME formula titles.rs built it with,
+            // using the new pill width, so its clearance past the pill's edge never drifts out of sync.
+            let k = h.min(w) / 1080.0;
+            let want_pill_role = format!("pill_for:{}", c.id);
+            let pill = ss.project.tracks.iter().flat_map(|t| t.clips.iter()).find(|o| o.role.as_deref() == Some(want_pill_role.as_str()));
+            let want_dot_role = format!("dot_for:{}", c.id);
+            let dot = ss.project.tracks.iter().flat_map(|t| t.clips.iter()).find(|o| o.role.as_deref() == Some(want_dot_role.as_str()));
+            let then = pill.map(|p| {
+                let new_pill_w = crate::titles::pill_width_for_text(text, font, new_size, w, k);
+                let mut pill_fix = json!({"tool": "set_shape_size", "args": {"clip_id": p.id, "width": r3(new_pill_w)}});
+                if let Some(d) = dot { if let Source::Shape { width: dot_w, .. } = &d.source {
+                    let new_dot_x = crate::titles::dot_x_for_pill(new_pill_w, *dot_w, k);
+                    pill_fix["then"] = json!({"tool": "set_property", "args": {"clip_id": d.id, "property": "x", "value": r3(new_dot_x)}});
+                } }
+                pill_fix
+            });
+            let mut fix = json!({"tool": "set_text", "args": {"clip_id": c.id, "size": new_size}});
+            if let Some(then) = then { fix["then"] = then; }
             probs.push(json!({"code": "text_too_small", "clip_id": c.id, "size": r3(eff), "message": format!("text '{}' is {:.0} px, under {:.0} px it is hard to read on a phone", text.chars().take(24).collect::<String>(), eff, min_px),
-                "fix": {"tool": "set_property", "args": {"clip_id": c.id, "property": "scale", "value": r3(min_px / size.max(1.0))}}})); }
+                "fix": fix})); }
         let miss = crate::text::missing_glyphs(text, font, c.text_fx.as_ref().map(|x| x.weight).unwrap_or(0.0));
         if !miss.is_empty() { let m: String = miss.iter().collect();
             probs.push(json!({"code": "missing_glyph", "clip_id": c.id, "chars": m, "message": format!("the font has no glyph for '{m}' (emoji or symbol); it is left out of the picture"), "fix": {"tool": "set_text", "args": {"clip_id": c.id, "text": "<the text without those characters>"}}})); }

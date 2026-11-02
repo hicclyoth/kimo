@@ -7,6 +7,23 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 static FONTS: OnceLock<Mutex<HashMap<String, std::sync::Arc<FontVec>>>> = OnceLock::new();
+/// 8.5.4: names of fonts we have already warned about falling back for -- `resolve_font_info` is called
+/// on every glyph/frame touching a text clip, so without dedup a missing font would flood stderr with
+/// the same line thousands of times over a render. Keyed by the requested name so a SECOND distinct
+/// missing font still gets its own warning.
+static WARNED_FONTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// Returns the warning message the FIRST time `name` falls back to a substitute, None every time after
+/// (for that same name) -- the dedup is a pure, testable decision separate from the eprintln side effect,
+/// so a test can assert "exactly once" without capturing the process's real stderr.
+fn font_fallback_warning(name: &str) -> Option<String> {
+    let set = WARNED_FONTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut g = set.lock().unwrap();
+    if g.insert(name.to_string()) {
+        Some(format!("kimo: font '{name}' was not found, so text using it is drawn with a fallback system font -- set KIMO_FONTS to the folder holding the preset fonts, or run `bash fonts/fetch.sh` in the repo to fetch them"))
+    } else {
+        None
+    }
+}
 fn norm(s: &str) -> String { let mut n: String = s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect(); for suf in ["variablefont", "var", "regular"] { if n.ends_with(suf) && n.len() > suf.len() { n.truncate(n.len() - suf.len()); } } n }
 pub fn font_dirs() -> Vec<std::path::PathBuf> { let mut v = vec![]; if let Ok(d) = std::env::var("KIMO_FONTS") { v.push(d.into()); }
     if let Ok(e) = std::env::current_exe() { let mut p = e.clone(); for _ in 0..4 { p.pop(); v.push(p.join("fonts")); } }
@@ -18,6 +35,11 @@ pub fn all_fonts() -> Vec<(String, std::path::PathBuf)> { let mut files = vec![]
 pub fn resolve_font_info(name: &str) -> (String, bool) { if std::path::Path::new(name).is_file() { return (name.into(), false); } if crate::deps::font_is_path(name) { let r = crate::deps::resolve_str(name); if std::path::Path::new(&r).is_file() { return (r, false); } } let want = norm(name); let fonts = all_fonts();
     if let Some((_, p)) = fonts.iter().find(|(s, _)| norm(s) == want) { return (p.to_string_lossy().into(), false); }
     if let Some((_, p)) = fonts.iter().find(|(s, _)| norm(s).starts_with(&want)) { return (p.to_string_lossy().into(), false); }
+    // 8.5.4: the bundled preset fonts (KIMO_FONTS) are missing, so we're about to fall back to Montserrat-if-
+    // present or DejaVu/system -- this silently changed the whole look of every title using `name` with no
+    // signal anywhere except lint_edit's own font_substituted check, which only runs if someone calls lint_edit.
+    // One clear stderr line per distinct missing font name says so at the moment it actually happens.
+    if let Some(msg) = font_fallback_warning(name) { eprintln!("{msg}"); }
     if let Some((_, p)) = fonts.iter().find(|(s, _)| norm(s) == "montserrat") { return (p.to_string_lossy().into(), true); }
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(), true) }
 pub fn resolve_font(name: &str) -> String { resolve_font_info(name).0 }
@@ -201,4 +223,43 @@ pub fn render_text(fr: &mut Frame, text: &str, fontpath: &str, size: f64, col: [
     match grad { Some((a, b)) => over(fr, &main, &|i| { let y = (i / w) as f32; let t_ = ((y - by0) / bh).clamp(0.0, 1.0); [(a[0] + (b[0] - a[0]) * t_ as f64) as f32, (a[1] + (b[1] - a[1]) * t_ as f64) as f32, (a[2] + (b[2] - a[2]) * t_ as f64) as f32] }, 1.0),
         None => over(fr, &main, &|_| [col[0] as f32, col[1] as f32, col[2] as f32], 1.0) }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod font_fallback_warning_tests {
+    use super::*;
+
+    /// 8.5.4: a missing bundled font used to fall back to DejaVu/system with zero signal anywhere except
+    /// lint_edit's own check (which only runs if someone calls it). The resolver itself must now say so,
+    /// exactly once per distinct missing name -- not once per call (resolve_font_info runs per glyph/frame).
+    #[test]
+    fn warns_exactly_once_per_distinct_missing_font_name() {
+        let name = "Totally_Not_A_Real_Font_8_5_4_xyz";
+        let first = font_fallback_warning(name);
+        assert!(first.is_some(), "the first fallback for a missing font should produce a warning");
+        let msg = first.unwrap();
+        assert!(msg.contains(name), "the warning must name the missing font: {msg}");
+        assert!(msg.contains("KIMO_FONTS"), "the warning must say how to fix it (KIMO_FONTS): {msg}");
+        assert!(msg.contains("fonts/fetch.sh"), "the warning must say how to fix it (fonts/fetch.sh): {msg}");
+
+        let second = font_fallback_warning(name);
+        assert!(second.is_none(), "a SECOND fallback for the SAME missing font must not warn again: {second:?}");
+
+        // a DIFFERENT missing name still gets its own warning -- the dedup is per-name, not global
+        let other = font_fallback_warning("Another_Missing_Font_8_5_4_xyz");
+        assert!(other.is_some(), "a different missing font name must still warn");
+    }
+
+    /// The warning must be a pure side channel: resolve_font_info's actual return value (the resolved path
+    /// and whether it substituted) is identical whether or not this is the first time that name fell back.
+    #[test]
+    fn the_warning_never_changes_what_resolve_font_info_returns() {
+        let name = "Yet_Another_Missing_Font_8_5_4_xyz";
+        let (path1, sub1) = resolve_font_info(name);
+        let (path2, sub2) = resolve_font_info(name); // second call: dedup means no warning fires this time
+        assert_eq!(path1, path2, "the resolved path must not depend on whether the warning already fired");
+        assert_eq!(sub1, sub2);
+        assert!(sub1, "a made-up font name should report substituted=true");
+    }
 }

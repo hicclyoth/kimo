@@ -95,6 +95,11 @@ pub(super) fn tools(eff_kinds: &[&str]) -> Vec<Command> {
         run: |ss, a| { let c = clip(&mut ss.project, a)?; if let Source::Text { text, size, color: col, .. } = &mut c.source {
             if let Some(t) = a.get("text").and_then(|v| v.as_str()) { *text = t.replace("\\n", "\n"); } if let Some(v) = a.get("size").and_then(|v| v.as_f64()) { *size = v; }
             if a.get("color").is_some() { *col = color(a, "color", *col)?; } Ok(json!({"ok":true})) } else { Err("not a text clip".into()) } } },
+    Command { name: "set_shape_size", description: "Set a shape clip's own width and height in pixels. This is the shape's size field (rect/ellipse/polygon/line), independent of its animated scale -- not a Prop, so it has no keyframes of its own to fight. Use this to resize a box/pill that backs a text label (e.g. a subscribe_pop pill) after the text it hugs changes size, so the box keeps matching the rendered text bounds instead of staying the width it was first built for.", mutates: true,
+        schema: obj(vec![("clip_id", s("shape clip")), ("width", n("pixels")), ("height", n("pixels"))], &["clip_id"]),
+        run: |ss, a| { let c = clip(&mut ss.project, a)?; if let Source::Shape { width, height, .. } = &mut c.source {
+            if let Some(v) = a.get("width").and_then(|v| v.as_f64()) { *width = v; } if let Some(v) = a.get("height").and_then(|v| v.as_f64()) { *height = v; }
+            Ok(json!({"ok":true})) } else { Err("not a shape clip".into()) } } },
     Command { name: "set_mask", description: "Set a mask on a clip: shape rect|ellipse|linear, normalized cx,cy,w,h (0..1), feather (0..1), rotation (deg), invert. Mask params are keyframable via set_mask_keyframe.", mutates: true,
         schema: obj(vec![("clip_id", s("clip")), ("shape", json!({"type":"string","enum":["rect","ellipse","linear"]})), ("cx", n("0..1")), ("cy", n("0..1")), ("w", n("0..1")), ("h", n("0..1")), ("feather", n("0..1")), ("rotation", n("degrees")), ("invert", json!({"type":"boolean"}))], &["clip_id","shape"]),
         run: |ss, a| { let shape = str_arg(a, "shape")?.to_string(); let mut props = std::collections::BTreeMap::new();

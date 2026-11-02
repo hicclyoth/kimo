@@ -108,6 +108,15 @@ fn pulse_prop(period: f64, low: f64, high: f64) -> Value {
 }
 const SRC: &str = "__frame__";
 
+/// 8.5.4: the pulse period (seconds) a look's own punch-and-recover graph repeats on, for looks built on
+/// `pulse_prop` -- exposed so a caller (apply_vfx_preset) can cap the TOP-LEVEL mix ramp's fade-in/out by
+/// it. Without this, a short clip's fade (15% of the clip-local window, apply_vfx_preset's generic default)
+/// can last longer than a pulse's own attack+hold, muting the very first punch while mix is still ramping
+/// up. None for looks with no internal pulse (the generic fade is already fine for a steady grade/particle look).
+pub fn pulse_period(name: &str) -> Option<f64> {
+    match name { "glitch_surge" => Some(0.6), _ => None }
+}
+
 pub const NAMES: [&str; 9] = ["ember_drift", "chrome_bloom", "glitch_surge", "dream_haze", "frost_veil", "magic_sparkle", "vhs_decay", "aurora_wash", "solar_flare"];
 
 pub fn describe(name: &str) -> Option<&'static str> {
@@ -152,10 +161,20 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // redone as cool temperature + desaturation + a touch more contrast, instead of relying on fringe alone.
         // Chromatic aberration and sharpen are dialled back from an earlier pass that aliased badly on a patterned
         // shirt at i=1.0 (visible moire from the fringe amplifying a high-frequency pattern).
+        // V8.5.4: the montage review found this still too subtle at auto_edit's own default intensity (0.45) on
+        // a busy, warmly-lit real shot -- it read as "a nice grade", not a distinct look. Root cause: the SAME
+        // trap frost_veil hit in 8.5.2 -- `temperature`'s amount is scaled 0.2x internally (effects.rs), so even
+        // -(0.22+0.3*i) at i=0.45 is only a flat +-0.07ish RGB shift, easily swamped by warm real lighting.
+        // Replaced with `color_wheels` (lift/gain pushed blue over highlights and shadows both), the same fix
+        // frost_veil used: far stronger and controllable, with no flat internal scale-down. Chromatic aberration,
+        // sharpen and bloom are left exactly as they were (the moire/washout ceilings already tuned for those).
         "chrome_bloom" => json!({"nodes": [
             eff("split", SRC, "chromatic_aberration", json!({"amount": 1.3 + 2.8 * i})),
             eff("sharp", "split", "sharpen", json!({"amount": 0.12 + 0.18 * i})),
-            eff("cool", "sharp", "temperature", json!({"amount": -(0.22 + 0.3 * i)})),
+            eff("cool", "sharp", "color_wheels", json!({
+                "lift_r": -(0.02 + 0.03 * i), "lift_b": 0.02 + 0.03 * i,
+                "gain_r": 1.0 - (0.14 + 0.22 * i), "gain_g": 1.0 - (0.02 + 0.03 * i), "gain_b": 1.0 + (0.22 + 0.3 * i),
+            })),
             eff("desat", "cool", "saturation", json!({"amount": (1.0 - 0.22 * i).max(0.55)})),
             eff("contrast", "desat", "contrast", json!({"amount": 1.0 + 0.18 * i})),
             eff("out", "contrast", "bloom", json!({"amount": 0.45 + 0.65 * i, "threshold": 0.52, "tint_r": 0.75, "tint_g": 0.87, "tint_b": 1.0})),
@@ -173,8 +192,14 @@ pub fn graph_for(name: &str, i: f64) -> Result<Value, String> {
         // between hits everything settles to near zero (clean) with only a light scanline texture.
         "glitch_surge" => json!({"nodes": [
             eff("bigblocks", SRC, "glitch_blocks", json!({"amount": pulse_prop(0.6, 0.0, 50.0 + 60.0 * i), "slices": 9.0, "rate": 8.0, "slice_threshold": 0.25, "green_offset": 14.0 + 10.0 * i})),
-            eff("fineblocks", "bigblocks", "glitch_blocks", json!({"amount": pulse_prop(0.6, 1.5 + 1.5 * i, 18.0 + 16.0 * i), "slices": 24.0, "rate": 20.0, "slice_threshold": 0.45, "green_offset": 6.0})),
-            eff("split", "fineblocks", "rgb_split", json!({"amount": pulse_prop(0.6, 0.4 + 0.4 * i, 14.0 + 16.0 * i)})),
+            // 8.5.4: fineblocks and rgb_split used to rest at a nonzero "low" (1.5+1.5*i, 0.4+0.4*i) between
+            // punches -- meant as a light fringe/scanline texture on a long demo clip, but the montage review
+            // found it reads as a sustained wash with no clean recovery on a short real cutaway. bigblocks
+            // above already rests at a true 0; these two now match it. The constant `scanlines` node below
+            // is the actual "light texture between hits" carrier and is untouched, so the long-clip look is
+            // unaffected -- only this redundant nonzero hum is gone.
+            eff("fineblocks", "bigblocks", "glitch_blocks", json!({"amount": pulse_prop(0.6, 0.0, 18.0 + 16.0 * i), "slices": 24.0, "rate": 20.0, "slice_threshold": 0.45, "green_offset": 6.0})),
+            eff("split", "fineblocks", "rgb_split", json!({"amount": pulse_prop(0.6, 0.0, 14.0 + 16.0 * i)})),
             eff("out", "split", "scanlines", json!({"amount": 0.08 + 0.1 * i, "spacing": 3.0})),
         ], "output": "out"}),
         // V8.5.1: added a real halation pass (the dedicated `halation` effect, not just bloom) for the "clear

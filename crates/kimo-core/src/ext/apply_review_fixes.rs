@@ -59,15 +59,26 @@ fn apply_review_fixes(ss: &mut Session, a: &Value) -> Result<Value, String> {
         match dispatch_nested(ss, tool, &args) {
             Ok(result) => {
                 let mut entry = json!({"code": code, "clip_id": p.get("clip_id"), "tool": tool, "args": args, "result": result});
-                // A "then" step (e.g. move_clip then trim_clip) is applied only if the primary succeeded and it is itself concrete.
-                if let Some(then_fix) = fix.get("then") {
-                    if let Some((then_tool, then_args)) = dispatchable(then_fix) {
-                        match dispatch_nested(ss, then_tool, &then_args) {
-                            Ok(tr) => entry["then_result"] = json!({"tool": then_tool, "args": then_args, "result": tr}),
-                            Err(e) => entry["then_failed"] = json!({"tool": then_tool, "args": then_args, "error": e}),
-                        }
+                // A "then" step (e.g. move_clip then trim_clip) is applied only if the primary succeeded and
+                // it is itself concrete. `then` can itself carry a further `then` (e.g. subscribe_pop's
+                // text_too_small fix: resize the text, THEN resize the pill it backs, THEN reposition the
+                // pill's own dot past the pill's new edge) -- walk the whole chain, not just one hop, so a
+                // fix generator can describe an arbitrary sequence of dependent steps in one `fix` value. The
+                // first hop keeps the old single `then_result`/`then_failed` keys (unchanged shape for every
+                // existing one-hop fix); `then_results` additionally lists every hop, in order, when there is
+                // more than one -- a chain stops at the first step that fails or isn't concrete.
+                let mut hop = fix.get("then").cloned(); let mut hops: Vec<Value> = vec![];
+                while let Some(step) = hop {
+                    let Some((step_tool, step_args)) = dispatchable(&step) else { break };
+                    match dispatch_nested(ss, step_tool, &step_args) {
+                        Ok(tr) => { hops.push(json!({"tool": step_tool, "args": step_args, "result": tr})); hop = step.get("then").cloned(); }
+                        Err(e) => { hops.push(json!({"tool": step_tool, "args": step_args, "error": e})); hop = None; }
                     }
                 }
+                if let Some(first) = hops.first() {
+                    if first.get("error").is_some() { entry["then_failed"] = first.clone(); } else { entry["then_result"] = first.clone(); }
+                }
+                if hops.len() > 1 { entry["then_results"] = json!(hops); }
                 applied.push(entry);
             }
             Err(e) => failed.push(json!({"code": code, "clip_id": p.get("clip_id"), "tool": tool, "args": args, "error": e})),

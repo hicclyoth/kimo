@@ -1,3 +1,57 @@
+## v8.5.4 (2026-11-02)
+
+A real-footage review montage (3 looks, boxed captions, driven end to end through the MCP tools an AI
+director would use) surfaced five things that read as amateur even though every individual unit test
+was green. Fixed below, each with a failing-first test.
+
+- **`lint_edit`'s `text_too_small` auto-fix was a silent no-op on animated text.** The fix wrote only the
+  clip's base `scale` Prop; once a Prop carries any keyframes (e.g. a pop-in entrance/exit curve), the
+  base value is never read again, so the "SUBSCRIBE FOR MORE" end card stayed exactly as small as lint
+  had just flagged it. The fix now scales the text's own `size` field directly (a plain f64, not a Prop,
+  so it has no keyframes to be overridden by) -- it reaches the screen whatever the clip's scale
+  animation is doing.
+- **The end-card pill overflowed its own text once the text above was enlarged, and once that was fixed
+  its own dot landed on the enlarged text instead.** A `subscribe_pop`-style pill is built once, sized
+  for the text's original width; growing the text (by the fix above, or by hand) left it narrower than
+  the label it was supposed to back. The pill shape is now tagged to the text clip it backs, a new
+  `set_shape_size` tool resizes a shape clip's pixel width/height independent of any animated scale, and
+  `lint_edit`'s own fix now chains a pill resize after the text resize so the box is always re-measured
+  from the new rendered text bounds. That pill resize left a second bug: the badge's own white dot sits
+  outside the pill at a fixed offset computed from the pill's width at build time, and once the pill grew
+  wider that same offset put the dot on top of the enlarged text's first letter ("SUBSCRIBE FOR MORE"'s
+  "B", caught on a montage render at full size). The dot is now tagged to the text clip it sits beside the
+  same way, and `lint_edit`'s fix chains a third step that repositions the dot with the SAME clearance
+  formula `titles.rs` used to place it originally, now evaluated against the new, wider pill -- so the
+  dot's gap past the pill's edge never drifts out of sync with a pill that grew after the badge was first
+  laid out. `apply_review_fixes` itself now walks a `fix`'s whole `then` chain (any depth), not just one
+  hop, so a fix generator can describe this kind of multi-step, order-dependent repair in one `fix` value.
+- **`glitch_surge` read as a sustained wash, not punch-and-recover, on short (<~2s) clips.** Two causes:
+  the fine-grain glitch/RGB-split keyframes never rested at a true zero between punches (fine at full
+  clip length, visible as "always on" on a short cutaway), and the preset's own outer mix fade-in was a
+  flat 15% of the clip window regardless of the look's internal pulse period, so a short clip could still
+  be ramping up mix through what should have been a full-strength first hit. Fixed: the low-baseline
+  keys now hit true zero, and `apply_vfx_preset` caps the fade by the look's own pulse period.
+- **`chrome_bloom` was too subtle on real (warm) footage at default intensity.** Same trap `frost_veil`
+  hit in 8.5.2: its cool grade used `temperature`, which is scaled down 5x internally, so the push barely
+  registered against warm lighting. Replaced with `color_wheels` for a controllable, clearly-visible
+  cool push with 0% clipping.
+- **A missing bundled font failed over to a system font with no warning anywhere.** The resolver in
+  `text.rs` now emits one clear stderr warning per distinct missing font, naming it and pointing at
+  `KIMO_FONTS` / `fonts/fetch.sh`, deduped so a long render doesn't spam it. Render output (resolved
+  path, substituted flag) is unchanged.
+
+**The pinned real-footage benchmark md5 intentionally changes** from `82ef81b676c9b78a3428e6d4bc57d8b4`
+to `36c25e57765e76a311a54bfe14ec8f10`. Cause: the benchmark's own end-card text was itself flagged
+`text_too_small` (20px under the 40px floor) and the old auto-fix silently did nothing against it --
+the same bug fixed above. With the fix working, the benchmark's end card is now actually enlarged to
+40px and its pill resized to match, exactly like the montage's end card, and the badge's dot is
+repositioned together with the pill so it stays clear of the enlarged text instead of landing on top of
+it. Verified frame-by-frame (`ffmpeg framemd5`, 656 frames @30fps, 21.867s, identical duration): every
+frame from 0.0s to 18.7s is byte-identical between the old and new render; only the last ~3.1s (the end
+card) differs, confirmed visually with a side-by-side frame comparison. This is the new expected
+benchmark md5 (superseding the intermediate `8d41372662cf1508863564a77b3a79d7`, which had the pill fix
+but not yet the dot fix).
+
 ## v8.5.3 (2026-11-01)
 
 `vhs_decay` still didn't read as VHS in a 4fps/200px-wide thumbnail strip even though the v8.5.2

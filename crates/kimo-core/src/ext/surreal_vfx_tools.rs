@@ -227,7 +227,17 @@ pub fn commands() -> Vec<Command> { vec![
                     let graph = crate::vfx_look_library::graph_for(look, intensity).map_err(|e| format!("apply_vfx_preset: {e}"))?;
                     let dur = ss.project.find_clip(&cid).unwrap().duration;
                     let start = num(&a, "start_time", 0.0, 0.0, dur)?; let end = num(&a, "end_time", dur, start, dur)?;
-                    crate::commands::dispatch(ss, "add_vfx_graph", &json!({"clip_id": cid, "graph": graph, "mix": 1.0, "start_time": start, "end_time": end}))?;
+                    let mut vfx_args = json!({"clip_id": cid, "graph": graph, "mix": 1.0, "start_time": start, "end_time": end});
+                    // 8.5.4: a look that pulses on its own internal period (glitch_surge's punch-and-recover) needs
+                    // its outer mix fade-in capped by that period -- the generic 15%-of-window default can outlast
+                    // the pulse's own attack+hold on a short clip, so mix is still ramping up (muting the effect)
+                    // through what should have been a full-strength first punch. A steady grade/particle look has
+                    // no such internal cadence and keeps the generic default (pulse_period returns None for it).
+                    if let Some(period) = crate::vfx_look_library::pulse_period(look) {
+                        let capped = (((end - start) * 0.15).max(0.05)).min(period * 0.2);
+                        vfx_args["fade"] = json!(capped);
+                    }
+                    crate::commands::dispatch(ss, "add_vfx_graph", &vfx_args)?;
                     applied.push("vfx_graph"); }
             }
             Ok(json!({"clip_id": cid, "preset": preset, "intensity": intensity, "sub_effects": applied})) } },

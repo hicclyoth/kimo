@@ -5,6 +5,26 @@ use crate::model::*;
 use serde_json::{json, Value};
 
 fn clip(ss: &mut Session, source: Source, start: f64, dur: f64) -> Clip { Clip { id: ss.project.gen_id("clip"), source, start, duration: dur, in_point: 0.0, speed: 1.0, speed_curve: None, time_remap: None, speed_blend: Default::default(), props: default_props(), grade_graph: None, effects: vec![], blend: "normal".into(), mask: None, time_mode: TimeMode::Normal, corners: None, audio: Audio::default(), motion_blur: 0.0, echo: None, motion_path: None, posterize_fps: 0.0, text_fx: None, parent: None, inherit: Default::default(), name: None, role: None, tags: vec![], transition_in: None } }
+/// Tight-ink-extent width for a subscribe_pop-style pill badge (V7.7Q): measure the actual drawn
+/// (uppercase, bold) text and pad it, rather than guessing a fixed width. Exposed as its own
+/// function (8.5.4) so a later size fix -- lint_edit's text_too_small auto-fix bumping this same
+/// text's font size after the badge was already built -- can recompute the SAME pill a second time
+/// for the new size, instead of leaving a pill sized for text that no longer exists on screen.
+pub(crate) fn pill_width_for_text(text: &str, font_name: &str, text_size: f64, wpx: f64, k: f64) -> f64 {
+    let upper = text.to_uppercase();
+    let (text_w, _) = crate::text::measure(&upper, font_name, text_size, 0.0, 700.0, "center", wpx).unwrap_or((180.0 * k, 0.0));
+    let side_pad = 56.0 * k; // room on both sides so the pill visibly hugs, not clips, the text
+    (text_w + side_pad).max(190.0 * k) // a one-word label still reads as a normal pill, not a hugged sliver
+}
+/// The subscribe_pop dot's own x offset (clip-local, canvas-center-relative), given a pill of width
+/// `pill_w` and the dot's own width `dot_w` (8.5.4, second pass): both the initial subscribe_pop
+/// build AND the later text_too_small pill-resize fix compute the dot's position from this SAME
+/// formula, so a pill that grows after the badge was first laid out carries the dot's clearance with
+/// it instead of leaving the dot at its old spot -- which, once the pill's own left edge moved further
+/// left than the dot, is what put the dot on top of the enlarged text's first letter (Tab's montage
+/// review, 8.5.4). Negative: the dot sits to the LEFT of the pill, outside it, 14px (scaled) clear.
+pub(crate) fn dot_x_for_pill(pill_w: f64, dot_w: f64, k: f64) -> f64 { -(pill_w / 2.0 + dot_w / 2.0 + 14.0 * k) }
+
 fn an(unit: &str, shape: &str, sm: f64) -> TextAnimator { TextAnimator { id: String::new(), unit: unit.into(), shape: shape.into(), start: Prop::new(0.0), end: Prop::new(1.0), offset: Prop::new(0.0), smoothness: Prop::new(sm), x: Prop::new(0.0), y: Prop::new(0.0), scale: Prop::new(1.0), rotation: Prop::new(0.0), opacity: Prop::new(1.0), tracking: Prop::new(0.0), blur: Prop::new(0.0), random: false, seed: 0, fill: None, fill_amount: None, ease: None, wiggly: None } }
 fn sweep(a: &mut TextAnimator, t0: f64, t1: f64, sm: f64, e: Ease) { let hi = 1.0 + 2.0 * sm.max(0.05); a.offset.set_key(t0, 0.0, e); a.offset.set_key(t1, hi, e); }
 fn num(a: &Value, k: &str, d: f64) -> f64 { a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) }
@@ -98,16 +118,23 @@ pub fn add_title(ss: &mut Session, a: &Value) -> Result<Value, String> {
             // not a fixed px offset that only happened to clear a short word.
             let font_name = font_o.unwrap_or("Montserrat");
             let text_size = 30.0 * k;
-            let upper = text.to_uppercase();
-            let (text_w, _) = crate::text::measure(&upper, font_name, text_size, 0.0, 700.0, "center", wpx).unwrap_or((180.0 * k, 0.0));
-            let side_pad = 56.0 * k; // room on both sides so the pill visibly hugs, not clips, the text
-            let pill_w = (text_w + side_pad).max(190.0 * k); // a one-word label still reads as a normal pill, not a hugged sliver
+            let pill_w = pill_width_for_text(&text, font_name, text_size, wpx, k);
             let pill_h = 66.0 * k; let dot_w = 24.0 * k;
             let y = 260.0 * k;
             let pop = |c: &mut Clip, sh: f64| { let sc = c.props.get_mut("scale").unwrap(); sc.base = 0.0; sc.set_key(0.0, 0.0, Ease::Out); sc.set_key((0.12 - sh).max(0.0), 1.0, Ease::OutBack); sc.set_key((dur - 0.35 - sh).max(0.13), 1.0, Ease::In); sc.set_key((dur - 0.05 - sh).max(0.14), 0.0, Ease::In); c.props.get_mut("opacity").unwrap().base = 1.0; c.props.get_mut("y").unwrap().base = y; };
-            let mut p = clip(ss, Source::Shape { shape: "rect".into(), width: pill_w, height: pill_h, fill: accent, stroke_width: 0.0, stroke_color: [0.0; 3], sides: 4, corner_radius: 33.0 * k }, start, dur); pop(&mut p, 0.0); clips.push(p);
-            let mut d = clip(ss, Source::Shape { shape: "ellipse".into(), width: dot_w, height: dot_w, fill: [1.0, 1.0, 1.0], stroke_width: 0.0, stroke_color: [0.0; 3], sides: 4, corner_radius: 0.0 }, start, dur); pop(&mut d, 0.04); d.props.get_mut("x").unwrap().base = -(pill_w / 2.0 + dot_w / 2.0 + 14.0 * k); clips.push(d);
-            let mut c = clip(ss, txt(&text, font_name, text_size, [1.0, 1.0, 1.0], 0.0, "center"), start, dur); c.text_fx = Some(TextFx { weight: 700.0, uppercase: true, ..Default::default() }); pop(&mut c, 0.0); clips.push(c);
+            let mut p = clip(ss, Source::Shape { shape: "rect".into(), width: pill_w, height: pill_h, fill: accent, stroke_width: 0.0, stroke_color: [0.0; 3], sides: 4, corner_radius: 33.0 * k }, start, dur); pop(&mut p, 0.0);
+            let mut d = clip(ss, Source::Shape { shape: "ellipse".into(), width: dot_w, height: dot_w, fill: [1.0, 1.0, 1.0], stroke_width: 0.0, stroke_color: [0.0; 3], sides: 4, corner_radius: 0.0 }, start, dur); pop(&mut d, 0.04); d.props.get_mut("x").unwrap().base = dot_x_for_pill(pill_w, dot_w, k);
+            let mut c = clip(ss, txt(&text, font_name, text_size, [1.0, 1.0, 1.0], 0.0, "center"), start, dur); c.text_fx = Some(TextFx { weight: 700.0, uppercase: true, ..Default::default() }); pop(&mut c, 0.0);
+            // 8.5.4: tag the pill with the text clip it backs so a later size fix (lint_edit's
+            // text_too_small auto-fix) can grow the pill to match -- the box must track what's
+            // actually drawn, not just the size it was built for at this moment.
+            p.role = Some(format!("pill_for:{}", c.id));
+            // 8.5.4 (second pass): same tag shape for the dot, so that same fix can also carry the
+            // dot's clearance past the pill's edge forward once the pill grows -- without this a
+            // resized pill's own left edge can move past where the dot was left sitting, putting the
+            // dot on top of the (also enlarged) text's first letter (Tab's montage review).
+            d.role = Some(format!("dot_for:{}", c.id));
+            clips.push(p); clips.push(d); clips.push(c);
         }
         o => return Err(format!("unknown style {o}; styles: {:?}", STYLES)),
     }
