@@ -22,7 +22,12 @@ pub struct Cache { frames: HashMap<String, (String, std::sync::Arc<Frames>)>, //
 /// Rendered frames of one code clip: (signature, last slot prepared, slot -> canvas-size straight-alpha RGBA8).
 type CodeSlots = (String, usize, std::collections::BTreeMap<usize, std::sync::Arc<Vec<u8>>>);
 pub struct StaticCrop { x0: usize, y0: usize, x1: usize, y1: usize, d: Vec<f32> }
-impl Cache { pub fn new() -> Self { Cache { frames: HashMap::new(), code: HashMap::new(), size: (0, 0, 0.0), export_mode: false, proxy_clips: Default::default(), statics: std::sync::RwLock::new(HashMap::new()) } } pub fn new_export() -> Self { let mut c = Cache::new(); c.export_mode = true; c } pub fn frames_of(&self, id: &str) -> Option<&Frames> { self.frames.get(id).map(|x| x.1.as_ref()) } }
+impl Cache { pub fn new() -> Self { Cache { frames: HashMap::new(), code: HashMap::new(), size: (0, 0, 0.0), export_mode: false, proxy_clips: Default::default(), statics: std::sync::RwLock::new(HashMap::new()) } } pub fn new_export() -> Self { let mut c = Cache::new(); c.export_mode = true; c } pub fn frames_of(&self, id: &str) -> Option<&Frames> { self.frames.get(id).map(|x| x.1.as_ref()) }
+    /// A cheap point-in-time copy for overlapping export: shares every decoded frame/code-slot buffer by
+    /// Arc (no pixel data is duplicated), so a prefetch thread can decode the next window into its own
+    /// `Cache` instance without aliasing the one the current batch's compose threads are reading.
+    pub fn snapshot(&self) -> Cache { Cache { frames: self.frames.clone(), code: self.code.clone(), size: self.size, export_mode: self.export_mode, proxy_clips: self.proxy_clips.clone(), statics: std::sync::RwLock::new(self.statics.read().map(|g| g.clone()).unwrap_or_default()) } }
+}
 
 /// Still-image extensions the decoder holds as one looped frame (ffmpeg `-loop 1`). One list, read by
 /// `decode` and by `import_media`'s check, so the two cannot drift apart.
@@ -980,30 +985,85 @@ pub fn export_range_opts(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f6
     export_range_cmd(p, path, f0, f1, command, false, with_audio)
 }
 
+/// Decode the batch starting at local index `i` into `cache`, exactly as the old single-threaded export
+/// loop did: start at a batch of `batch` frames and halve it on a cache-budget error (resetting `cache`,
+/// which only ever happens on that rare fallback path). Returns the batch's actual end (exclusive).
+fn decode_batch(p: &Project, cache: &mut Cache, f0: usize, i: usize, n: usize, batch: usize) -> Result<usize, String> {
+    let mut end = (i + batch).min(n);
+    loop {
+        let last = (f0 + end - 1) as f64 / p.fps;
+        match prepare_export_range(p, cache, (f0 + i) as f64 / p.fps, last) {
+            Ok(()) => return Ok(end),
+            Err(e) if end - i > 1 && (e.contains("cache budget") || e.contains("memory cap") || e.contains("bounded cache")) => { end = i + (end - i).div_ceil(2); *cache = Cache::new_export(); }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Shared export loop: render frames f0..f1 into `command`'s stdin (RGBA8), then mux audio when `audio`.
 /// `transparent` renders on a transparent canvas (alpha delivery); the ordinary export passes false.
+///
+/// V8.6.0 overlap: three stages run concurrently instead of the old decode-then-compose-then-write-and-block
+/// sequence. While batch i composes (the existing nt-worker queue below, unchanged), a prefetch thread
+/// decodes batch i+1 into a cheap Arc-sharing `snapshot()` of the cache (so it can't alias the frames compose
+/// is reading), and the encoder runs on its own thread fed by a bounded channel, so the main loop never
+/// blocks on the encoder's pipe — it hands off a composed batch and moves straight to the next one. Output
+/// bytes are unchanged: same frames, same order, same encoder command; see tests/overlap_pipeline.rs
+/// (framemd5-identical to the old sequential path) for the proof.
 pub(crate) fn export_range_cmd(p: &Project, path: &str, f0: usize, f1: usize, mut command: Command, transparent: bool, audio: bool) -> Result<f64, String> {
     let mut cache = Cache::new_export();
     let n = f1 - f0;
     let frame_bytes=(p.width as usize).checked_mul(p.height as usize).and_then(|v|v.checked_mul(4)).ok_or("legacy encoder frame overflow")?;
-    let mut encoder=crate::color::process::EncodeStream::new(&mut command,frame_bytes,crate::color::process::encode_deadline(n))?;
+    let encoder=crate::color::process::EncodeStream::new(&mut command,frame_bytes,crate::color::process::encode_deadline(n))?;
     let nt = crate::guard::export_threads_n(p.width, p.height, std::thread::available_parallelism().map(|x| x.get()).unwrap_or(2).max(1), frame_buffers(p));
-    let mut i = 0;
+    let batch = nt * 4;
+
+    // Encoder-writer thread: owns `encoder`, drains a bounded channel. EncodeStream::write() already
+    // waits on its own internal writer's ack per call (unchanged, see color/process.rs), but that wait now
+    // happens off this function's critical path instead of stalling the compose/decode of the next batch.
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(batch.max(4) * 2);
+    let writer = crate::guard::spawn_with_token(move || -> Result<(), String> {
+        let mut encoder = encoder;
+        for frame in frame_rx { encoder.write(frame)?; }
+        encoder.finish()
+    });
+
     crate::telemetry::progress_frames(0, n, "frames");
-    while i < n {
-        crate::guard::check();
-        let mut end = (i + nt * 4).min(n);
-        loop{let last=(f0+end-1) as f64/p.fps;match prepare_export_range(p,&mut cache,(f0+i) as f64/p.fps,last){Ok(())=>break,Err(e)if end-i>1&&(e.contains("cache budget")||e.contains("memory cap")||e.contains("bounded cache"))=>{end=i+(end-i).div_ceil(2);cache=Cache::new_export();},Err(e)=>return Err(e)}}
-        // work queue: nt workers pull frame indices, so one slow frame (shards) no longer idles the other cores
-        let next = std::sync::atomic::AtomicUsize::new(i); let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>, String>>>> = (i..end).map(|_| std::sync::Mutex::new(None)).collect();
-        std::thread::scope(|sc| { for _ in 0..nt.min(end - i) { let (cache, next, slots) = (&cache, &next, &slots); crate::guard::scope_spawn(sc, move || loop { let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst); if k >= end { break; }
-            let tf0 = std::time::Instant::now(); let res = render_frame_opts(p, (f0 + k) as f64 / p.fps, cache, transparent).and_then(|mut f| {if transparent { unpremultiply(&mut f); } prof("frame_total", tf0); let tq = std::time::Instant::now(); crate::color::pipeline::output(p,&mut f)?; prof("pipe_out", tq); let tq = std::time::Instant::now(); let r = to_rgba8(&f); prof("to_rgba8", tq); Ok(r)}); *slots[k - i].lock().unwrap() = Some(res); }); } });
-        let frames: Vec<Result<Vec<u8>, String>> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-        for f in frames { encoder.write(f?)?; }
-        i = end;
-        crate::telemetry::progress_frames(i, n, "frames");
-    }
-    encoder.finish()?;
+    let loop_result: Result<(), String> = (|| {
+        let mut i = 0usize;
+        let mut end = decode_batch(p, &mut cache, f0, i, n, batch)?;
+        while i < n {
+            crate::guard::check();
+            let mut carried: Option<(Cache, usize)> = None;
+            std::thread::scope(|osc| -> Result<(), String> {
+                // Kick off the NEXT batch's decode now, on a cache snapshot, before composing this one.
+                let prefetch = (end < n).then(|| {
+                    let mut snap = cache.snapshot();
+                    let next_i = end;
+                    crate::guard::scope_spawn(osc, move || decode_batch(p, &mut snap, f0, next_i, n, batch).map(|e| (snap, e)))
+                });
+                // work queue: nt workers pull frame indices, so one slow frame (shards) no longer idles the other cores
+                let next = std::sync::atomic::AtomicUsize::new(i); let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>, String>>>> = (i..end).map(|_| std::sync::Mutex::new(None)).collect();
+                std::thread::scope(|sc| { for _ in 0..nt.min(end - i) { let (cache, next, slots) = (&cache, &next, &slots); crate::guard::scope_spawn(sc, move || loop { let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst); if k >= end { break; }
+                    let tf0 = std::time::Instant::now(); let res = render_frame_opts(p, (f0 + k) as f64 / p.fps, cache, transparent).and_then(|mut f| {if transparent { unpremultiply(&mut f); } prof("frame_total", tf0); let tq = std::time::Instant::now(); crate::color::pipeline::output(p,&mut f)?; prof("pipe_out", tq); let tq = std::time::Instant::now(); let r = to_rgba8(&f); prof("to_rgba8", tq); Ok(r)}); *slots[k - i].lock().unwrap() = Some(res); }); } });
+                let frames: Vec<Result<Vec<u8>, String>> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+                for f in frames { if frame_tx.send(f?).is_err() { return Err("encoder closed early".into()); } }
+                if let Some(handle) = prefetch {
+                    let joined: Result<(Cache, usize), String> = handle.join().map_err(|_| "prefetch decode thread panicked".to_string())?;
+                    let (new_cache, new_end) = joined?;
+                    carried = Some((new_cache, new_end));
+                }
+                Ok(())
+            })?;
+            match carried { Some((new_cache, new_end)) => { cache = new_cache; i = end; end = new_end; } None => { i = end; end = n; } }
+            crate::telemetry::progress_frames(i, n, "frames");
+        }
+        Ok(())
+    })();
+    drop(frame_tx);
+    let writer_result: Result<(), String> = writer.join().map_err(|_| "encoder writer thread panicked".to_string())?;
+    loop_result?;
+    writer_result?;
     // mux mixed audio
     let pcm_full = crate::audio::mix(p); let (s0, s1) = ((f0 as f64 / p.fps * crate::audio::SR as f64) as usize * 2, (f1 as f64 / p.fps * crate::audio::SR as f64) as usize * 2); let pcm: Vec<f32> = { let a = s0.min(pcm_full.len()); let b = s1.min(pcm_full.len()); let mut v = pcm_full[a..b].to_vec(); v.resize(s1 - s0, 0.0); v };
     if audio && pcm.iter().any(|v|v.abs()>1e-6){crate::color::mux::legacy_audio(path,&pcm,n)?}

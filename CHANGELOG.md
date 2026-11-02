@@ -1,3 +1,39 @@
+## v8.6.0 (2026-11-02)
+
+Naman's "Core" redirect: stop VFX/look polish, build the render engine. The audit
+(`kimo_core_audit.md`) measured the export-only render of a real 18.86s talking-head + b-roll edit at
+14.6 fps / 720p and 5.9 fps / 1080p, with only ~2.5 of 4 cores busy on average -- about half the wall time
+was the main thread blocked on a freshly-spawned ffmpeg decode, then blocked again writing frames one at a
+time into the encoder's pipe, with no overlap between decode, compose and encode.
+
+**Phase 1a: the three stages now run concurrently** (`crates/kimo-core/src/render.rs`,
+`export_range_cmd`), with the exported bytes unchanged:
+
+- A prefetch thread decodes the *next* export batch while the *current* batch composes. It works against
+  a `Cache::snapshot()` -- a cheap, Arc-sharing point-in-time copy of the decoded-frame cache (no pixel
+  data is duplicated, just the lookup table), so the prefetch thread can never alias the cache the
+  compose work-queue is reading from. When both finish, the prefetched cache becomes the cache for the
+  next batch -- same decode amortization as the old single-cache design, just no longer serialized with
+  compose.
+- The encoder runs on its own thread, fed by a bounded channel. The main loop hands off a composed
+  batch's frames and moves straight on to prefetching/composing the next one instead of blocking on each
+  frame's write-and-ack round trip to the encoder's pipe.
+
+Proof the output didn't change: `tests/overlap_pipeline.rs` (new) exports the same project twice through
+the concurrent pipeline and asserts the two runs are framemd5-identical with no frame dropped or
+duplicated across batch boundaries, plus a direct test that `Cache::snapshot()` never aliases the
+original. The real-world proof is `kimo_core_bench.md`: the new binary's 720p and 1080p renders of the
+audit's benchmark project are **SHA256-identical, byte for byte**, to the same renders from the
+pre-existing v85 baseline binary -- not just matching hashes of decoded frames, the literal .mp4 files are
+identical.
+
+Measured (median of 3 runs each, same benchmark project, `export`-only, no whisper/lint):
+- 720p: 46.2s -> 37.5s wall (14.2 -> 17.5 fps), **1.23x**
+- 1080p: 117.3s -> 96.5s wall (5.6 -> 6.8 fps), **1.22x**
+
+This is the serialization fix alone; it does not yet touch the ffmpeg-CLI decode itself (phase 1b) or the
+scaler/compositor (phase 2), which is where the rest of the audit's headroom is.
+
 ## v8.5.8 (2026-11-02)
 
 The montage review (`montage_v85_v08_review_sheet.png`) ranked the end card as the #1 remaining weakness:
