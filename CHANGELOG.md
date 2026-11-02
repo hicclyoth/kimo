@@ -1,3 +1,32 @@
+## v8.6.2 (2026-11-02)
+
+Build fix: `ffmpeg-next` (and the `libav_decode` module it backs) is now an **optional** cargo feature,
+`libav`, off by default. v8.6.1 added `ffmpeg-next` as a plain, non-optional dependency of `kimo-core` --
+that meant every build, even one that never sets `KIMO_DECODER=libav`, needed `libav*-dev` headers and
+clang installed just to compile. The decoder itself was already opt-in at runtime; now the dependency is
+opt-in too.
+
+**What changed:** `crates/kimo-core/Cargo.toml` marks `ffmpeg-next` `optional = true` and adds a `libav`
+feature (`dep:ffmpeg-next`); `lib.rs` gates `pub mod libav_decode;` on `#[cfg(feature = "libav")]`;
+`render.rs`'s `KIMO_DECODER=libav` call site is gated the same way, with a companion
+`#[cfg(not(feature = "libav"))]` arm that logs one warning (`eprintln!`, once per process via `OnceLock`)
+and falls straight through to the existing pipe decoder when the feature isn't compiled in, instead of
+silently doing nothing. `tests/libav_vfr_conform.rs` is gated with `required-features = ["libav"]` in a
+`[[test]]` entry, so a default `cargo test` doesn't need the libav headers either.
+
+**Verified both ways:** a default build (`cargo build --profile gate`) and a `--features libav` build both
+compile clean (34 warnings, unchanged). `ldd` on the default binary links no `libavcodec`/`libavformat`/
+`libavutil`/`libswscale`/`libswresample`/`libavfilter`/`libavdevice` at all; the `--features libav` binary
+links all of them. The default decode path (`render.rs::decode()`'s existing ffmpeg-pipe branch) has zero
+line changes in this commit -- only the already-opt-in `KIMO_DECODER=libav` branch and its surrounding
+`#[cfg]` moved, so the default-build output is unaffected by construction; the full scoped test suite
+(golden_frames, recipes, registry_lint/unique, external_refs, description_first_sentence, auto_edit,
+transition_raw, whip_transition, overlap_pipeline, vfx_look_library, color_pipeline, director_small) passed
+on the default build with no golden file touched.
+
+Version bumped to 8.6.2 with this entry; `Cargo.lock`'s workspace members follow (no dependency version
+changes -- `ffmpeg-next` was already resolved in the lockfile from 8.6.1, this just makes it optional).
+
 ## v8.6.1 (2026-11-02)
 
 Phase 1b: an in-process libav decoder (the `ffmpeg-next` crate, pinned to 5.1.1 to match this box's
