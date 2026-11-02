@@ -251,6 +251,19 @@ pub struct Project {
     /// audit's #4 and #6), the same switch for all three. Absent/false for every existing project file, so
     /// old files and golden_frames.txt / recipe_frames.txt stay byte-identical.
     #[serde(default, skip_serializing_if = "is_false")] pub linear_blend: bool,
+    /// V8.8.0: explicit x264 encoder preset for the legacy H.264 export (legacy_encoder_command). Absent
+    /// (None) keeps ffmpeg's own default ("medium"), so every existing project and golden stays byte-
+    /// identical -- this only changes final encoder settings, never a rendered pixel, so it does not
+    /// touch golden_frames.txt/recipe_frames.txt either way. Set by auto_edit as its own default (see
+    /// ext/auto_edit.rs), the same opt-in-for-auto_edit pattern as linear_blend above.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub x264_preset: Option<String>,
+    /// V8.8.1: when true, decode treats HD (>=720 lines) source footage that is mistagged or incompletely
+    /// tagged (an SD matrix such as bt470bg/smpte170m with no primaries/transfer at all) as bt709 instead
+    /// of trusting the lone incomplete tag -- the convention most NLEs use, and the audit's measured case
+    /// (talkinghead_real_final.mp4: bt470bg, no primaries/transfer, at 1280x720). False (default, every
+    /// existing project) decodes exactly as before: ffmpeg's swscale honours whatever is tagged. See
+    /// render.rs::color_tag_override and decode().
+    #[serde(default, skip_serializing_if = "is_false")] pub color_tag_sanity: bool,
     #[serde(default)] pub camera: BTreeMap<String, crate::keyframe::Prop>,
     /// 3D compositor (comp3d.rs, set_3d_compositor): depth sorting, intersections, shadows, depth of field. None (absent from the
     /// file) or enabled = false renders exactly as before.
@@ -314,7 +327,7 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
+        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, x264_preset: None, color_tag_sanity: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
     }
 }
 

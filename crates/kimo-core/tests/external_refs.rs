@@ -198,7 +198,7 @@ fn open_sites_are_classified() {
         ("motion.rs", 1, "caller path (tool argument / output / temp file / test), not stored in the project"),
         ("planar.rs", 2, "PROJECT-DERIVED, resolved through deps (resolve / resolve_str) at the call site"),
         ("reframe.rs", 1, "PROJECT-DERIVED, resolved through deps (Project::resolve -> deps::resolve_path) at the call site: the clip's media decoded by auto_reframe's subject analysis"),
-        ("render.rs", 17, "PROJECT-DERIVED, resolved through deps (resolve / resolve_str) at the call site; 1 caller path: check_still_path reads the first bytes of a still's output path so a still never overwrites a video"),
+        ("render.rs", 18, "PROJECT-DERIVED, resolved through deps (resolve / resolve_str) at the call site; 1 caller path: check_still_path reads the first bytes of a still's output path so a still never overwrites a video; V8.8.0: +1 is not a real open site, it's the literal \"-i\" inside x264_preset_none_is_byte_identical_to_before's own expected-argv test fixture"),
         ("shards.rs", 3, "PROJECT-DERIVED, resolved through deps (resolve / resolve_str) at the call site"),
         ("text.rs", 1, "PROJECT-DERIVED, resolved through deps (resolve / resolve_str) at the call site"),
         ("threed/csm.rs", 1, "no project path: an ffmpeg stdin pipe (-i -) fed with raw RGBA frames inside a #[cfg(test)] #[ignore] frame-dump harness; output goes to a test-supplied directory (KIMO_*_FRAMES env), nothing is read from or stored in the project (here: KIMO_CSM_FRAMES)"),

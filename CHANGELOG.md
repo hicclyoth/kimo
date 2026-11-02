@@ -1,3 +1,83 @@
+## v8.8.0 "explicit x264 preset" (2026-11-03)
+
+Quality audit #1 (`/home/user/tab/work/kimo_quality_audit.md`, phase 3). `legacy_encoder_command_opts`
+never set `-preset`, so libx264 silently defaulted to "medium". At the SAME crf, "slow" is both smaller AND
+higher-SSIM than "medium" -- a CRF target is a quality constant, not a bitrate floor, so a better preset
+buys the same visual quality in fewer bits.
+
+**Measured (quality audit, fixed crf 18, same source, varying only preset -- real_v62.mp4 re-encoded):**
+
+| preset | file size | SSIM vs. same-source reference | encode time (18.86s clip) |
+|---|---|---|---|
+| medium (old implicit default) | 6,813,958 B | 0.996366 | 11.96 s |
+| slow | 6,617,270 B (-2.9%) | 0.996484 | 17.39 s (+45% encode stage) |
+| veryslow | 6,147,787 B (-9.8%) | 0.996801 | 47.12 s (+294% encode stage) |
+
+**Measured fresh this commit, on the live core-engine binary, full real-footage auto_edit benchmark project
+(talking head + 3 b-roll + music, boxed captions, 21.86s/656-frame 720p export, 3 runs each, median):**
+
+| preset | export wall time (median of 3) | file size | vs medium |
+|---|---|---|---|
+| medium (x264_preset unset) | 43.41 s | 7,627,200 B | -- |
+| slow | 47.02 s | 7,344,423 B | +8.3% wall time, -3.7% size |
+| veryslow | 68.79 s | 6,655,200 B | +58.5% wall time, -12.7% size |
+
+"slow" costs +8.3% total wall time on the real benchmark (well under the ~15% bar) while shrinking the file
+and raising SSIM; "veryslow" nearly doubles encode cost for a much smaller incremental quality gain. **slow**
+ships as auto_edit's own default.
+
+**Change**: `Project.x264_preset: Option<String>` (new field, `#[serde(default, skip_serializing_if =
+"Option::is_none")]`, so every existing project file and golden stays byte-identical -- `None` adds no
+`-preset` flag at all, the exact pre-8.8.0 argv). `project_set` takes `x264_preset` (a string, validated
+against ffmpeg's 9 named presets) and `color_tag_sanity` (see v8.8.1 below -- landed in the same project_set
+schema bump). `auto_edit` sets `x264_preset: "slow"` as its own last step (same opt-in-for-auto_edit pattern
+as `linear_blend`/8.7.0), behind a new `encoder_quality` arg (default true). Touches only ffmpeg's own
+encoder settings, never a rendered pixel -- confirmed `golden_frames.rs`/`recipe_frames.rs` only hash
+`render_frame`'s raw buffer and `to_rgba8`, never the encoder, so this item carries zero golden-frame risk
+either way; `golden_project.txt` stays byte-identical since the field is omitted when unset.
+
+**Output colour tagging (also audit #1): checked, already correct, no change needed.** `ffprobe` on
+`real_v62.mp4`: `color_space=bt709 color_transfer=iec61966-2-1 color_primaries=bt709 color_range=tv
+pix_fmt=yuv420p` -- `legacy_encoder_command_opts` already tags every export with
+`-color_range tv -color_primaries bt709 -color_trc <transfer> -colorspace bt709` (render.rs, confirmed by
+the existing `ordinary_video_argv_declares_matching_conversion_and_tags` test). The default transfer tag
+(`iec61966-2-1`/sRGB rather than `bt709`) is a defensible choice for the still-mostly-gamma-space pipeline,
+named explicitly rather than silently changed; revisiting it is future work for whenever the pipeline
+becomes fully linear-managed end to end, not this commit.
+
+**Also folds in quality audit #7** (found while reviewing the blend code for this commit):
+`render.rs::wants_linear_blend` still sent `Source::Solid`/`Source::Gradient` through linear-light
+compositing. A fixed-opacity Solid/Gradient clip is, in practice, almost always a designer-authored scrim or
+dim (the same class of thing as 8.7.1's caption-plate fix), so it now blends gamma-space like Text/Shape --
+UNLESS the clip is actively transitioning (`tplan.is_some()` at the composite call site), since a genuine
+crossfade between two Solid/Media clips is a real linear-light mix of two pictures, not a static scrim (see
+`crossfade_midpoint_is_188_with_the_option_on`, unaffected by this change, and the new
+`static_solid_scrim_over_footage_blends_the_same_linear_on_or_off` /
+`transitioning_solid_still_honors_linear_blend_unlike_a_static_scrim` tests in `quality_v880.rs`, which
+pin both outcomes side by side).
+
+**Tests** (`quality_v880.rs`, plus two inline argv tests in `render.rs`): `x264_preset_appears_in_argv_when_set`,
+`x264_preset_none_is_byte_identical_to_before` (bit-identical pre-8.8.0 argv when unset),
+`x264_preset_rejects_an_unknown_value`, `static_solid_scrim_over_footage_blends_the_same_linear_on_or_off`,
+`transitioning_solid_still_honors_linear_blend_unlike_a_static_scrim`,
+`auto_edit_turns_on_encoder_quality_and_color_tag_sanity_by_default`.
+
+`golden_registry.txt`: `auto_edit` and `project_set` entries changed (two new args/schema fields each, real
+tool-contract changes) -- recomputed by running `golden_registry_contract`/`golden_frames_registry_and_projects`
+WITHOUT `KIMO_UPDATE_GOLDEN` and hand-splicing the exact "now: <hash>" values the failing assertion printed,
+never via the update flag. `golden_frames.txt`, `recipe_frames.txt` and `golden_project.txt` are confirmed
+byte-identical to d9c8201 (`git diff 10ad62d -- ...` empty for all three, checked again against the new HEAD
+before committing).
+
+`external_refs.rs`'s `open_sites_are_classified` table bumped render.rs from 17 to 18 sites: not a new
+file-open call, it's the literal substring `"-i"` inside `x264_preset_none_is_byte_identical_to_before`'s own
+expected-argv fixture (the scan matches source text, not real open calls) -- noted explicitly in the table.
+
+`director_small.rs`'s `director_profile_is_a_short_editing_list` byte budget bumped from 29,700 to 29,900
+(measured 29,757 with the new `project_set` fields, kept undescribed in their schema specifically to
+minimize this budget's growth) -- same precedent as the two earlier bumps already in that comment (V7.7Q,
+V7.9Q).
+
 ## v8.7.1 "linear light for footage and transitions only" (2026-11-03)
 
 Two fixes to V8.7.0, found by Tab on review.

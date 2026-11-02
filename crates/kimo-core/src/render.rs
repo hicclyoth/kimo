@@ -446,7 +446,7 @@ fn source_frame_h(p: &Project, c: &Clip, lt_in: f64, cache: &Cache) -> (Frame, O
                 let al = if a1 == a2 { a1 } else { a1*(1.0-k)+a2*k };
                 for j in 0..3 { f.d[i+j] = if al > 0.0 { ((c1[j]*a1*(1.0-k)+c2[j]*a2*k)/al) as f32 } else { (c1[j]*(1.0-k)+c2[j]*k) as f32 }; } f.d[i+3]=(al*fa) as f32; } } },
         Source::Adjustment => {}
-        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
+        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
         Source::Shape { shape, width, height, fill, stroke_width, stroke_color, sides, corner_radius } => {
             let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0); let (hw, hh) = (width / 2.0, height / 2.0);
             // signed distance (negative inside), then shape modifiers (offset/repeater/merge) from shapemods.rs
@@ -705,10 +705,21 @@ fn srgb_oetf_lut() -> &'static [f32; SRGB_LUT_N] { static LUT: std::sync::OnceLo
 /// ~10s caption-over-footage frame, core_v02 vs real_v62). So the scope check is per TOP-layer source kind,
 /// not one project-wide switch: `Source::Text` and `Source::Shape` (captions, caption plates, subscribe
 /// pills, lower-thirds and any other graphic/title clip) always blend in gamma space regardless of
-/// `linear_blend`; every other source kind (media footage, solids/gradients, 3D/particle/precomp layers,
-/// and a clip's own crossfade/transition fade, which runs through this same per-clip blend call) honors
-/// the project's `linear_blend` switch exactly as before.
-fn wants_linear_blend(src: &Source, linear_blend: bool) -> bool { linear_blend && !matches!(src, Source::Text { .. } | Source::Shape { .. }) }
+/// `linear_blend`.
+///
+/// V8.9.0 (quality audit #7): `Source::Solid`/`Source::Gradient` get the same gamma-space treatment, but
+/// ONLY when the clip is not actively transitioning: a fixed-opacity Solid/Gradient clip is, in practice,
+/// almost always a designer-authored scrim or dim (the audit's own example: the end-card backdrop's
+/// vignette, fixed in 8.7.1 as a Shape -- a plain-color version of the same thing is a Solid), authored in
+/// display space exactly like a caption plate, so it gets the same rule. A clip's own crossfade/transition
+/// fade is different: `add_transition` on a Solid or Media clip is a genuine physical mix of two pictures
+/// (the thing `crossfade_midpoint_is_188_with_the_option_on` measures), so it keeps honoring `linear_blend`
+/// regardless of source kind -- `transitioning` is true exactly while `tplan` (the active transition plan)
+/// is `Some` at the call site, so this one function covers both cases without the caller needing its own
+/// copy of the rule.
+fn wants_linear_blend(src: &Source, linear_blend: bool, transitioning: bool) -> bool {
+    linear_blend && (transitioning || !matches!(src, Source::Text { .. } | Source::Shape { .. } | Source::Solid { .. } | Source::Gradient { .. }))
+}
 
 /// V8.7.0: `blend`/`blend_region` composite in gamma space (today's default, unchanged above). When
 /// `linear` is true (Project.linear_blend), this instead linearizes RGB (not alpha -- alpha is a coverage
@@ -950,7 +961,7 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
             if c.effects.iter().any(|e| crate::effects2::is_post(&e.kind)) { BACKDROP.with(|b| *b.borrow_mut() = Some(std::rc::Rc::new(Frame { w, h, d: out.d.clone() }))); crate::frosted::set_post(true); crate::frosted::set_tilt((ryv.to_radians().sin()) as f32, (-rxv.to_radians().sin()) as f32); crate::frosted::set_slab(Some(crate::three_d::Projector::new(w, h, &cam, &pose)));
                 let r: Result<(), String> = (|| { for e in c.effects.iter().filter(|e| crate::effects2::is_post(&e.kind)) { effects::apply(&e.kind, &e.params, &e.strings, &mut f3, lt, seed)?; } Ok(()) })();
                 crate::frosted::set_post(false); crate::frosted::set_tilt(0.0, 0.0); crate::frosted::set_slab(None); BACKDROP.with(|b| *b.borrow_mut() = None); r?; }
-            blend_opt(&mut out, &f3, op, c_blend, mask.as_deref(), wants_linear_blend(&c.source, p.linear_blend)); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
+            blend_opt(&mut out, &f3, op, c_blend, mask.as_deref(), wants_linear_blend(&c.source, p.linear_blend, tplan.is_some())); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
         }
         crate::comp3d::flush(&mut out, &mut g3, p, t);
         // opt-in exact shutter (set_motion_blur samples / shutter_phase / shutter_curve); None keeps the legacy centred fixed-count sampler unchanged
@@ -988,11 +999,11 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
         if let Some(cf) = tplan.as_ref().and_then(|pl| pl.compose.as_ref()) { out = cf(&out, &f); continue; }
         if let Source::ShardBurst(sb) = &c.source { if let Some(d) = crate::shards::take_disp() { crate::shards::refract_canvas(&mut out, &d, &f, sb.refract_dispersion.clamp(0.0, 1.0)); } }
         if let Some(acc) = eacc.as_mut() { let wgt = op / (ne + 1) as f32; for i in 0..w * h { let a = f.d[i * 4 + 3] * wgt; if a > 0.0 { for j in 0..3 { acc.d[i * 4 + j] += f.d[i * 4 + j] * a; } acc.d[i * 4 + 3] += a; } } continue; }
-        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region_opt(&mut out, &f, op, c_blend, mask.as_deref(), rect, wants_linear_blend(&c.source, p.linear_blend)); prof("blend", tp);
+        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region_opt(&mut out, &f, op, c_blend, mask.as_deref(), rect, wants_linear_blend(&c.source, p.linear_blend, tplan.is_some())); prof("blend", tp);
         if let Some(r) = rect { pool_give(f, r); }
         if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } }
         }
-        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend_opt(&mut out, &acc, 1.0, &c.blend, None, wants_linear_blend(&c.source, p.linear_blend)); }
+        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend_opt(&mut out, &acc, 1.0, &c.blend, None, wants_linear_blend(&c.source, p.linear_blend, false)); }
     }}
     crate::comp3d::flush(&mut out, &mut g3, p, t);
     prof_dump();
@@ -1049,7 +1060,13 @@ pub(crate) fn legacy_encoder_command(p:&Project,path:&str,crf:u32)->Result<Comma
 pub(crate) fn legacy_encoder_command_opts(p:&Project,path:&str,crf:u32,low_memory:bool)->Result<Command,String>{
     let q=&p.color_pipeline;
     let transfer=if q.enabled{q.validate()?;if q.output_gamut!=0{return Err("ordinary video export requires Rec709 output gamut=0; select a supported delivery output or export_high_bit".into())}match q.output_transfer{0=>"linear",1=>"iec61966-2-1",8=>"bt709",_=>return Err("ordinary video export requires exactly taggable linear/sRGB/BT709 output transfer; select a supported delivery output or export_high_bit".into())}}else{"iec61966-2-1"};
-    let mut cmd=Command::new("ffmpeg");cmd.args(["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{}x{}",p.width,p.height),"-r",&p.fps.to_string(),"-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc",transfer,"-colorspace","bt709","-crf",&crf.to_string()]);if low_memory{cmd.args(["-x264-params","rc-lookahead=10:ref=2:bframes=2:sync-lookahead=0"]);}cmd.arg(path);Ok(cmd)
+    let mut cmd=Command::new("ffmpeg");cmd.args(["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{}x{}",p.width,p.height),"-r",&p.fps.to_string(),"-i","-","-c:v","libx264"]);
+    // V8.8.0 (audit #1): an explicit x264 preset. Measured at crf 18 on real footage: "slow" is both
+    // smaller AND higher-SSIM than ffmpeg's own unset default ("medium"); see CHANGELOG.md v8.8.0 for the
+    // numbers. None (every project before this version, and any caller that never sets it) adds no
+    // `-preset` flag at all, so ffmpeg picks its own default and the argv is byte-identical to before.
+    if let Some(preset)=&p.x264_preset{cmd.args(["-preset",preset]);}
+    cmd.args(["-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc",transfer,"-colorspace","bt709","-crf",&crf.to_string()]);if low_memory{cmd.args(["-x264-params","rc-lookahead=10:ref=2:bframes=2:sync-lookahead=0"]);}cmd.arg(path);Ok(cmd)
 }
 
 
@@ -1253,7 +1270,7 @@ pub fn render_clip_alone_as(p: &Project, c: &Clip, t: f64, cache: &Cache) -> Opt
     let mut srcs: Vec<std::sync::Arc<Clip>> = vec![];
     for e in c.effects.iter() { let Some(k) = crate::layerfx::source_key(&e.kind) else { continue };
         if let Some(m) = e.strings.get(k).and_then(|id| p.find_clip(id)).filter(|m| m.id != c.id && !srcs.iter().any(|s| s.id == m.id)) { let mut m = m.clone(); m.start += t - crate::pushwipe::luma_time(p, &m, t); srcs.push(std::sync::Arc::new(m)); } }
-    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
+    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
     MATTE_DEPTH.with(|d| d.set(d.get() + 1)); let r = render_frame_opts(&sub, t, cache, true).ok(); MATTE_DEPTH.with(|d| d.set(d.get() - 1)); r
 }
 
@@ -1470,6 +1487,8 @@ fn flow_pair(fr:&Frames,a:usize,b:usize,w:usize,h:usize)->Result<(Frame,Frame),S
 }
 #[cfg(test)]mod legacy_encoder_tests{use super::*;
 #[test]fn ordinary_video_argv_declares_matching_conversion_and_tags(){for(w,h)in[(320,180),(1280,720)]{let mut p=Project::default();p.width=w;p.height=h;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let logged:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert_eq!(logged,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{w}x{h}"),"-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","iec61966-2-1","-colorspace","bt709","-crf","23","proof.mp4"]);}}
+#[test]fn x264_preset_appears_in_argv_when_set(){let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;p.x264_preset=Some("slow".into());let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|w|w==["-preset","slow"]),"expected -preset slow: {args:?}");}
+#[test]fn x264_preset_none_is_byte_identical_to_before(){let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(!args.iter().any(|a|a=="-preset"));assert_eq!(args,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s","320x180","-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","iec61966-2-1","-colorspace","bt709","-crf","23","proof.mp4"]);}
 #[test]fn ordinary_video_rejects_untaggable_output_before_spawn(){let mut p=Project::default();p.color_pipeline.enabled=true;for g in 1..=7{p.color_pipeline.output_gamut=g;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}p.color_pipeline.output_gamut=0;for t in[2,3,4,5,6,7]{p.color_pipeline.output_transfer=t;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}for(t,name)in[(0,"linear"),(1,"iec61966-2-1"),(8,"bt709")]{p.color_pipeline.output_transfer=t;let cmd=legacy_encoder_command(&p,"unused.mp4",18).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|v|v==["-color_trc",name]));}}
 #[test]fn parallel_out_of_order_arrival_preserves_writer_order(){let path=std::env::temp_dir().join(format!("kimo-ordered-{}.bin",std::process::id()));let mut cmd=Command::new("sh");cmd.args(["-c",&format!("exec cat > {}",path.display())]);let mut encoder=crate::color::process::EncodeStream::new(&mut cmd,4,std::time::Duration::from_secs(2)).unwrap();let slots:Vec<_>=(0..4).map(|_|std::sync::Mutex::new(None)).collect();std::thread::scope(|sc|{for k in 0..4{let slots=&slots;sc.spawn(move||{std::thread::sleep(std::time::Duration::from_millis((3-k)*10));*slots[k as usize].lock().unwrap()=Some(vec![k as u8;4]);});}});for slot in slots{encoder.write(slot.into_inner().unwrap().unwrap()).unwrap();}encoder.finish().unwrap();assert_eq!(std::fs::read(&path).unwrap(),vec![0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3]);std::fs::remove_file(path).unwrap();}
 }

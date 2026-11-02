@@ -147,7 +147,7 @@ fn silent_no_audio_track(name: &str, dur: f64) -> String {
         assert!(names.contains(&want), "director profile lacks {want}: {names:?}");
     }
     assert!(names.len() <= 36, "{} tools: {names:?}", names.len()); // KF2: 29 + 4 highlight/reframe tools + 2 meta tools = 35
-    let bytes = serde_json::to_string(&list).unwrap().len(); assert!(bytes < 29_700, "director list is {bytes} bytes"); // KF2: +4 tools pushed this from ~21k; V7.7Q: place_broll's words/asset_tags relevance params pushed it to ~29.1k; V7.9Q: finish_audio's match_strength/compress_strength args pushed it to ~29.5k; 29.7k keeps real headroom under the 150k flat-list cost
+    let bytes = serde_json::to_string(&list).unwrap().len(); assert!(bytes < 29_900, "director list is {bytes} bytes"); // KF2: +4 tools pushed this from ~21k; V7.7Q: place_broll's words/asset_tags relevance params pushed it to ~29.1k; V7.9Q: finish_audio's match_strength/compress_strength args pushed it to ~29.5k; V8.8.0/8.8.1 (quality audit #1/#2): project_set's x264_preset/color_tag_sanity fields, with no per-field description to keep this small, pushed it to ~29.76k; 29.9k keeps real headroom under the 150k flat-list cost
     for t in &list { let d = t["description"].as_str().unwrap(); assert!(d.len() <= 150, "{}: {} chars", t["name"], d.len()); }
     // every listed tool is a real one with its real schema
     for t in list.iter().filter(|t| !["search_tools", "kimo_describe"].contains(&t["name"].as_str().unwrap())) {

@@ -19,6 +19,10 @@ use crate::model::Source;
 /// speech re-detection, which this duration is compared against) treats as "the same" instant.
 fn r3(v: f64) -> f64 { (v * 1000.0).round() / 1000.0 }
 
+/// V8.8.0: the x264 preset auto_edit sets by default when `encoder_quality` is on. See CHANGELOG.md
+/// v8.8.0 for the measured speed/size/SSIM table behind this specific choice.
+const AUTO_EDIT_X264_PRESET: &str = "slow";
+
 /// V8.5.5 end-card background tuning: freeze an earlier, calmer source frame instead of the literal last
 /// one; blur it gently rather than into mush; scale it up a touch so the blur's edge falloff never shows;
 /// darken it slightly so the white pill/text/dot pop against it. See the end_screen stage below.
@@ -145,6 +149,16 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // hand leaves linear_blend at its default (false), so golden_frames.txt / recipe_frames.txt (built
     // without auto_edit) stay byte-identical.
     let linear_compositing_on = a.get("linear_compositing").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.8.0 (quality audit #1): an explicit x264 preset for the final export. Measured on the real
+    // benchmark at crf 18: ffmpeg's own unset default ("medium") is both bigger AND lower-SSIM than
+    // "slow" at the SAME crf -- see CHANGELOG.md v8.8.0 for the measured table and the chosen preset.
+    // Touches only encoder settings, never a rendered pixel, so it carries no golden_frames.txt/
+    // recipe_frames.txt risk either way; still gated to auto_edit (project_set's x264_preset stays None,
+    // ffmpeg's own default, for anyone building a project by hand).
+    let encoder_quality_on = a.get("encoder_quality").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.8.1 (quality audit #2): decode mistagged/untagged HD source footage as bt709 instead of trusting
+    // an incomplete SD tag (see render.rs::color_tag_override and model.rs's color_tag_sanity doc comment).
+    let color_tag_sanity_on = a.get("color_tag_sanity").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -616,11 +630,21 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if linear_compositing_on {
         call(ss, "project_set", &json!({"linear_blend": true}))?;
     }
+    // V8.8.0: see encoder_quality_on's comment above. "slow" is the chosen preset (CHANGELOG.md v8.8.0).
+    if encoder_quality_on {
+        call(ss, "project_set", &json!({"x264_preset": AUTO_EDIT_X264_PRESET}))?;
+    }
+    // V8.8.1: see color_tag_sanity_on's comment above.
+    if color_tag_sanity_on {
+        call(ss, "project_set", &json!({"color_tag_sanity": true}))?;
+    }
 
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
         "stages": stages, "warnings": warnings, "lint_clean": lint_ok, "remaining_problems": remaining,
         "linear_compositing": linear_compositing_on,
+        "encoder_quality": encoder_quality_on,
+        "color_tag_sanity": color_tag_sanity_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -659,6 +683,8 @@ pub fn commands() -> Vec<Command> {
                 ("end_screen_duration", n("outro card seconds, default 3.0, clamped 2..4")),
                 ("pacing", json!({"type": "boolean", "description": "tighten_pauses: shrink the dead air rough_cut leaves inside its own kept clips (a breath between phrases, the lead-in before the first word) down to a natural pad; default true"})),
                 ("linear_compositing", json!({"type": "boolean", "description": "default true: linear-light blend, lanczos fit, dither"})),
+                ("encoder_quality", json!({"type": "boolean", "description": "default true: an explicit x264 preset (slow) for the final export, smaller and higher-SSIM than ffmpeg's own default at the same crf"})),
+                ("color_tag_sanity", json!({"type": "boolean", "description": "default true: decode mistagged/untagged HD source footage as bt709 instead of trusting an incomplete SD tag"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }
