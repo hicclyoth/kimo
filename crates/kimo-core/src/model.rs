@@ -174,6 +174,7 @@ fn ser_pan<S: serde::Serializer>(p: &Prop, s: S) -> Result<S::Ok, S::Error> {
 fn is_zero_f64(v: &f64) -> bool { *v == 0.0 }
 fn one_f64() -> f64 { 1.0 }
 fn is_one_f64(v: &f64) -> bool { *v == 1.0 }
+fn is_false(v: &bool) -> bool { !*v }
 impl Default for Audio { fn default() -> Self { Audio { lead: 0.0, tail: 0.0, effects: vec![], pan: Prop::new(0.0), duck_gain: Prop::new(1.0), mute: false, volume: Prop::new(1.0), fade_in: 0.0, fade_out: 0.0, pitch: 0.0, highpass: 0.0, lowpass: 0.0, denoise: 0.0, compress: false, echo: 0.0, reverse: false, speech_level: 0.0, compress_amount: 1.0 } } }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,7 +250,7 @@ pub struct Project {
     /// grading math undisturbed. Also gates the lanczos clip-to-canvas fit and TPDF dithered output (the
     /// audit's #4 and #6), the same switch for all three. Absent/false for every existing project file, so
     /// old files and golden_frames.txt / recipe_frames.txt stay byte-identical.
-    #[serde(default)] pub linear_blend: bool,
+    #[serde(default, skip_serializing_if = "is_false")] pub linear_blend: bool,
     #[serde(default)] pub camera: BTreeMap<String, crate::keyframe::Prop>,
     /// 3D compositor (comp3d.rs, set_3d_compositor): depth sorting, intersections, shadows, depth of field. None (absent from the
     /// file) or enabled = false renders exactly as before.

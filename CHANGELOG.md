@@ -1,3 +1,76 @@
+## v8.7.1 "linear light for footage and transitions only" (2026-11-03)
+
+Two fixes to V8.7.0, found by Tab on review.
+
+**1. Saved project files were changing for everyone.** `Project.linear_blend` was added with
+`#[serde(default)]` only, so every project -- including ones that never touch the option -- serialized
+`"linear_blend": false` where the field previously didn't exist at all, changing the bytes of every saved
+`.kimo` project file. The V8.7.0 CHANGELOG's own claim that "old files stay byte-identical" was false for
+anything actually saved (it was only true for files never re-saved). Fixed with
+`#[serde(default, skip_serializing_if = "is_false")]`, the same pattern already used 32 times in
+`model.rs` (e.g. `FrameBlend::is_off`): the field is omitted entirely when `false`, so a saved project file
+is now exactly as before unless `linear_blend` is actually turned on. `golden_project.txt` is restored to
+its exact pre-8.7.0 (`d9c8201`) content (copied back with `git show`, not regenerated); `golden_registry.txt`
+keeps its two legitimate `auto_edit`/`project_set` tool-description hashes from the new parameter.
+Honesty note on how `golden_project.txt` got its V8.7.0 values: `golden_frames.txt`,
+`golden_registry.txt` and `golden_project.txt` are written by the *same* `compare()` calls inside one test
+(`golden_frames_registry_and_projects`), gated by the *same* `KIMO_UPDATE_GOLDEN` flag -- there is no
+"compute the FNV-1a hashes by hand" path that doesn't mean running that exact harness (or literally
+equivalent code) against the real build. The V8.7.0 CHANGELOG's claim that the values were "computed
+directly from this build (not via KIMO_UPDATE_GOLDEN... and hand-written into both files, the same
+allowance the brief gives for an intentional tool-schema change" stretches an allowance that was only ever
+given for `golden_registry.txt`'s tool-description hashes to also cover `golden_project.txt`, which hashes
+actual serialized project state, not a tool contract -- that file's change was a real byte-for-byte
+regression on every saved project, not an intentional schema note, whatever process produced the new
+hashes.
+
+**2. Linear-light compositing washed out caption plates and other graphics.** The audit's physically-correct
+linear-light blend is right for a crossfade or a footage layer (both are genuinely a mix of light), but
+designers author caption-box, subscribe-pill and lower-third opacity in display (sRGB) space -- the
+Photoshop/Premiere default -- so applying the same linear math to those layers made a semi-transparent
+black caption plate visibly lighter and more see-through. Measured at the ~10s "PUNCH IN THE..." caption
+frame: the caption box's own background (text and footage masked out) read 31.18/255 mean luma in
+`real_v62.mp4` (pre-8.7.0) vs 54.41/255 in `core_v02.mp4` (V8.7.0, +23.2 washed out).
+
+Fix (`render.rs`): a new `wants_linear_blend(source, linear_blend)` gate decides by the TOP layer's own
+source kind at each of the three blend-call sites (the main per-clip composite, the 3D-transform composite,
+and the echo accumulator flush) -- `Source::Text` and `Source::Shape` (captions, caption plates, subscribe
+pills, lower-thirds and any other graphic/title clip) always blend in gamma space regardless of
+`linear_blend`; every other source kind (media footage, solids/gradients, 3D/particle/precomp layers, and a
+clip's own crossfade/transition fade, which runs through this same per-clip blend call) still honors the
+project's `linear_blend` switch exactly as V8.7.0 shipped it. The existing crossfade-midpoint tests
+(188 on / 128 off, using Solid clips, unaffected by this narrowing) stay green; a new test,
+`graphic_plate_over_footage_blends_the_same_linear_on_or_off`, pins a 60%-opacity black Shape plate over a
+mid-grey footage-like background to the *same* pixel whether `linear_blend` is on or off.
+
+**Measured after the fix** (re-rendered full benchmark, `core_v03.mp4`, same binary): the caption box's own
+background luma at ~10s is now 31.19/255 -- 0.01/255 from `real_v62.mp4`'s 31.18, well inside the ~2/255
+target (V8.7.0's `core_v02.mp4` was +23.2 off). A wider comparison sheet,
+`/home/user/tab/files/v7q/linear_v62_vs_core03.png` (same 4 rows as the V8.7.0 sheet: whip + caption plate
+~4.2s, caption-over-footage ~10s, subscribe-pill ~18.9s, end-card backdrop blur ~20s), shows the same
+pattern at every row -- mean crop delta vs `real_v62.mp4` dropped from 11.6-19.6/255 (V8.7.0) to
+0.8-1.7/255 (V8.7.1) at every one of the 4 rows, including the end-card backdrop (which carries a graphic
+scrim/vignette over the blur, not just the blur itself -- the same layer-kind fix caught that too). Visual
+verdict: `core_v03.mp4` is indistinguishable from `real_v62.mp4` by eye at all 4 moments; the true
+footage/transition linear-light gains V8.7.0 already demonstrated (the end-card backdrop blur, the
+crossfade midpoint) are untouched.
+
+Tests (scoped suite, all green): golden_frames, recipes, registry_lint, registry_unique, external_refs,
+description_first_sentence, auto_edit (26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, color_pipeline, color_linear, quality_v870 (7, including the new graphic-plate test),
+director_small (49/50 -- the one failure is the suite's already-documented box-load timing flake,
+`lint_edit_scans_a_long_clip_without_rescanning_from_its_start_each_sample`, clean in isolation and
+unrelated to this change). Warnings: 34 (unchanged, within the 35 cap). `golden_frames.txt` and
+`recipe_frames.txt` are byte-identical to `d9c8201` (verified with `git diff`, no `KIMO_UPDATE_GOLDEN`
+used); `golden_project.txt` is restored to byte-identical; `golden_registry.txt`'s only two changes
+(`auto_edit`, `project_set`) are the legitimate V8.7.0 schema-description hashes.
+
+`core_v03.mp4` md5 `dec99ea31eb0d6da569eb336e7c56e00` (full benchmark, rendered against this binary,
+scratch `.kimo` deleted after; mtime newer than the binary's). Differs from `real_v62.mp4`
+(`dac36d18de29f81da090006d262c46c2`) and from `core_v02.mp4` as expected -- the blend path changed for
+every graphic layer in the benchmark's captions.
+
+
 ## v8.7.0 "linear light" (2026-11-02)
 
 Linear-light compositing, Lanczos scaling, and TPDF dither for the finished `auto_edit` render (audit items

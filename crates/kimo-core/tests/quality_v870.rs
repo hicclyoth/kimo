@@ -133,3 +133,29 @@ fn auto_edit_turns_on_color_pipeline_as_its_last_step() {
     assert!(s.project.linear_blend, "auto_edit should have turned linear_blend on as its last step");
     assert!(!s.project.color_pipeline.enabled, "auto_edit's fast linear_blend option must NOT also flip the heavier color_pipeline");
 }
+
+/// V8.7.1: the layer-kind rule itself (render.rs::wants_linear_blend). A 60%-opacity black caption-style
+/// plate (a Shape, standing in for a caption box / subscribe pill / lower-third) over a mid-grey
+/// footage-like background must composite to the SAME pixel whether linear_blend is on or off: designers
+/// author caption-box, pill and lower-third opacity in display (sRGB) space, the way Photoshop and
+/// Premiere composite by default -- linearizing that blend is what made the audit's own 8.7.0 pass wash
+/// out caption contrast (measured mean crop delta 14.45/255 at the ~10s caption-over-footage frame,
+/// core_v02 vs real_v62). Only footage/image layers and the crossfade/transition math between clips (see
+/// `crossfade_midpoint_is_188_with_the_option_on` above, which uses Solid clips and is unaffected by this
+/// narrowing) still honor `linear_blend`.
+#[test]
+fn graphic_plate_over_footage_blends_the_same_linear_on_or_off() {
+    let run = |linear_on: bool| -> Vec<u8> {
+        let mut s = Session::new();
+        dispatch(&mut s, "project_set", &json!({"width": 16, "height": 16, "fps": 30, "linear_blend": linear_on})).unwrap();
+        let bg = dispatch(&mut s, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
+        dispatch(&mut s, "add_clip", &json!({"track_id": bg, "source_type": "solid", "color": [0.5, 0.5, 0.5], "start": 0.0, "duration": 1.0})).unwrap();
+        let plate_track = dispatch(&mut s, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
+        dispatch(&mut s, "add_shape", &json!({"track_id": plate_track, "shape": "rect", "width": 16, "height": 16, "fill": [0.0, 0.0, 0.0, 0.6], "start": 0.0, "duration": 1.0})).unwrap();
+        let cache = render::Cache::new();
+        render::export_frame_rgba8(&s.project, 0.5, &cache).unwrap()
+    };
+    let on = run(true);
+    let off = run(false);
+    assert_eq!(on, off, "a graphic (Shape) plate over footage must blend identically in gamma space regardless of linear_blend");
+}

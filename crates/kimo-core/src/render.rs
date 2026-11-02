@@ -697,6 +697,19 @@ fn srgb_oetf_lut() -> &'static [f32; SRGB_LUT_N] { static LUT: std::sync::OnceLo
 #[inline] fn srgb_to_linear(v: f32) -> f32 { let lut = srgb_eotf_lut(); let x = v.clamp(0.0, 1.0) * (SRGB_LUT_N - 1) as f32; let i = x as usize; let f = x - i as f32; let i1 = (i + 1).min(SRGB_LUT_N - 1); lut[i] * (1.0 - f) + lut[i1] * f }
 #[inline] fn linear_to_srgb(v: f32) -> f32 { let lut = srgb_oetf_lut(); let x = v.clamp(0.0, 1.0) * (SRGB_LUT_N - 1) as f32; let i = x as usize; let f = x - i as f32; let i1 = (i + 1).min(SRGB_LUT_N - 1); lut[i] * (1.0 - f) + lut[i1] * f }
 
+/// V8.7.1: the layer-kind rule -- linear-light is physically right for footage/image layers and for the
+/// transition/crossfade math between clips (both are genuinely a mix of light), but WRONG for graphic/
+/// title layers: designers author caption-box, pill and lower-third opacity in display (sRGB) space, the
+/// way Photoshop and Premiere composite by default, so linearizing those blends made a semi-transparent
+/// black caption plate visibly lighter and more see-through (measured: mean crop delta 14.45/255 at the
+/// ~10s caption-over-footage frame, core_v02 vs real_v62). So the scope check is per TOP-layer source kind,
+/// not one project-wide switch: `Source::Text` and `Source::Shape` (captions, caption plates, subscribe
+/// pills, lower-thirds and any other graphic/title clip) always blend in gamma space regardless of
+/// `linear_blend`; every other source kind (media footage, solids/gradients, 3D/particle/precomp layers,
+/// and a clip's own crossfade/transition fade, which runs through this same per-clip blend call) honors
+/// the project's `linear_blend` switch exactly as before.
+fn wants_linear_blend(src: &Source, linear_blend: bool) -> bool { linear_blend && !matches!(src, Source::Text { .. } | Source::Shape { .. }) }
+
 /// V8.7.0: `blend`/`blend_region` composite in gamma space (today's default, unchanged above). When
 /// `linear` is true (Project.linear_blend), this instead linearizes RGB (not alpha -- alpha is a coverage
 /// fraction, not a light value) for the row range the blend actually touches, runs the existing blend math
@@ -937,7 +950,7 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
             if c.effects.iter().any(|e| crate::effects2::is_post(&e.kind)) { BACKDROP.with(|b| *b.borrow_mut() = Some(std::rc::Rc::new(Frame { w, h, d: out.d.clone() }))); crate::frosted::set_post(true); crate::frosted::set_tilt((ryv.to_radians().sin()) as f32, (-rxv.to_radians().sin()) as f32); crate::frosted::set_slab(Some(crate::three_d::Projector::new(w, h, &cam, &pose)));
                 let r: Result<(), String> = (|| { for e in c.effects.iter().filter(|e| crate::effects2::is_post(&e.kind)) { effects::apply(&e.kind, &e.params, &e.strings, &mut f3, lt, seed)?; } Ok(()) })();
                 crate::frosted::set_post(false); crate::frosted::set_tilt(0.0, 0.0); crate::frosted::set_slab(None); BACKDROP.with(|b| *b.borrow_mut() = None); r?; }
-            blend_opt(&mut out, &f3, op, c_blend, mask.as_deref(), p.linear_blend); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
+            blend_opt(&mut out, &f3, op, c_blend, mask.as_deref(), wants_linear_blend(&c.source, p.linear_blend)); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
         }
         crate::comp3d::flush(&mut out, &mut g3, p, t);
         // opt-in exact shutter (set_motion_blur samples / shutter_phase / shutter_curve); None keeps the legacy centred fixed-count sampler unchanged
@@ -975,11 +988,11 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
         if let Some(cf) = tplan.as_ref().and_then(|pl| pl.compose.as_ref()) { out = cf(&out, &f); continue; }
         if let Source::ShardBurst(sb) = &c.source { if let Some(d) = crate::shards::take_disp() { crate::shards::refract_canvas(&mut out, &d, &f, sb.refract_dispersion.clamp(0.0, 1.0)); } }
         if let Some(acc) = eacc.as_mut() { let wgt = op / (ne + 1) as f32; for i in 0..w * h { let a = f.d[i * 4 + 3] * wgt; if a > 0.0 { for j in 0..3 { acc.d[i * 4 + j] += f.d[i * 4 + j] * a; } acc.d[i * 4 + 3] += a; } } continue; }
-        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region_opt(&mut out, &f, op, c_blend, mask.as_deref(), rect, p.linear_blend); prof("blend", tp);
+        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region_opt(&mut out, &f, op, c_blend, mask.as_deref(), rect, wants_linear_blend(&c.source, p.linear_blend)); prof("blend", tp);
         if let Some(r) = rect { pool_give(f, r); }
         if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } }
         }
-        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend_opt(&mut out, &acc, 1.0, &c.blend, None, p.linear_blend); }
+        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend_opt(&mut out, &acc, 1.0, &c.blend, None, wants_linear_blend(&c.source, p.linear_blend)); }
     }}
     crate::comp3d::flush(&mut out, &mut g3, p, t);
     prof_dump();
