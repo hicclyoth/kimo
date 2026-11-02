@@ -239,6 +239,17 @@ pub struct Project {
     #[serde(default)] pub occluders: BTreeMap<String, OccSpec>,
     #[serde(default)] pub ocio_view_delivery: Option<crate::color::view_video::Selection>,
     #[serde(default)] pub color_pipeline: crate::color::pipeline::Pipeline,
+    /// V8.7.0: lightweight linear-light compositing option, independent of the full managed color_pipeline
+    /// above (ACEScg working space, 16-bit decode, HDR) -- that path measured ~3.4x slower on a real
+    /// auto_edit export (144.7s vs 42.4s at 720p, see CHANGELOG v8.7.0), far past the "doesn't tank speed"
+    /// bar, because it reroutes decode/effects/output through 16-bit float scene-linear end to end. This
+    /// flag instead linearizes only the actual alpha-composite step (render.rs's blend/blend_region, via a
+    /// small interpolated sRGB EOTF/OETF LUT) and nothing else -- decode, grading effects (auto_grade,
+    /// match_shot_look) and encode stay exactly as they are today, so this is both fast and leaves existing
+    /// grading math undisturbed. Also gates the lanczos clip-to-canvas fit and TPDF dithered output (the
+    /// audit's #4 and #6), the same switch for all three. Absent/false for every existing project file, so
+    /// old files and golden_frames.txt / recipe_frames.txt stay byte-identical.
+    #[serde(default)] pub linear_blend: bool,
     #[serde(default)] pub camera: BTreeMap<String, crate::keyframe::Prop>,
     /// 3D compositor (comp3d.rs, set_3d_compositor): depth sorting, intersections, shadows, depth of field. None (absent from the
     /// file) or enabled = false renders exactly as before.
@@ -302,7 +313,7 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
+        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
     }
 }
 

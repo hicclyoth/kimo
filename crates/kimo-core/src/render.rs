@@ -166,6 +166,20 @@ struct DecodeProcess(std::process::Child);
 impl Drop for DecodeProcess{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
 const WINDOW: usize = 24;
 
+/// The main source-to-project-canvas scale/fit ffmpeg filter string for a clip not using the subject-aware
+/// reframe crop (which pins its own bicubic, see reframe.rs:ffmpeg_fit). `fit`: >=1.5 stretch to fill
+/// exactly, >=0.5 cover (crop after an aspect-preserving upscale), else contain (letterbox/pillarbox pad).
+/// V8.7.0: `lanczos` (audit #4) requests ffmpeg's `flags=lanczos` on the scale step instead of its
+/// undecorated default (bicubic) -- gated by the caller on the same color_pipeline.enabled switch that
+/// turns on linear-light compositing and TPDF dither, so pipeline-off (the default) keeps byte-identical
+/// bicubic output. Pulled out of decode() as its own pure function so it's unit-testable without a decode.
+pub fn clip_fit_filter(w: u32, h: u32, fit: f64, lanczos: bool) -> String {
+    let flags = if lanczos { ":flags=lanczos" } else { "" };
+    if fit >= 1.5 { format!("scale={w}:{h}{flags}") }
+    else if fit >= 0.5 { format!("scale={w}:{h}:force_original_aspect_ratio=increase{flags},crop={w}:{h}") }
+    else { format!("scale={w}:{h}:force_original_aspect_ratio=decrease{flags},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0") }
+}
+
 /// Decode `n` frames starting at global clip frame `a` (windowed: memory stays bounded for any clip length).
 fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Option<(f64, i64)>) -> Result<Frames, String> {
     let (w, h) = (p.width, p.height);
@@ -186,7 +200,7 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     } let is_img0 = is_still_path(path); let (a, n) = if is_img0 { (0, 1) } else { (a, n) };
     let (in_pt, speed, span, a_rel) = if let Some((st, fbase)) = seek_base { let rel = (a as i64 - fbase).max(0) as usize; (st, 1.0, (rel+n) as f64 / p.fps, rel) } else if c.retimed() { (c.in_point, 1.0, (a+n) as f64 / p.fps, a) } else { (c.in_point, c.speed, (a+n) as f64 / p.fps * c.speed, a) };
     let fit = c.props.get("fit").map(|q| q.at(0.0)).unwrap_or(0.0);
-    let fitf = if crate::reframe::active(c) { crate::reframe::ffmpeg_fit(c, w, h, p.fps, a, n) } else if fit >= 1.5 { format!("scale={w}:{h}") } else if fit >= 0.5 { format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}") } else { format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0") };
+    let fitf = if crate::reframe::active(c) { crate::reframe::ffmpeg_fit(c, w, h, p.fps, a, n) } else { clip_fit_filter(w, h, fit, p.linear_blend) };
     // V8.6.1/8.6.2: in-process libav decode, opt-in via KIMO_DECODER=libav AND the "libav" cargo feature
     // (default stays the ffmpeg pipe below until proven; the feature is also off by default as of 8.6.2,
     // so a default build needs no libav*-dev headers or clang). Only attempted for the scope
@@ -432,7 +446,7 @@ fn source_frame_h(p: &Project, c: &Clip, lt_in: f64, cache: &Cache) -> (Frame, O
                 let al = if a1 == a2 { a1 } else { a1*(1.0-k)+a2*k };
                 for j in 0..3 { f.d[i+j] = if al > 0.0 { ((c1[j]*a1*(1.0-k)+c2[j]*a2*k)/al) as f32 } else { (c1[j]*(1.0-k)+c2[j]*k) as f32 }; } f.d[i+3]=(al*fa) as f32; } } },
         Source::Adjustment => {}
-        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
+        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
         Source::Shape { shape, width, height, fill, stroke_width, stroke_color, sides, corner_radius } => {
             let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0); let (hw, hh) = (width / 2.0, height / 2.0);
             // signed distance (negative inside), then shape modifiers (offset/repeater/merge) from shapemods.rs
@@ -672,7 +686,98 @@ fn synth_edges(p: &Project, c: &Clip, f: &mut Frame, lt: f64, a_t: (f64, f64, f6
 /// follow W3C Compositing and Blending Level 1: B(cb, cs) on unpremultiplied colour clamped to 0..1, cs' = (1 - ab) cs + ab B,
 /// then source-over with the layer's alpha (the canvas holds premultiplied colour, sources are straight).
 pub const BLEND_MODES: &[&str] = &["normal", "add", "multiply", "screen", "overlay", "darken", "lighten", "difference", "exclusion", "soft_light", "hard_light", "color_dodge", "color_burn", "linear_burn", "linear_dodge", "vivid_light", "linear_light", "pin_light", "hue", "saturation", "color", "luminosity"];
-fn blend(dst: &mut Frame, src: &Frame, opacity: f32, mode: &str, mask: Option<&dyn Fn(usize, usize) -> f32>) { blend_region(dst, src, opacity, mode, mask, None) }
+
+/// V8.7.0: sRGB EOTF/OETF via a small interpolated LUT -- no powf() in the per-pixel hot path. 1024 entries
+/// linearly interpolated is well under 1/4096 of an 8-bit step of error, far smaller than anything visible.
+const SRGB_LUT_N: usize = 1024;
+fn srgb_eotf_scalar(c: f32) -> f32 { let c = c.max(0.0); if c <= 0.040449936 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } }
+fn srgb_oetf_scalar(c: f32) -> f32 { let c = c.max(0.0); if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 } }
+fn srgb_eotf_lut() -> &'static [f32; SRGB_LUT_N] { static LUT: std::sync::OnceLock<[f32; SRGB_LUT_N]> = std::sync::OnceLock::new(); LUT.get_or_init(|| { let mut t = [0f32; SRGB_LUT_N]; for (i, v) in t.iter_mut().enumerate() { *v = srgb_eotf_scalar(i as f32 / (SRGB_LUT_N - 1) as f32); } t }) }
+fn srgb_oetf_lut() -> &'static [f32; SRGB_LUT_N] { static LUT: std::sync::OnceLock<[f32; SRGB_LUT_N]> = std::sync::OnceLock::new(); LUT.get_or_init(|| { let mut t = [0f32; SRGB_LUT_N]; for (i, v) in t.iter_mut().enumerate() { *v = srgb_oetf_scalar(i as f32 / (SRGB_LUT_N - 1) as f32); } t }) }
+#[inline] fn srgb_to_linear(v: f32) -> f32 { let lut = srgb_eotf_lut(); let x = v.clamp(0.0, 1.0) * (SRGB_LUT_N - 1) as f32; let i = x as usize; let f = x - i as f32; let i1 = (i + 1).min(SRGB_LUT_N - 1); lut[i] * (1.0 - f) + lut[i1] * f }
+#[inline] fn linear_to_srgb(v: f32) -> f32 { let lut = srgb_oetf_lut(); let x = v.clamp(0.0, 1.0) * (SRGB_LUT_N - 1) as f32; let i = x as usize; let f = x - i as f32; let i1 = (i + 1).min(SRGB_LUT_N - 1); lut[i] * (1.0 - f) + lut[i1] * f }
+
+/// V8.7.0: `blend`/`blend_region` composite in gamma space (today's default, unchanged above). When
+/// `linear` is true (Project.linear_blend), this instead linearizes RGB (not alpha -- alpha is a coverage
+/// fraction, not a light value) for the row range the blend actually touches, runs the existing blend math
+/// in linear light, then converts the result back -- the audit's #1 finding (a black->white crossfade
+/// midpoint of 128/255 by default, 188/255 the correct linear value). Deliberately NOT routed through the
+/// full color_pipeline (ACEScg working space, 16-bit decode, HDR): that measured ~3.4x slower on a real
+/// auto_edit export (144.7s vs 42.4s at 720p, see CHANGELOG v8.7.0) because it reroutes decode/effects/
+/// output through 16-bit float end to end. This touches only the actual composite step -- decode, grading
+/// effects (auto_grade, match_shot_look) and encode are completely unaffected, gamma space throughout.
+fn blend_opt(dst: &mut Frame, src: &Frame, opacity: f32, mode: &str, mask: Option<&dyn Fn(usize, usize) -> f32>, linear: bool) { blend_region_opt(dst, src, opacity, mode, mask, None, linear) }
+
+thread_local! {
+    /// Per-thread scratch for blend_region_opt's linearized src copy -- reused across the many blend calls
+    /// one worker thread makes within an export batch (std::thread::scope respawns threads per BATCH, not
+    /// per frame, so this still saves most of the repeated 720p/1080p-sized allocations within a batch).
+    static LINEAR_SRC_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Tight row AND column bounds of src's non-transparent pixels within [ry0,ry1) -- the same margin-skip
+/// blend_region already does per row, computed once up front so blend_region_opt only linearizes/delinearizes
+/// the pixels actually blended, not a layer's full (often mostly-transparent) bounding box.
+fn opaque_bounds(src: &Frame, w: usize, ry0: usize, ry1: usize, rx0: usize, rx1: usize) -> Option<(usize, usize, usize, usize)> {
+    let (mut top, mut bot, mut left, mut right) = (ry1, ry0, rx1, rx0);
+    for y in ry0..ry1 {
+        let srow = &src.d[y * w * 4..(y + 1) * w * 4];
+        let (mut x0, mut x1) = (rx0, rx1);
+        while x0 < rx1 && srow[x0 * 4 + 3] <= 0.0 { x0 += 1; }
+        if x0 == rx1 { continue; }
+        while x1 > x0 && srow[(x1 - 1) * 4 + 3] <= 0.0 { x1 -= 1; }
+        top = top.min(y); bot = y + 1; left = left.min(x0); right = right.max(x1);
+    }
+    if bot <= top || right <= left { None } else { Some((top, bot, left, right)) }
+}
+
+fn blend_region_opt(dst: &mut Frame, src: &Frame, opacity: f32, mode: &str, mask: Option<&dyn Fn(usize, usize) -> f32>, region: Option<(usize, usize, usize, usize)>, linear: bool) {
+    if !linear { blend_region(dst, src, opacity, mode, mask, region); return; }
+    let w = dst.w;
+    let (ry0, ry1, rx0, rx1) = match region { Some((a, b, c, d)) => (b.min(dst.h), (d + 1).min(dst.h), a.min(w), (c + 1).min(w)), None => (0, dst.h, 0, w) };
+    if ry0 >= ry1 || w == 0 { blend_region(dst, src, opacity, mode, mask, region); return; }
+    let Some((top, bot, left, right)) = opaque_bounds(src, w, ry0, ry1, rx0, rx1) else { return; }; // fully transparent in this region: nothing to blend, nothing to linearize
+    // V8.7.0 perf (root's 2026-11-02 steer, after the first cut measured ~29% over the ~15% budget): skip
+    // the sRGB<->linear round trip pixel-by-pixel, not just by bounding box. `m_id==0` ("normal", and
+    // anything not one of the 4 simple named ops or the >=5 W3C table) is a plain alpha-over whose blended
+    // color is the source verbatim -- blend_region's own `_ => s` arm -- so at full per-pixel coverage
+    // (layer alpha * opacity * mask == 1) `out = s` regardless of which color space `s` is read in, and at
+    // zero coverage dst is untouched either way. Only genuinely fractional-coverage pixels (AA glyph edges,
+    // an active crossfade's mid-range opacity, a soft mask) actually need the conversion; most of a typical
+    // frame (an opaque full-bleed clip, the interior of a caption's background box) does not, and this also
+    // avoids the LUT's small round-trip quantization noise on pixels a copy or a no-op would've left exact.
+    let m_id = match mode { "add" => 1, "multiply" => 2, "screen" => 3, "overlay" => 4, m => BLEND_MODES.iter().position(|x| *x == m).filter(|&k| k >= 5).unwrap_or(0) };
+    let normal_copy = m_id == 0;
+    LINEAR_SRC_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() != src.d.len() { buf.clear(); buf.resize(src.d.len(), 0.0); }
+        for y in top..bot { let row = y * w * 4; buf[row + left * 4..row + right * 4].copy_from_slice(&src.d[row + left * 4..row + right * 4]); }
+        for y in top..bot {
+            let row = y * w * 4;
+            for x in left..right {
+                let i = row + x * 4;
+                let a = buf[i + 3] * opacity * if let Some(m) = mask { m(x, y) } else { 1.0 };
+                if a <= 0.0 || (normal_copy && a >= 1.0) { continue; }
+                buf[i] = srgb_to_linear(buf[i]); buf[i + 1] = srgb_to_linear(buf[i + 1]); buf[i + 2] = srgb_to_linear(buf[i + 2]);
+                let d = &mut dst.d[i..i + 4]; d[0] = srgb_to_linear(d[0]); d[1] = srgb_to_linear(d[1]); d[2] = srgb_to_linear(d[2]);
+            }
+        }
+        // Swap the scratch buffer into a throwaway Frame for blend_region's &Frame signature, then take the
+        // Vec back out so the next call on this thread reuses the same allocation instead of a fresh one.
+        let src_lin = Frame { w: src.w, h: src.h, d: std::mem::take(&mut *buf) };
+        blend_region(dst, &src_lin, opacity, mode, mask, Some((left, top, right.saturating_sub(1), bot.saturating_sub(1))));
+        *buf = src_lin.d;
+        for y in top..bot {
+            let row = y * w * 4;
+            for x in left..right {
+                let i = row + x * 4;
+                let a = buf[i + 3] * opacity * if let Some(m) = mask { m(x, y) } else { 1.0 };
+                if a <= 0.0 || (normal_copy && a >= 1.0) { continue; }
+                let d = &mut dst.d[i..i + 4]; d[0] = linear_to_srgb(d[0]); d[1] = linear_to_srgb(d[1]); d[2] = linear_to_srgb(d[2]);
+            }
+        }
+    });
+}
 /// `region` (x0,y0,x1,y1 inclusive) must contain every pixel of `src` with alpha > 0; pixels outside are skipped without scanning (bit-identical to a full scan).
 fn blend_region(dst: &mut Frame, src: &Frame, opacity: f32, mode: &str, mask: Option<&dyn Fn(usize, usize) -> f32>, region: Option<(usize, usize, usize, usize)>) {
     let w = dst.w; let m_id = match mode { "add" => 1, "multiply" => 2, "screen" => 3, "overlay" => 4, m => BLEND_MODES.iter().position(|x| *x == m).filter(|&k| k >= 5).unwrap_or(0) };
@@ -832,7 +937,7 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
             if c.effects.iter().any(|e| crate::effects2::is_post(&e.kind)) { BACKDROP.with(|b| *b.borrow_mut() = Some(std::rc::Rc::new(Frame { w, h, d: out.d.clone() }))); crate::frosted::set_post(true); crate::frosted::set_tilt((ryv.to_radians().sin()) as f32, (-rxv.to_radians().sin()) as f32); crate::frosted::set_slab(Some(crate::three_d::Projector::new(w, h, &cam, &pose)));
                 let r: Result<(), String> = (|| { for e in c.effects.iter().filter(|e| crate::effects2::is_post(&e.kind)) { effects::apply(&e.kind, &e.params, &e.strings, &mut f3, lt, seed)?; } Ok(()) })();
                 crate::frosted::set_post(false); crate::frosted::set_tilt(0.0, 0.0); crate::frosted::set_slab(None); BACKDROP.with(|b| *b.borrow_mut() = None); r?; }
-            blend(&mut out, &f3, op, c_blend, mask.as_deref()); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
+            blend_opt(&mut out, &f3, op, c_blend, mask.as_deref(), p.linear_blend); if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } } continue;
         }
         crate::comp3d::flush(&mut out, &mut g3, p, t);
         // opt-in exact shutter (set_motion_blur samples / shutter_phase / shutter_curve); None keeps the legacy centred fixed-count sampler unchanged
@@ -870,11 +975,11 @@ pub fn render_frame_opts(p_in: &Project, t: f64, cache: &Cache, transparent: boo
         if let Some(cf) = tplan.as_ref().and_then(|pl| pl.compose.as_ref()) { out = cf(&out, &f); continue; }
         if let Source::ShardBurst(sb) = &c.source { if let Some(d) = crate::shards::take_disp() { crate::shards::refract_canvas(&mut out, &d, &f, sb.refract_dispersion.clamp(0.0, 1.0)); } }
         if let Some(acc) = eacc.as_mut() { let wgt = op / (ne + 1) as f32; for i in 0..w * h { let a = f.d[i * 4 + 3] * wgt; if a > 0.0 { for j in 0..3 { acc.d[i * 4 + j] += f.d[i * 4 + j] * a; } acc.d[i * 4 + 3] += a; } } continue; }
-        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region(&mut out, &f, op, c_blend, mask.as_deref(), rect); prof("blend", tp);
+        let tp=std::time::Instant::now(); let rect = if from_tb { LAST_RECT.with(|l| l.get()) } else { None }; blend_region_opt(&mut out, &f, op, c_blend, mask.as_deref(), rect, p.linear_blend); prof("blend", tp);
         if let Some(r) = rect { pool_give(f, r); }
         if let Some(pl) = &tplan { if let Some(ov) = &pl.overlay { ov(&mut out); } }
         }
-        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend(&mut out, &acc, 1.0, &c.blend, None); }
+        if let Some(mut acc) = eacc { crate::comp3d::flush(&mut out, &mut g3, p, t); for i in 0..w * h { let a = acc.d[i * 4 + 3]; if a > 1e-6 { for j in 0..3 { acc.d[i * 4 + j] /= a; } } } blend_opt(&mut out, &acc, 1.0, &c.blend, None, p.linear_blend); }
     }}
     crate::comp3d::flush(&mut out, &mut g3, p, t);
     prof_dump();
@@ -892,6 +997,9 @@ pub fn to_rgba8(f: &Frame) -> Vec<u8> { f.d.iter().map(|v| (v.clamp(0.0, 1.0) * 
 /// Deterministic TPDF dither (sum of two uniforms, +/-1 LSB triangular PDF) applied in
 /// display-referred [0,1] before 8-bit rounding. Fixed splitmix64 seed keyed on channel
 /// index: same frame in, same bytes out. Kills mid-gradient quantization terraces.
+/// V8.7.0: wired into legacy video export's per-frame quantization (export_range_cmd), gated on
+/// p.color_pipeline.enabled alongside linear-light compositing and the lanczos fit above -- previously
+/// only write_image_tpdf (stills) called this.
 fn tpdf_lsb(i: usize) -> f64 { fn sm(mut x: u64) -> u64 { x = x.wrapping_add(0x9E3779B97F4A7C15); x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9); x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB); x ^ (x >> 31) } let u1 = (sm(0xD1B54A32D192ED03 ^ (i as u64).wrapping_mul(2)) >> 11) as f64 * (1.0 / 9007199254740992.0); let u2 = (sm(0xD1B54A32D192ED03 ^ (i as u64).wrapping_mul(2).wrapping_add(1)) >> 11) as f64 * (1.0 / 9007199254740992.0); u1 + u2 - 1.0 }
 pub fn to_rgba8_tpdf(f: &Frame) -> Vec<u8> { f.d.iter().enumerate().map(|(i, v)| (((v.clamp(0.0, 1.0) + (tpdf_lsb(i) * (1.0 / 255.0)) as f32) * 255.0 + 0.5).clamp(0.0, 255.0)) as u8).collect() }
 
@@ -1074,7 +1182,7 @@ pub(crate) fn export_range_cmd(p: &Project, path: &str, f0: usize, f1: usize, mu
                 // work queue: nt workers pull frame indices, so one slow frame (shards) no longer idles the other cores
                 let next = std::sync::atomic::AtomicUsize::new(i); let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>, String>>>> = (i..end).map(|_| std::sync::Mutex::new(None)).collect();
                 std::thread::scope(|sc| { for _ in 0..nt.min(end - i) { let (cache, next, slots) = (&cache, &next, &slots); crate::guard::scope_spawn(sc, move || loop { let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst); if k >= end { break; }
-                    let tf0 = std::time::Instant::now(); let res = render_frame_opts(p, (f0 + k) as f64 / p.fps, cache, transparent).and_then(|mut f| {if transparent { unpremultiply(&mut f); } prof("frame_total", tf0); let tq = std::time::Instant::now(); crate::color::pipeline::output(p,&mut f)?; prof("pipe_out", tq); let tq = std::time::Instant::now(); let r = to_rgba8(&f); prof("to_rgba8", tq); Ok(r)}); *slots[k - i].lock().unwrap() = Some(res); }); } });
+                    let tf0 = std::time::Instant::now(); let res = render_frame_opts(p, (f0 + k) as f64 / p.fps, cache, transparent).and_then(|mut f| {if transparent { unpremultiply(&mut f); } prof("frame_total", tf0); let tq = std::time::Instant::now(); crate::color::pipeline::output(p,&mut f)?; prof("pipe_out", tq); let tq = std::time::Instant::now(); let r = if p.linear_blend { to_rgba8_tpdf(&f) } else { to_rgba8(&f) }; prof("to_rgba8", tq); Ok(r)}); *slots[k - i].lock().unwrap() = Some(res); }); } });
                 let frames: Vec<Result<Vec<u8>, String>> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
                 for f in frames { if frame_tx.send(f?).is_err() { return Err("encoder closed early".into()); } }
                 if let Some(handle) = prefetch {
@@ -1132,7 +1240,7 @@ pub fn render_clip_alone_as(p: &Project, c: &Clip, t: f64, cache: &Cache) -> Opt
     let mut srcs: Vec<std::sync::Arc<Clip>> = vec![];
     for e in c.effects.iter() { let Some(k) = crate::layerfx::source_key(&e.kind) else { continue };
         if let Some(m) = e.strings.get(k).and_then(|id| p.find_clip(id)).filter(|m| m.id != c.id && !srcs.iter().any(|s| s.id == m.id)) { let mut m = m.clone(); m.start += t - crate::pushwipe::luma_time(p, &m, t); srcs.push(std::sync::Arc::new(m)); } }
-    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
+    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
     MATTE_DEPTH.with(|d| d.set(d.get() + 1)); let r = render_frame_opts(&sub, t, cache, true).ok(); MATTE_DEPTH.with(|d| d.set(d.get() - 1)); r
 }
 

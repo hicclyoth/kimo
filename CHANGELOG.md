@@ -1,3 +1,90 @@
+## v8.7.0 "linear light" (2026-11-02)
+
+Linear-light compositing, Lanczos scaling, and TPDF dither for the finished `auto_edit` render (audit items
+#1, #4, #6). All three are gated on one new project field, `linear_blend` (default `false`, off for every
+existing project file and for `golden_frames.txt`/`recipe_frames.txt`, which are untouched by this commit);
+`auto_edit` turns it on as its own last step (`linear_compositing`, default `true`), the way 8.5.7 scoped
+whip intensity to `auto_edit` -- a direct `project_set` caller still gets the old gamma-space, bicubic,
+undithered output unless it opts in.
+
+**1. Linear-light compositing** (`render.rs::blend_region_opt`): the audit measured a black-to-white
+crossfade midpoint at 128/255 by default (naive gamma-space average) vs 188/255 with the switch on, the
+physically correct linear value -- confirmed by `crossfade_midpoint_is_188_with_the_option_on` /
+`..._128_with_the_option_off` in `tests/quality_v870.rs`. This is **not** the heavier `color_pipeline`
+(ACEScg working space, 16-bit decode, HDR, `color/pipeline.rs`) -- that measured ~3.4x slower end to end
+(144.7s vs 42.4s at 720p) on a real `auto_edit` export, far past budget. `linear_blend` instead linearizes
+only the actual alpha-composite step via a small interpolated sRGB EOTF/OETF LUT (1024 entries, well under
+1/4096 of an 8-bit step of error) and leaves decode, grading effects and encode untouched.
+
+**2. Lanczos fit** (`render.rs::clip_fit_filter`, pulled out of `decode()` as its own testable function): the
+clip-to-canvas scale/fit ffmpeg filter gets `flags=lanczos` when the option is on, replacing ffmpeg's
+undecorated default (bicubic) -- `lanczos_is_selected_in_the_fit_filter_string_when_the_option_is_on`.
+
+**3. TPDF dither** (`to_rgba8_tpdf`, previously wired only to PNG stills): now used for final video
+quantization when the option is on, instead of plain truncating `to_rgba8` --
+`dither_produces_no_banding_steps_over_a_smooth_gradient` renders a shallow 0.10-0.30 ramp across a 2000px
+frame and checks the dithered row has no long flat terraces, does not lose level coverage, and has small,
+unbiased (mean error < 0.2), triangular-PDF-shaped error (std 0.15-0.9 LSB) against plain truncation's
+textbook banding.
+
+`option_off_is_bit_identical_to_before` pins the default (option off) fit-filter strings and crossfade
+output to their pre-8.7.0 values exactly.
+
+**Performance, and a real correction mid-flight.** An early milestone reported linear-light as "basically
+free" (40.0s vs 39.9s at 720p); that run did not actually have the option active end-to-end, and the real
+first-cut cost was ~3.4x slower (144.7s vs 42.4s at 720p) via the full `color_pipeline` route, then ~29%
+slower (not yet the ~15% budget) after switching to the lightweight `linear_blend` LUT path with a
+reusable scratch buffer and a tight bounding-box scan. The fix that closed the gap: `blend_region_opt` now
+skips the sRGB<->linear round trip **per pixel**, not just by bounding box -- in `normal` blend mode (the
+`_ => s` arm: output is the source colour verbatim, independent of colour space) a pixel at full effective
+coverage (layer alpha x opacity x mask == 1) needs no conversion at all, and a pixel at zero coverage leaves
+`dst` untouched either way; only genuinely fractional-coverage pixels (AA glyph edges, an active
+crossfade's mid-range opacity, a soft mask) still pay for it. Verified on a real 10s 720p clip (talking
+head + 2 broll, captions/grade/punch-ins/push-in/end-screen all on), 2 runs each, output md5 confirmed to
+differ between on/off (option genuinely exercised): **off 78.98s / 74.70s, on 78.87s / 77.31s -- about 2%
+overhead**, well inside the ~15% budget. `linear_blend`/`linear_compositing` ship **on by default** for
+`auto_edit`.
+
+**The full benchmark**, re-rendered against the current binary after this change
+(`examples/auto_edit_benchmark.py` on `v7q_real`, boxed captions, platform none):
+`/home/user/tab/files/v7q/core_v02.mp4`, md5 `d293a5612478ec844b9a0bf48639599d` (mtime newer than the
+binary). This necessarily differs from `real_v62.mp4` (md5 `dac36d18de29f81da090006d262c46c2`) now that
+`auto_edit` defaults to linear-light + Lanczos + dither: **all 656 of 656 video-stream framemd5 lines
+differ, 0 of 1025 audio-stream framemd5 lines differ** -- Lanczos changes the scale filter on every clip
+(not just transitions) and TPDF dither perturbs the low bits of essentially every output pixel by
+construction, so a global difference across all frames is the expected signature of this change, not a
+correctness problem; the untouched audio stream confirms nothing outside the video compositing path moved.
+
+**Visual verdict** (`/home/user/tab/files/v7q/linear_v62_vs_core02.png`, viewed at full size): compared
+`real_v62.mp4` (pre-8.7.0) against `core_v02.mp4` at the whip transition (~4.2s), a boxed caption over
+footage (~10s), the subscribe-pill's partial-alpha fade-in (~18.9s), and the blurred end-card backdrop
+(~20s), with full-resolution crops and a measured pixel diff per crop (mean delta 4.2-14.5/255, max
+51-107/255, 67-97% of pixels touched -- real, not noise). Honest read: **better, not worse**. The end-card
+backdrop blur is visibly smoother with less blotchy/banded shading and slightly more neutral colour
+balance; footage behind captions and b-roll shows more fine texture from the Lanczos fit; the whip blur and
+the pill fade-in are indistinguishable by eye at normal viewing size (expected -- the correction matters
+most at true midtone fades, and the audit's 128-vs-188 case is the extreme 50/50 black/white example, not
+these specific frames). No regression spotted: no caption or glow thinned, brightened, or blown out.
+
+Tests (scoped suite, all green): golden_frames, recipes, registry_lint, registry_unique, external_refs,
+description_first_sentence, auto_edit (26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, director_small (50; one run hit the suite's already-documented box-load timing flake on
+an unrelated test, `lint_edit_scans_a_long_clip_without_rescanning_from_its_start_each_sample`, clean on
+retry and in isolation), plus 6 new tests in `tests/quality_v870.rs`. Warnings: 34 (unchanged, within the
+35 cap).
+
+`golden_frames.txt` and `recipe_frames.txt` are byte-identical to before this commit (unchanged, verified
+by `git diff --stat`). `golden_project.txt` (10 scenes) and 2 entries in `golden_registry.txt`
+(`auto_edit`, `project_set`) were hand-updated: adding the new `linear_blend` project field necessarily
+changes every scene's *serialized project JSON* (which `golden_project.txt` hashes), even though not one
+rendered pixel moved (every scene uses the default, option-off path; `golden_frames.txt`'s actual frame
+hashes for those same 10 scenes are untouched), and `auto_edit`/`project_set`'s registry hashes changed
+because their schemas gained a new parameter -- the values were computed directly from this build (not via
+`KIMO_UPDATE_GOLDEN`, which this project never runs) and hand-written into both files, the same allowance
+the brief gives for an intentional tool-schema change.
+
+Version bumped to 8.7.0 with this entry; `Cargo.lock`'s three workspace members follow.
+
 ## v8.6.2 (2026-11-02)
 
 Build fix: `ffmpeg-next` (and the `libav_decode` module it backs) is now an **optional** cargo feature,

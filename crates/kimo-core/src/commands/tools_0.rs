@@ -40,14 +40,17 @@ fn add_clip_place(ss: &mut Session, a: &Value, mode: Option<&str>, ripple_tracks
 
 pub(super) fn tools(eff_kinds: &[&str]) -> Vec<Command> {
     vec![
-    Command { name: "project_set", description: "Set project canvas size and frame rate (and optional name).", mutates: true,
-        schema: obj(vec![("width", n("pixels")), ("height", n("pixels")), ("fps", n("frames per second")), ("name", s("project name"))], &[]),
+    Command { name: "project_set", description: "Set project canvas size and frame rate (name, linear quality option).", mutates: true,
+        schema: obj(vec![("width", n("pixels")), ("height", n("pixels")), ("fps", n("frames per second")), ("name", s("project name")),
+            ("linear_blend", json!({"type":"boolean"}))],
+            &[]),
         run: |ss, a| { let p = &mut ss.project;
             if let Some(v) = a.get("width").and_then(|v| v.as_u64()) { if !(16..=16384).contains(&v) { return Err(format!("width {v} out of range 16..16384")); } p.width = v as u32; }
             if let Some(v) = a.get("height").and_then(|v| v.as_u64()) { if !(16..=16384).contains(&v) { return Err(format!("height {v} out of range 16..16384")); } p.height = v as u32; }
             if let Some(v) = a.get("fps").and_then(|v| v.as_f64()) { if !(1.0..=480.0).contains(&v) { return Err(format!("fps {v} out of range 1..480")); } p.fps = v; }
             if let Some(v) = a.get("name").and_then(|v| v.as_str()) { p.name = v.into(); }
-            Ok(json!({"width":p.width,"height":p.height,"fps":p.fps})) } },
+            if let Some(v) = a.get("linear_blend").and_then(|v| v.as_bool()) { p.linear_blend = v; }
+            Ok(json!({"width":p.width,"height":p.height,"fps":p.fps,"linear_blend":p.linear_blend})) } },
     Command { name: "import_media", description: "Import a video file as an asset (probes size/duration). Returns asset id.", mutates: true,
         schema: obj(vec![("path", s("absolute path to media file"))], &["path"]),
         run: |ss, a| { let path = str_arg(a, "path")?; let (w, h, d, fps) = render::probe(path)?; render::check_importable(path)?;

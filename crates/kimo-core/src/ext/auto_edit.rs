@@ -130,6 +130,21 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let end_screen_text = a.get("end_screen_text").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("SUBSCRIBE FOR MORE").to_string();
     let end_screen_duration = opt_num(a, "end_screen_duration", 3.0).clamp(2.0, 4.0);
     let pacing_on = a.get("pacing").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.7.0: picture-quality render mode for the finished edit -- linear-light compositing (crossfades/
+    // b-roll keying/captions blend correctly instead of the gamma-space default: the audit measured a
+    // black->white crossfade midpoint at 128/255 by default vs 188/255, the physically correct linear
+    // value), lanczos scaling on the clip-to-canvas fit, and TPDF dither on final 8-bit quantization -- all
+    // three gated on the SAME project.linear_blend switch (render.rs), a fast compositing-only option, NOT
+    // the heavier color_pipeline (which measured ~3.4x slower end to end -- see CHANGELOG v8.7.0). Scoped
+    // the way 8.5.7 scoped whip intensity to auto_edit: this flips the option on the PROJECT auto_edit
+    // hands back, as the very last change it makes, after every grading/matching/lint call above has
+    // already run its own measurement and set its own effect gains against the ordinary display-referred
+    // frames those tools have always read -- none of that analysis changes, because linear_blend only
+    // touches the actual alpha-composite step (render.rs::blend_region_opt), not decode or effects. Only
+    // the later render (export, called separately by the caller) sees the option on. Building a project by
+    // hand leaves linear_blend at its default (false), so golden_frames.txt / recipe_frames.txt (built
+    // without auto_edit) stay byte-identical.
+    let linear_compositing_on = a.get("linear_compositing").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -591,9 +606,21 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         }
     }
 
+    // V8.7.0: turn on the picture-quality render option for the finished project (see linear_compositing_on
+    // above) -- last step, after every stage above has already run against the ordinary display-referred
+    // frames it has always read. project_set's linear_blend (a fast, compositing-only option -- see
+    // render.rs::blend_region_opt) is a plain project field, not the heavier set_color_pipeline (ACEScg
+    // working space, 16-bit decode, HDR): that measured ~3.4x slower on this exact benchmark (144.7s vs
+    // 42.4s at 720p, see CHANGELOG v8.7.0), well past "doesn't tank speed" -- the audit's measured 188/255
+    // crossfade midpoint comes just as correctly from the lighter option.
+    if linear_compositing_on {
+        call(ss, "project_set", &json!({"linear_blend": true}))?;
+    }
+
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
         "stages": stages, "warnings": warnings, "lint_clean": lint_ok, "remaining_problems": remaining,
+        "linear_compositing": linear_compositing_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -631,6 +658,7 @@ pub fn commands() -> Vec<Command> {
                 ("end_screen_text", s("outro card text, default SUBSCRIBE FOR MORE")),
                 ("end_screen_duration", n("outro card seconds, default 3.0, clamped 2..4")),
                 ("pacing", json!({"type": "boolean", "description": "tighten_pauses: shrink the dead air rough_cut leaves inside its own kept clips (a breath between phrases, the lead-in before the first word) down to a natural pad; default true"})),
+                ("linear_compositing", json!({"type": "boolean", "description": "default true: linear-light blend, lanczos fit, dither"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }
