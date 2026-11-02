@@ -201,7 +201,16 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
             let dur = ss.project.find_clip(cid).map_or(0.0, |c| c.duration);
             if dur < broll_transition_duration * 1.5 { continue; }
             let kind = KINDS[i % KINDS.len()];
-            if let Err(e) = call(ss, "add_transition", &json!({"clip_id": cid, "kind": kind, "duration": broll_transition_duration})) {
+            let mut tr_args = json!({"clip_id": cid, "kind": kind, "duration": broll_transition_duration});
+            if kind == "whip_left" {
+                // V8.5.7: opt-in-safe extra margin on top of the transitions.rs fix (whip_left/
+                // whip_right now reads crisp even at the tool's own default intensity, 1.0) --
+                // auto_edit fires this on every b-roll cutaway, so a touch gentler here keeps a
+                // run of several whips from ever feeling heavy. A caller invoking add_transition
+                // directly keeps the tool's own default (1.0) untouched.
+                tr_args["intensity"] = json!(0.65);
+            }
+            if let Err(e) = call(ss, "add_transition", &tr_args) {
                 warnings.push(format!("b-roll transition skipped on clip {cid}: {e}"));
             }
         }

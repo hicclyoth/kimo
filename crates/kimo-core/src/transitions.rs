@@ -106,8 +106,49 @@ pub fn plan(tr: &Transition, lt: f64, w: usize, h: usize) -> Plan {
                 let crack = (1.0 - edge / (1.0 + cs * 0.018)).clamp(0.0, 1.0).powi(2); let born = sstep((k - 0.02 - lg * 0.9) / 0.06); let gone = 1.0 - sstep((k - 0.3 - lg) / 0.2);
                 let glow = (1.0 - edge / (cs * 0.12)).clamp(0.0, 1.0).powi(2) * 0.25; let a = (crack + glow) * born * gone * it; if a <= 0.0 { continue; } let i = (y * f.w + x) * 4; f.d[i] += a * 1.0; f.d[i + 1] += a * 0.97; f.d[i + 2] += a * 0.92; } } }));
             let kk = k as f64; p.scale = 1.0 + 0.04 * (1.0 - kk); }
-        "whip_left" | "whip_right" => { let s = if tr.kind == "whip_left" { 1.0 } else { -1.0 }; p.dx = s * (1.0 - k as f64) * w as f64; let vel = ((1.0 - k) * 4.0 * k).max(0.0).min(1.0) * wf * 0.35 * tr.intensity as f32; p.post = Some(Box::new(move |f| dir_blur(f, vel, 0.0, 16))); p.op = 1.0;
-            let v2 = vel; p.overlay = Some(Box::new(move |f| dir_blur(f, v2 * 0.6, 0.0, 12))); }
+        "whip_left" | "whip_right" => {
+            // V8.5.7: a pro whip pan is short and strong, concentrated on only the middle
+            // frames, with the outgoing AND incoming shots staying sharp right up to the peak.
+            // The old shape here (plain envelope 4k(1-k), one box blur up to ~0.35*frame-width
+            // wide on only 16 taps, plus a second `overlay` blur that render.rs re-applies to
+            // the whole ALREADY COMPOSITED frame -- incoming shot included) held visible blur
+            // over most of the transition and read as ghosting/mush rather than a streak (16
+            // taps spread across ~450px at full intensity is ~30px between samples, i.e.
+            // distinct echoes, not a blur). Fixed: the envelope is raised to a power so it only
+            // really fires near k=0.5; the peak width is tightened; the tap count scales with
+            // the blur width so samples never land more than ~3px apart (no more combing); and
+            // there is no longer any `overlay` pass -- only the outgoing clip's own frame
+            // (`post`) is ever touched, so the incoming shot is never blurred by this transition.
+            //
+            // V8.5.7 follow-up: that first fix only ever touched `post`, which render.rs runs
+            // on the INCOMING clip's own frame before it is blended on top -- it never touches
+            // `out`, the already-composited backdrop the incoming clip is drawn over (the
+            // outgoing talking-head layer, still playing underneath on its own track/time).
+            // So the outgoing layer stayed perfectly sharp and static for the whole transition
+            // while only the incoming b-roll ever got any blur: a cheap slide/wipe, not a
+            // whip-pan. A real whip blurs BOTH layers along the motion direction with the SAME
+            // envelope, peaking together at the midpoint. `under` is the hook render.rs runs on
+            // `out` right before this clip is blended on top (it is how push/gradient_wipe move
+            // the outgoing picture already); using the identical vel/n here gives the backdrop
+            // the matching streak -- sharp at k=0, streaked near the middle, sharp again well
+            // before k=1 -- with no extra taps and no change to the incoming side at all. With
+            // no abutting same-track outgoing clip (the normal auto_edit b-roll-over-talking-
+            // head case), `prev` is None and the blur runs on `out` in place; with one (a push-
+            // style abutting cut), `prev` is that clip's own frame, blurred the same way and
+            // drawn back over `out` unshifted (its position is already correct).
+            let s = if tr.kind == "whip_left" { 1.0 } else { -1.0 };
+            p.dx = s * (1.0 - k as f64) * w as f64;
+            let base = ((1.0 - k) * 4.0 * k).clamp(0.0, 1.0);
+            let env = base.powf(2.4);
+            let vel = env * wf * 0.22 * tr.intensity as f32;
+            let n = ((vel.abs() / 3.0).ceil() as usize).clamp(16, 64);
+            p.post = Some(Box::new(move |f| dir_blur(f, vel, 0.0, n)));
+            p.under = Some(Box::new(move |out, prev| match prev {
+                Some(a) => { let mut bf = Frame { w: a.w, h: a.h, d: a.d.clone() }; dir_blur(&mut bf, vel, 0.0, n); crate::pushwipe::over_shifted(out, &bf, 0.0, 0.0); }
+                None => dir_blur(out, vel, 0.0, n),
+            }));
+            p.op = 1.0;
+        }
         "ripple_dissolve" => { // concentric rings expanding from centre, a sine-perturbed radial threshold (same
             // sstep((k*(1+sw)-n)/sw) shape as noise_dissolve, n clamped to 0..1 so k=0/1 are always pure)
             let (cx, cy) = (wf / 2.0, hf / 2.0); let maxd = (cx * cx + cy * cy).sqrt().max(1.0);

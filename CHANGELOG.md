@@ -1,3 +1,84 @@
+## v8.5.7 (2026-11-02)
+
+The montage review (`montage_v85_v06.mp4`) and the benchmark (`real_v59.mp4`) both flagged the
+`whip_left` transition into the first b-roll cutaway (around 4.05-4.07s) as a long smear instead of a
+crisp whip-pan -- the outgoing talking-head shot and the incoming b-roll both turned to mush for several
+frames in a row, with visible ghosting/double-image, not a clean directional streak.
+
+Root cause, found by extracting and viewing the actual frames (not eyeballing the finished clip): three
+separate bugs stacked up in `whip_left`/`whip_right` (`transitions.rs`, `plan()`):
+
+- The blur's peak width scaled as `frame_width * 0.35 * intensity` -- about 450px at 1280px wide and
+  intensity 1.0, roughly a third of the frame -- using only 16 box-filter taps. Taps that far apart
+  (~30px) don't blend into a streak, they sample distinct "echoes" of the image: ghosting, not blur.
+- A second directional blur (`overlay`, 0.6x the first, 12 taps) was applied by `render.rs` to the
+  **already-composited** frame -- both the outgoing clip being wiped away AND the incoming clip already
+  drawn underneath it -- so the incoming shot was smeared too, compounding the mush and directly
+  contradicting "the outgoing and incoming shots stay sharp right up to the blur peak."
+- The blur envelope was a plain `4k(1-k)` parabola, which stays above half its peak strength across
+  roughly 70% of the transition's own duration -- so most of the window read as blurred, not just the
+  middle frames.
+
+Fixed, all in `whip_left`/`whip_right`:
+
+- **The envelope is raised to a power** (`(4k(1-k))^2.4`), concentrating the blur on only the 2-3 frames
+  nearest the midpoint; the outgoing clip's own start and end frames now measure <=2px of blur width
+  (effectively untouched), same as before the fix, but now true for several surrounding frames too, not
+  just the exact endpoint.
+- **The peak blur width is tightened** (`frame_width * 0.22 * intensity`, down from `0.35`).
+- **The tap count now scales with the blur width** (`ceil(width / 3)`, clamped 16-64) so samples never
+  land more than ~3px apart -- the ghosting/double-image is gone regardless of how wide the blur gets.
+- **The `overlay` pass is removed.** Only the outgoing clip's own frame (`post`) is ever blurred by this
+  transition now; the incoming shot is never touched.
+- `auto_edit`'s own b-roll-cutaway call now passes `intensity: 0.65` explicitly for its `whip_left`
+  transitions specifically (opt-in-safe: a caller invoking `add_transition` directly still gets the
+  tool's own default, 1.0, untouched) -- auto_edit fires this on every cutaway, so a touch gentler here
+  keeps a run of several whips from ever feeling heavy.
+- New TDD coverage in `tests/whip_transition.rs`, measuring blur width directly off a rendered frame
+  (a hard edge's blurred transition-zone width) rather than eyeballing: the whip's own start/end frames
+  stay <=2px blurred, the peak frame carries a real >60px blur (so the fix doesn't just chase smearing
+  down to nothing), at most 5 of 9 sampled frames across the transition exceed a 20px visible-smear
+  threshold (was ~7-8 of 9 on the old code), `whip_right` mirrors `whip_left`, and `overlay` is confirmed
+  gone for both kinds.
+
+Verified against the real-footage benchmark (the first render of this fix): `real_v60.mp4`, md5
+`5919a8ece4f42e7426dac17a57e70f00` (was `real_v59.mp4`, md5 `9740b7c1b1f481db441d2f1f871e748e`). `framemd5`
+showed frames 98-197 differ (t=3.267-6.567s, audio bit-identical throughout); comparing against a
+side-by-side rebuild of the OLD 8.5.6 binary isolated the real content change to frames 124-128
+(t=4.13-4.27s, mean pixel delta 9.8-20.6 of 255) -- exactly the whip's own transition window (clip1 starts
+at 4.067s, duration 0.25s) -- while frames 98-122 and 130-196 carry only ordinary lossy-codec
+lookahead/mb-tree ripple (mean <1.4, max ~35-65 of 255, invisible), the same class already documented here
+for `real_v57` vs `real_v56`. The diff stops cleanly at frame 197/198, exactly the next scene cut (`clip1`
+-> `clip2`), which resets the encoder's own lookahead. Viewed the actual before/after frames directly: the
+old whip held visible ghosting/combing for about 6 frames; this first fix kept the outgoing shot sharp
+through t=4.133s, carried one real (clean, not ghosted) blur frame around t=4.2s, and the incoming shot was
+already sharp by t=4.267s.
+
+**Follow-up, same version:** that first fix only ever blurred the INCOMING clip's own frame (`post`, which
+`render.rs` runs before this clip is blended on top). It never touched `out`, the already-composited
+backdrop under it -- the outgoing layer, still playing on its own track/time (for `auto_edit`'s b-roll
+cutaways, the talking-head track continuing underneath). So the outgoing shot stayed perfectly sharp and
+completely static through the whole transition while only the incoming b-roll ever got any blur: a cheap
+slide/wipe, not a whip-pan, confirmed by viewing the actual frames at 1280x720 (the outgoing talking-head
+was crisp at the exact moment the incoming b-roll was streaked and already covering about 80% of the
+frame). A real whip blurs BOTH layers along the motion direction with the SAME envelope, peaking together
+at the midpoint. Fixed by also setting `under` -- the hook `render.rs` already runs on `out` right before
+this clip blends on top (it's how `push`/`gradient_wipe` move the outgoing picture) -- using the identical
+`vel`/`n` as the existing `post`, so the backdrop gets the matching streak with no new taps and no change
+to the incoming side: sharp at k=0, >40px blurred at the midpoint, sharp again (<=4px) by k=0.9, same as
+the incoming layer. 5 new tests in `tests/whip_transition.rs` cover it directly (outgoing-midpoint blur,
+outgoing-sharp-at-start, both layers sharp-by-k=0.9, no ghosting on either layer via the `under`/`post`
+hooks on a synthetic edge frame).
+
+Re-verified against the real-footage benchmark: rebuilt `real_v61.mp4`, md5
+`41caa0f5048e5cfa193b5071f2367953` (was `real_v60.mp4`, md5 `5919a8ece4f42e7426dac17a57e70f00`). `framemd5`
+shows frames 98-197 differ again (same window; a per-pixel diff against `real_v60.mp4` isolates the real
+change to frames 123-128, t=4.1-4.27s, mean pixel delta up to 14.6 of 255 -- the outgoing layer now
+streaking alongside the incoming one -- while the rest of the 98-197 range carries only the same ordinary
+encoder-ripple class as before). Viewed the before/after frames directly (`whip_v06_v07_v08.png`,
+`montage_v85_v08.mp4`): at the transition's midpoint the outgoing talking-head is now visibly streaked
+along with the incoming b-roll, reading as a real whip-pan rather than a slide with a blurred overlay.
+
 ## v8.5.6 (2026-11-02)
 
 The montage review (real-footage cut, `montage_v85_v05.mp4`) flagged a long talking-head stretch that read
