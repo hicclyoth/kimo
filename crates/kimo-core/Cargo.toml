@@ -25,6 +25,7 @@ opensubdiv-rs = { version = "=0.1.3" }
 
 # v6 eyes audio_spectrum (2026-10-17): rustfft 6.4.1, MIT OR Apache-2.0.
 rustfft = "=6.4.1"
+ffmpeg-next = { version = "5", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [features]
 default = ["surface-contour"]

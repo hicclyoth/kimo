@@ -1,3 +1,52 @@
+## v8.6.1 (2026-11-02)
+
+Phase 1b: an in-process libav decoder (the `ffmpeg-next` crate, pinned to 5.1.1 to match this box's
+ffmpeg 5.1.9), behind `KIMO_DECODER=libav`. The default stays the ffmpeg-CLI pipe in `render.rs::decode()`
+-- this is kept **opt-in**, not the default, because it is not faster here (see MEASURED below); the
+brief's own rule was to default it only if it proved both correct and faster, and it is only the first.
+
+**What it is** (`crates/kimo-core/src/libav_decode.rs`): one long-lived `LibavDecoder` per source path,
+pooled process-wide and reused across an export's whole batch sequence -- opened once, seeked only when a
+request goes backward, decoding forward from wherever it already is otherwise (no ffmpeg process respawned
+per window, unlike the pipe path at render.rs:202). Frame-accurate seek (seek to the keyframe at/before the
+target, flush, decode-forward) and CFR conform (map each output tick to the right source frame when the
+source's own rate doesn't match the project's) via swscale (BICUBIC, matching the `scale` filter's own
+default) plus a hand-written centre-crop/pad matching `decode()`'s `fitf` stretch/cover/contain modes
+exactly. Scope: ordinary 8-bit video at constant speed 1.0, not time-remapped, not reframe-active, not a
+still image or EXR/TIFF/kimopx, color_pipeline disabled (`libav_decode::supported()` is the one source of
+truth for this; `decode()` checks it and falls straight through to the existing pipe path on anything
+outside it, or on any libav error -- this can never make an export fail that would otherwise have
+succeeded).
+
+**Correctness, proven two ways:**
+- A genuinely variable-frame-rate fixture built by the test itself (6 distinctly-coloured frames at
+  irregular real timestamps: 0 / 0.52 / 0.60 / 0.92 / 1.12 / 1.52s), conformed to a 10fps CFR project and
+  compared frame-for-frame against the existing ffmpeg-pipe decode: **max pixel delta 0, mean 0.0000** over
+  311,296 bytes (`tests/libav_vfr_conform.rs`). Getting this exactly right took one real fix: the first
+  version picked, for each output tick, whichever source frame was nearest to that tick's raw time --
+  wrong, and it disagreed with the pipe path at 2 of 19 ticks (max channel delta 255, a genuine wrong-frame
+  pick). The actual rule ffmpeg's own `fps` filter applies holds each source frame from the output tick
+  *its own* pts rounds to (`round(pts * fps)`) until the next frame's rounded tick -- a source-frame-driven
+  rule, not a per-tick-nearest one. Once that was the rule, the fixture matched exactly.
+- The real montage benchmark, decoded output compared via `ffmpeg`'s `psnr` filter: 526 of 656 frames
+  within noise of PSNR 48-57dB against the pipe path's own encode (the rest exactly inf/identical) -- the
+  same class of "ordinary encoder lookahead/mb-tree ripple" already documented for earlier 8.5.x commits,
+  not a decode discrepancy.
+
+**MEASURED (median wall time unless noted, same benchmark project as v8.6.0's table):**
+- 720p: 39.7-41.4s with `KIMO_DECODER=libav` vs 37.5s for v8.6.0's overlap pipeline alone -- *slower*,
+  despite higher average core usage (2.85-2.89 vs 2.22-2.23).
+- 1080p: 97.4s vs 96.5s -- a wash either way.
+
+Root cause, as best understood: libavcodec's own frame-threading was enabled explicitly
+(`set_threading(Frame, available_parallelism())`), which closed some of an earlier, worse gap (41.8-43.6s
+before that change), but each `LibavDecoder` still does its own decode-then-scale-then-crop work on exactly
+one thread (the prefetch thread, see v8.6.0) -- the ffmpeg CLI subprocess this replaces decoded a whole
+window using its own internal multi-threaded pipeline in a wholly separate OS process, which on this box's
+real workload evidently extracted more total parallelism than one Rust thread managed, overlap or not.
+
+Version bumped to 8.6.1 with this entry; `Cargo.lock`'s three workspace members follow.
+
 ## v8.6.0 (2026-11-02)
 
 Naman's "Core" redirect: stop VFX/look polish, build the render engine. The audit

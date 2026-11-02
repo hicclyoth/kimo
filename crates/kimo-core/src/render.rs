@@ -187,6 +187,23 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     let (in_pt, speed, span, a_rel) = if let Some((st, fbase)) = seek_base { let rel = (a as i64 - fbase).max(0) as usize; (st, 1.0, (rel+n) as f64 / p.fps, rel) } else if c.retimed() { (c.in_point, 1.0, (a+n) as f64 / p.fps, a) } else { (c.in_point, c.speed, (a+n) as f64 / p.fps * c.speed, a) };
     let fit = c.props.get("fit").map(|q| q.at(0.0)).unwrap_or(0.0);
     let fitf = if crate::reframe::active(c) { crate::reframe::ffmpeg_fit(c, w, h, p.fps, a, n) } else if fit >= 1.5 { format!("scale={w}:{h}") } else if fit >= 0.5 { format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}") } else { format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0") };
+    // V8.6.1: in-process libav decode, opt-in via KIMO_DECODER=libav (default stays the ffmpeg pipe below
+    // until proven). Only attempted for the scope libav_decode::supported() states (ordinary 8-bit video,
+    // constant speed 1.0, no retime/reframe/seek_base/color-management/stills); anything outside that, or
+    // any libav error, falls straight through to the existing pipe path -- this can never make an export
+    // fail that would otherwise have succeeded.
+    if seek_base.is_none() && std::env::var("KIMO_DECODER").ok().as_deref() == Some("libav") {
+        let is_native_fit_ext = p.color_pipeline.enabled && [".exr", ".pfm"].iter().any(|ext| path.to_lowercase().ends_with(ext));
+        if crate::libav_decode::supported(p.color_pipeline.enabled, c.retimed(), speed, crate::reframe::active(c), is_img0, false, is_native_fit_ext) {
+            let fs = (w as usize).checked_mul(h as usize).and_then(|v| v.checked_mul(4));
+            if let Some(fs) = fs {
+                crate::guard::reserve(fs.saturating_mul(n.max(1)));
+                if let Ok(buf) = crate::libav_decode::decode_window(path, w, h, fit, in_pt, p.fps, a, n) {
+                    return Ok(Frames { still: is_img0, working_linear: false, quantized: Default::default(), linear_buf: None, buf, fs, first: a });
+                }
+            }
+        }
+    }
     if p.color_pipeline.enabled&&path.to_lowercase().ends_with(".exr"){crate::color::interchange::validate_exr_source(path)?;}
     let float_source=p.color_pipeline.enabled&&[".exr",".pfm"].iter().any(|ext|path.to_lowercase().ends_with(ext));
     let native_fit=float_source||(p.color_pipeline.enabled&&p.color_pipeline.linear_resample);
