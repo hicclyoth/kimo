@@ -45,7 +45,8 @@ pub(super) fn tools(eff_kinds: &[&str]) -> Vec<Command> {
             ("linear_blend", json!({"type":"boolean"})),
             ("x264_preset", json!({"type":"string"})),
             ("color_tag_sanity", json!({"type":"boolean"})),
-            ("frame_blend_conform", json!({"type":"boolean"}))],
+            ("frame_blend_conform", json!({"type":"boolean"})),
+            ("adaptive_denoise", json!({"type":"boolean"}))],
             &[]),
         run: |ss, a| { let p = &mut ss.project;
             if let Some(v) = a.get("width").and_then(|v| v.as_u64()) { if !(16..=16384).contains(&v) { return Err(format!("width {v} out of range 16..16384")); } p.width = v as u32; }
@@ -56,7 +57,8 @@ pub(super) fn tools(eff_kinds: &[&str]) -> Vec<Command> {
             if let Some(v) = a.get("x264_preset") { match v { Value::Null => p.x264_preset = None, Value::String(s) => { const OK: [&str; 9] = ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"]; if !OK.contains(&s.as_str()) { return Err(format!("x264_preset must be one of {OK:?}, got '{s}'")); } p.x264_preset = Some(s.clone()); }, _ => return Err("x264_preset must be a string or null".into()) } }
             if let Some(v) = a.get("color_tag_sanity").and_then(|v| v.as_bool()) { p.color_tag_sanity = v; }
             if let Some(v) = a.get("frame_blend_conform").and_then(|v| v.as_bool()) { p.frame_blend_conform = v; }
-            Ok(json!({"width":p.width,"height":p.height,"fps":p.fps,"linear_blend":p.linear_blend,"x264_preset":p.x264_preset,"color_tag_sanity":p.color_tag_sanity,"frame_blend_conform":p.frame_blend_conform})) } },
+            if let Some(v) = a.get("adaptive_denoise").and_then(|v| v.as_bool()) { p.adaptive_denoise = v; }
+            Ok(json!({"width":p.width,"height":p.height,"fps":p.fps,"linear_blend":p.linear_blend,"x264_preset":p.x264_preset,"color_tag_sanity":p.color_tag_sanity,"frame_blend_conform":p.frame_blend_conform,"adaptive_denoise":p.adaptive_denoise})) } },
     Command { name: "import_media", description: "Import a video file as an asset (probes size/duration). Returns asset id.", mutates: true,
         schema: obj(vec![("path", s("absolute path to media file"))], &["path"]),
         run: |ss, a| { let path = str_arg(a, "path")?; let (w, h, d, fps) = render::probe(path)?; render::check_importable(path)?;

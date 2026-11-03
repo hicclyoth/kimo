@@ -1,3 +1,61 @@
+## v8.10.0 "content-adaptive denoise + sharpen" (2026-11-03)
+
+Quality audit #6: phone/webcam footage carries real sensor noise that x264 spends bits reproducing instead
+of discarding, and the result looks soft and blocky at a given CRF. Pro editors denoise lightly, then
+sharpen to taste; nothing in auto_edit measured per-clip noise or applied either, so every clip got the
+same (zero) treatment regardless of how noisy its own source actually was.
+
+**Measurement (`noise_est.rs`, new module):** a flat-region-gated Laplacian noise-sigma estimator
+(Immerkaer 1996) on a few sampled frames per clip. The Laplacian kernel `[[1,-2,1],[-2,4,-2],[1,-2,1]]` has
+zero response to any linear/quadratic surface (flat regions and smooth gradients alike), but a real edge or
+fine texture also triggers a large response that is not noise -- so the estimator gates on the largest
+absolute difference to any of a pixel's 4 immediate neighbours, and only accumulates the Laplacian response
+where that is below a threshold (5/255 in 0..1 units). Deliberately an ADJACENT-pixel gate, not a skip-one
+central difference: a skip-one gradient is blind to period-2 (Nyquist) texture -- a tight checkerboard, or
+the fine detail a fractal test pattern (mandelbrot) carries even in its nominally smooth regions, measured
+0.044 with a skip-one gate (55x the real-footage range) before this was caught and fixed during testing,
+because x-1/x+1 are the same parity and cancel exactly for a period-2 signal.
+
+**Fix:** a new `adaptive_denoise` Project field (`#[serde(default, skip_serializing_if = "is_false")]`, a
+provenance marker auto_edit sets when the gate ran -- every existing saved project is untouched). During
+auto_edit's analysis pass, every media clip (talking-head and b-roll; text/solid/gradient clips are never
+candidates -- `estimate_clip_noise` only accepts `Source::Media`) gets 3 sampled frames measured; a clip
+whose median sigma sits below a measured-clean floor (0.00035) gets no effect at all. Above the floor, a
+`denoise` effect (color/denoise.rs's existing edge-aware spatial filter) is added with `amount` proportional
+to how far above the floor the clip sits (`(sigma - floor) / 0.004`, capped at 0.6), plus a mild compensating
+`sharpen` effect (ratio 0.15x the denoise amount, radius 1.5px) so the denoise's own softening doesn't read
+as a quality loss on its own. Off by default at the Project level; `auto_edit` turns it on like the other
+quality options (`adaptive_denoise: false` disables it for a call).
+
+**Real-footage measurement (the benchmark, 1280x720):** all 12 media clips in the benchmark measured above
+the floor (sigma 0.0008-0.0015, this footage's own quiet-but-real sensor/compression noise) and got a
+modest, proportional denoise (amount 0.11-0.29, nothing near the 0.6 cap) plus sharpen (0.017-0.044).
+
+**Sharpen-ratio tuning, honestly measured:** the first ratio tried (0.45x) was wrong -- re-exporting the
+same project with only the sharpen effects removed measured denoise ALONE saving 2.7% of file size at the
+same CRF (7,636,538 -> 7,430,267 bytes, undenoised baseline vs denoise-only: bits that went to noise really
+did drop), but the 0.45x sharpen pass added back MORE bits than that saved (7,685,672 bytes, a net +0.6%
+over the undenoised baseline) -- re-sharpening partially re-creates the entropy denoise just removed. Swept
+the ratio (0.0 / 0.1 / 0.15 / 0.2 / 0.25 / 0.3 / 0.45) on the same project; 0.15x keeps a real, solid net
+saving (7,366,656 bytes on the actual core_v07 render, -1.54% vs core_v06's undenoised 7,482,180) while still
+measurably raising edge energy back up versus denoise alone (quality_v8100.rs's own edge-sharpness test).
+
+**TDD (`tests/quality_v8100.rs`, 7 tests):** the estimator measures a synthetic noisy frame noisier than a
+clean one and handles degenerate input (too-small buffer, a frame with no flat pixel anywhere) without a
+panic; `adaptive_denoise: false` adds no denoise/sharpen effect to a genuinely noisy clip (bit-identical
+when off); a clean clip in the same edit as a noisy one gets nothing while the noisy one gets both effects
+(content-adaptive, not blanket); the noisy clip's rendered output measures real, lower noise variance than
+undenoised; edge/detail energy does not collapse under the denoise+sharpen pass versus an undenoised
+baseline, and the compensating sharpen measurably raises it back up versus denoise alone.
+
+**Honest visual verdict:** viewed 100% crops on the noisiest measured clip (the talking-head face at 18.3s,
+sigma 0.00152) and a detail-dense night b-roll shot (3.3s, sigma 0.00142) -- see
+`/home/user/tab/files/v7q/denoise_v8100.png`. Skin looks very slightly smoother on the cheeks/forehead, NOT
+waxy or plasticky: pores, stubble and eye/lip detail all stay visible, no halo or ringing at the
+face/background edge. The b-roll crop looks nearly identical to the eye at this amount (0.236) on a scene
+already dense with real high-frequency detail (lights, windows) -- the file-size measurement is what shows
+the real, if visually subtle, effect here. No new artifacts on either crop.
+
 ## v8.9.3 "frame-blend conform for 24→30fps" (2026-11-03)
 
 Quality audit #5: converting a clip whose native fps sits below the project fps (the ordinary case: 24fps

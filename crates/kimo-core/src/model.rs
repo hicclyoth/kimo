@@ -269,6 +269,14 @@ pub struct Project {
     /// cheap cross-dissolve of the two nearest source frames, no motion search) instead of the plain
     /// `fps=` filter's frame duplication. Off by default: existing projects/goldens render byte-identical.
     #[serde(default, skip_serializing_if = "is_false")] pub frame_blend_conform: bool,
+    /// V8.10.0 (quality audit #6): when true, auto_edit's own analysis pass measured at least one media
+    /// clip's sensor/compression noise above its flat-region threshold (noise_est.rs) and added a
+    /// proportional `denoise` + mild compensating `sharpen` effect to that clip only -- clean clips and
+    /// every text/solid/gradient clip are left with no effect added. This field is a provenance marker
+    /// (auto_edit sets it after deciding; render never reads it to change decode): the actual gate is the
+    /// per-clip effects list, which is empty for every clip when the feature finds nothing noisy or never
+    /// runs. False (default, every existing project) leaves every clip's effects list exactly as before.
+    #[serde(default, skip_serializing_if = "is_false")] pub adaptive_denoise: bool,
     #[serde(default)] pub camera: BTreeMap<String, crate::keyframe::Prop>,
     /// 3D compositor (comp3d.rs, set_3d_compositor): depth sorting, intersections, shadows, depth of field. None (absent from the
     /// file) or enabled = false renders exactly as before.
@@ -332,7 +340,7 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, x264_preset: None, color_tag_sanity: false, frame_blend_conform: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
+        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, x264_preset: None, color_tag_sanity: false, frame_blend_conform: false, adaptive_denoise: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
     }
 }
 

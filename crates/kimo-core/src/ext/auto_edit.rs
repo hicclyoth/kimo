@@ -169,6 +169,11 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // two nearest source frames instead. Pure decode-time filter string, never touches render_frame, so it
     // carries no golden_frames.txt/recipe_frames.txt risk -- still gated to auto_edit like the others above.
     let frame_blend_conform_on = a.get("frame_blend_conform").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.10.0 (quality audit #6): measure each media clip's own noise level at analysis time and apply a
+    // proportional denoise + mild compensating sharpen only to the clips that measure noisy -- see the
+    // adaptive-denoise section below for the actual threshold/strength numbers and the real-footage
+    // measurements in CHANGELOG.md v8.10.0.
+    let adaptive_denoise_on = a.get("adaptive_denoise").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -321,6 +326,56 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
             }
         }
         if !stabilized.is_empty() { stages.insert("stabilize".into(), json!({"clips": stabilized, "threshold_px": stabilize_shake_threshold_px})); }
+    }
+
+    // 2a4. V8.10.0 (quality audit #6): content-adaptive denoise. Phone/webcam footage carries real sensor
+    // noise that a codec spends bits reproducing instead of discarding, and the result looks soft/blocky
+    // at a given CRF; measure each media clip's own noise level (noise_est::estimate_clip_noise, a flat-
+    // region-gated Laplacian sigma on a few sampled frames -- the same "sample a few frames, measure
+    // something cheap" shape as the handheld shake-scan just above) and apply a denoise strength
+    // proportional to how far above a measured-clean floor the clip sits, plus a small compensating
+    // sharpen so denoise's own softening doesn't read as a quality loss on its own. Clean clips (and every
+    // text/solid/gradient clip -- estimate_clip_noise only accepts Source::Media) get no effect added at
+    // all: the default is off, and even with the gate on, a clip under the floor is left exactly as
+    // decoded. See CHANGELOG.md v8.10.0 for the measured real-footage sigmas behind the floor/scale below.
+    const DENOISE_NOISE_FLOOR: f64 = 0.00035; // sigma below this measures as already-clean; no effect added
+    const DENOISE_NOISE_SCALE: f64 = 0.0040; // sigma this far above the floor maps to the max denoise amount
+    const DENOISE_MAX_AMOUNT: f64 = 0.6; // never push the denoise effect's own mix past this, however noisy
+    const DENOISE_MIN_AMOUNT: f64 = 0.03; // below this the effect would be imperceptible; skip adding it
+    // V8.10.0 measurement on the real benchmark (CHANGELOG.md): at ratio 0.45 the compensating sharpen
+    // alone added back MORE bits than denoising saved (7,685,672 bytes vs the undenoised 7,636,538 --
+    // denoise ALONE measured 7,430,267, a real 2.7% saving the sharpen then more than erased). 0.15 keeps
+    // the file a real, solid net smaller (~1.5% below baseline on that same footage) while still visibly
+    // raising edge energy back up versus denoise alone (see tests/quality_v8100.rs's own edge-sharpness
+    // test) -- a light compensating sharpen, not a wash.
+    const DENOISE_SHARPEN_RATIO: f64 = 0.15; // compensating sharpen amount, as a fraction of the denoise amount
+    const DENOISE_SHARPEN_RADIUS: f64 = 1.5; // px, narrower than sharpen's own 2.0 default -- undoes denoise's own blur radius, not a general sharpen
+    if adaptive_denoise_on {
+        let mut media_clip_ids: Vec<String> = dialogue_clips.iter().map(|(id, _, _)| id.clone()).collect();
+        for cid in &broll_clip_ids { if !media_clip_ids.contains(cid) { media_clip_ids.push(cid.clone()); } }
+        let mut noise_cache = crate::render::Cache::new();
+        let mut measured: Vec<Value> = vec![];
+        for cid in &media_clip_ids {
+            let Some(c) = ss.project.find_clip(cid) else { continue };
+            if c.duration < 0.3 { continue; } // too short to sample meaningfully (same floor stabilize uses)
+            let c = c.clone();
+            let sigma = match crate::noise_est::estimate_clip_noise(&ss.project, &mut noise_cache, &c, 3) {
+                Ok(s) => s,
+                Err(e) => { warnings.push(format!("adaptive denoise: noise scan skipped on clip {cid}: {e}")); continue; }
+            };
+            let amount = ((sigma - DENOISE_NOISE_FLOOR) / DENOISE_NOISE_SCALE).clamp(0.0, DENOISE_MAX_AMOUNT);
+            if amount >= DENOISE_MIN_AMOUNT {
+                call(ss, "add_effect", &json!({"clip_id": cid, "kind": "denoise", "params": {"amount": amount}}))?;
+                let sharpen_amount = amount * DENOISE_SHARPEN_RATIO;
+                call(ss, "add_effect", &json!({"clip_id": cid, "kind": "sharpen", "params": {"amount": sharpen_amount, "radius": DENOISE_SHARPEN_RADIUS}}))?;
+                measured.push(json!({"clip_id": cid, "noise_sigma": sigma, "denoise_amount": amount, "sharpen_amount": sharpen_amount}));
+            } else {
+                measured.push(json!({"clip_id": cid, "noise_sigma": sigma, "denoise_amount": 0.0, "sharpen_amount": 0.0}));
+            }
+        }
+        if !measured.is_empty() {
+            stages.insert("adaptive_denoise".into(), json!({"clips": measured, "noise_floor": DENOISE_NOISE_FLOOR, "noise_scale": DENOISE_NOISE_SCALE, "max_amount": DENOISE_MAX_AMOUNT}));
+        }
     }
 
     // 2b. Slow push-in (V8.2V, Ken Burns): a gentle, eased push-in on every static b-roll cutaway -- the
@@ -758,6 +813,11 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if frame_blend_conform_on {
         call(ss, "project_set", &json!({"frame_blend_conform": true}))?;
     }
+    // V8.10.0: see adaptive_denoise_on's comment above -- a provenance marker, set whenever the gate ran,
+    // regardless of whether any clip actually measured noisy enough to get an effect.
+    if adaptive_denoise_on {
+        call(ss, "project_set", &json!({"adaptive_denoise": true}))?;
+    }
 
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
@@ -768,6 +828,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         "motion_blur": motion_blur_on,
         "stabilize_handheld": stabilize_handheld_on,
         "frame_blend_conform": frame_blend_conform_on,
+        "adaptive_denoise": adaptive_denoise_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -812,6 +873,7 @@ pub fn commands() -> Vec<Command> {
                 ("stabilize_handheld", json!({"type": "boolean", "description": "default FALSE: shake-detect each b-roll cutaway and warp-stabilize it only when measured shake clears stabilize_shake_threshold_px, leaving locked-off shots untouched -- off by default because even the cheap shake scan costs real time per clip (see CHANGELOG.md v8.9.0); never applied to the talking-head track (would fight add_punch_ins for the same x/y/scale props)"})),
                 ("stabilize_shake_threshold_px", n("max_correction_px above which a b-roll clip counts as handheld and gets warp-stabilized, default 1.5, clamped 0.1..50 (only read when stabilize_handheld is true)")),
                 ("frame_blend_conform", json!({"type": "boolean", "description": "default true: when a clip's native fps is below the project fps (e.g. 24fps footage in a 30fps project), blend the two nearest source frames (minterpolate mi_mode=blend) instead of duplicating whole frames"})),
+                ("adaptive_denoise", json!({"type": "boolean", "description": "default true: measure each media clip's own noise level (noise_est.rs) at analysis time and add a proportional denoise + mild compensating sharpen only to clips that measure above a measured-clean floor; clean clips and every text/solid/gradient clip get nothing"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }
