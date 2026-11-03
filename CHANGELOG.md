@@ -1,3 +1,63 @@
+## v8.12.1 "face avoidance targets the face" (2026-11-03)
+
+Fixes a real defect in V8.12.0's caption engine: face/subject avoidance was moving captions off the
+whole detected skin-toned BODY band -- face, neck, and whatever skin is contiguous below it (chest,
+hands) -- not just the face. On a seated talking-head shot the preferred bottom lower-third routinely
+"overlapped" that whole-body band even though it was nowhere near the actual head, so avoidance fired
+needlessly; and when it did fire, it jumped straight to a FIXED fallback spot (top of frame) with no
+check that the fallback itself cleared anything, landing the caption touching or crowding the actual
+head -- worse than doing nothing. Confirmed on the real `talkinghead_real_final.mp4` benchmark clip:
+with avoidance off the caption correctly sits low, clear of the face; with avoidance on (V8.12.0) it
+jumped to the top of the frame, crossing the subject's eyes and forehead.
+
+**The fix (`crates/kimo-core/src/ext/caption_engine.rs`):**
+- **Head region, not body region.** The engine's face/subject detector (`speech_words::skin_band`) only
+  ever finds a whole contiguous skin-toned band -- it has no notion of a face box. `place_from_face`
+  (the new, directly-testable pure scorer `place_unit` now wraps) derives the actual head/face region as
+  the TOP slice of that band, via a new `layout.face_region_frac` (default 0.35 -- a seated frontal
+  subject's forehead-to-chin reliably sits in the top third of their own skin band; a documented smart
+  default, not a measurement, and fully overridable).
+- **Keep the preferred anchor whenever it clears.** The preferred lower-third is kept exactly as before
+  whenever its own text box clears the derived head region by `layout.face_margin_frac` (default 0.04,
+  4% of frame height) -- real editors keep a lower-third under the chin and only move when the text
+  would actually cover the face.
+- **Score candidates, never jump blind.** When the preferred anchor doesn't clear, the engine tries a
+  same-side nudge (`layout.lower_nudge_frac`, default 0.08) first, then the opposite band -- taking the
+  first candidate that both clears the head region by the margin AND stays inside the frame's own safe
+  margins (platform UI clearance at the bottom, `layout.top_safe_frac` -- default 0.02 -- at the top).
+  The old fixed "jump to 0.2" fallback, chosen with no clearance check at all, is gone.
+- **Honest fallback.** If literally no candidate clears (an extreme close-up, for instance), the engine
+  keeps the preferred anchor exactly where it was -- never a spot touching the head that might be worse
+  -- and raises stroke/shadow/box strength to the spec's own strongest legibility setting to compensate,
+  the same mechanism used for a bright background, via a new `forced_overlap` signal threaded into the
+  existing auto-contrast step.
+- Every new threshold (`face_region_frac`, `face_margin_frac`, `caption_half_height_frac`,
+  `lower_nudge_frac`, `top_safe_frac`) is an ordinary overridable `layout` spec field with a smart
+  default -- Naman's standing rule: the engine has defaults, the AI has full freedom, presets and
+  defaults are reference only. The tool schema documents all five.
+
+**Tests (`tests/quality_v8120.rs`, +4, 19 total):** the pure `place_from_face` scorer is exercised
+directly with a synthetic detected face/subject band, no real frame needed -- a high face with a bottom
+caption stays put; a low, wide body band forces a move whose final box provably clears the margin; a
+battery of face positions across top/bottom/wide-frame anchors never lands on the head (with one
+documented exception: an engineered unavoidable case proves the honest `forced_overlap` fallback keeps
+the anchor rather than parking it somewhere worse); and `fixed_y_frac` pins the position exactly,
+ignoring face avoidance entirely, at both the `caption_engine_compose` and pure-scorer level. Two of the
+four fail against the pre-fix (V8.12.0) logic, reproducing the exact reported defect (the caption lands
+at the fixed fallback, still overlapping the head) -- confirmed by temporarily restoring the old scoring
+rule and rerunning, then reverting.
+
+`golden_registry.txt`'s one line for `caption_engine_compose` changed (the tool schema gained the five
+new `layout` fields); `golden_frames.txt`, `recipe_frames.txt` and `golden_project.txt` are untouched.
+
+**Sheet and demo**, same real clip as V8.12.0 (`talkinghead_real_final.mp4`):
+`/home/user/tab/files/v7q/captions_v8121.png` (five panels: avoidance off; the V8.12.0 bug reproduced
+live on this clip's own frame; the V8.12.1 fix on the same frame, now matching the off baseline;
+avoidance off at an explicit top position, showing it would overlap; and the V8.12.1 fix at that same
+top position, correctly relocating to the clear bottom) and
+`/home/user/tab/files/v7q/captions_v8121_demo.mp4` (12s, real ASR word timings, the fixed engine's
+default auto placement throughout).
+
 ## v8.12.0 "the caption engine" (2026-11-03)
 
 A real caption **engine**, not another named preset. Every prior version (including the five looks this

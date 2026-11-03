@@ -106,7 +106,7 @@ camera_clip_triangle bb5e8ec86c11e72f
 camera_project_points 9925e0b55b1c4af3
 camera_solve_info 68eba83a999378cc
 cancel_job 71597b2319b6d6cf
-caption_engine_compose 50a479ed66557627
+caption_engine_compose c0373834c0cc7e99
 caption_from_words c6b5de8e8851e704
 check_code_clip_determinism c8a2418c67534879
 check_color_consistency ebceb412c57323f7

@@ -131,6 +131,100 @@ fn words(pairs: &[(&str, f64, f64)]) -> Vec<EWord> { pairs.iter().map(|&(t, s, e
 }
 
 // ---------------------------------------------------------------------------------------------
+// Face avoidance targets the FACE, not the body (V8.12.1 fix for the V8.12.0 regression: captions
+// were jumping to a fixed top-of-frame fallback that crowded the actual head, because the old logic
+// treated the whole detected skin/subject band -- face, neck, chest, hands -- as "the face"). These
+// exercise the pure `place_from_face` scorer directly with a synthetic skin/subject band, exactly
+// the live-project-free shape the module's own doc comment promised for face avoidance.
+// ---------------------------------------------------------------------------------------------
+
+#[test] fn face_avoidance_keeps_the_preferred_lower_third_when_it_clears_the_head() {
+    let layout = LayoutSpec::default();
+    // Synthetic frame: face at top-centre (skin_band only ever returns the topmost contiguous skin
+    // band -- forehead through chin/neck here), the rest of the body sits lower but outside it, so a
+    // bottom lower-third caption never comes near it. Real editors keep the lower-third under the
+    // chin and only move when the text would actually cover the face -- this is that "don't move" case.
+    let face = Some((0.05, 0.30));
+    let pl = place_from_face(0.70, true, &layout, face); // tall frame, default auto-bottom anchor
+    assert!(!pl.moved, "a bottom caption that already clears the head must stay at the bottom: {pl:?}");
+    assert!(!pl.forced_overlap);
+    assert!((pl.y_frac - 0.70).abs() < 1e-9, "unmoved means exactly the preferred anchor: {pl:?}");
+    assert_eq!(pl.band, "bottom");
+}
+
+#[test] fn face_avoidance_moves_off_a_low_face_and_the_final_box_clears_the_margin() {
+    let layout = LayoutSpec::default();
+    // A low, wide skin/subject band -- head centred around 0.45-0.60 with skin (neck, exposed
+    // chest/hands) contiguous down to 0.88 -- exactly the "whole body" shape from the bug report.
+    // The preferred bottom lower-third (0.70 +/- 0.10) sits right over the mouth.
+    let face = Some((0.45, 0.88));
+    let pl = place_from_face(0.70, true, &layout, face);
+    assert!(pl.moved, "a face this low must force a move off the preferred anchor: {pl:?}");
+    assert!(!pl.forced_overlap, "a clearing candidate exists here, so this must not fall back to 'keep and raise contrast': {pl:?}");
+    let head_hi = 0.45 + (0.88 - 0.45) * layout.face_region_frac;
+    let (lo, hi) = (pl.y_frac - layout.caption_half_height_frac, pl.y_frac + layout.caption_half_height_frac);
+    let clears = hi <= 0.45 - layout.face_margin_frac + 1e-9 || lo >= head_hi + layout.face_margin_frac - 1e-9;
+    assert!(clears, "final box [{lo},{hi}] must clear the derived head region [0.45,{head_hi}] by face_margin_frac: {pl:?}");
+}
+
+#[test] fn face_avoidance_never_lands_on_the_head_across_a_battery_of_positions() {
+    // Regular cases under the engine's own smart defaults: whenever avoidance actually MOVES the
+    // caption (or keeps it claiming it already clears), the final box must never touch the derived
+    // head region -- the exact defect this version fixes (V8.12.0 jumped to a fixed top fallback with
+    // no check that the fallback itself cleared anything).
+    let layout = LayoutSpec::default();
+    let cases: &[(f64, bool, (f64, f64))] = &[
+        (0.70, true, (0.05, 0.30)),  // head high, bottom anchor already clear
+        (0.70, true, (0.45, 0.88)),  // head low and wide, bottom anchor must move
+        (0.80, false, (0.40, 0.75)), // wide-frame bottom anchor, a big low body band
+        (0.70, true, (0.60, 0.95)),  // head centred very low, near the bottom edge
+        (0.20, true, (0.10, 0.45)),  // an explicit top anchor that itself needs to move
+    ];
+    for &(default_band, tall, face) in cases {
+        let pl = place_from_face(default_band, tall, &layout, Some(face));
+        let head_hi = face.0 + (face.1 - face.0) * layout.face_region_frac;
+        let (lo, hi) = (pl.y_frac - layout.caption_half_height_frac, pl.y_frac + layout.caption_half_height_frac);
+        let touches_head = hi > face.0 - layout.face_margin_frac && lo < head_hi + layout.face_margin_frac;
+        assert!(!pl.forced_overlap, "the engine's own smart defaults should always find a clearing spot for a realistic face box: default_band={default_band} face={face:?} -> {pl:?}");
+        assert!(!touches_head, "no candidate the engine returns (moved or kept) may touch the head region under default thresholds: default_band={default_band} face={face:?} -> {pl:?}");
+    }
+
+    // The one honest exception the brief asks for: when NO candidate can clear (an extreme close-up
+    // where the derived head region, via an overridden face_region_frac, is nearly the whole frame),
+    // the engine keeps the preferred anchor exactly where it was rather than parking it somewhere
+    // worse, and says so via forced_overlap so the caller raises contrast instead of moving further.
+    let tight = LayoutSpec { face_region_frac: 0.95, ..LayoutSpec::default() };
+    let pl = place_from_face(0.70, true, &tight, Some((0.0, 1.0)));
+    assert!(!pl.moved, "with nothing able to clear, the anchor must stay exactly where it was: {pl:?}");
+    assert!(pl.forced_overlap, "nothing clearing must be reported honestly, not silently kept: {pl:?}");
+    assert!((pl.y_frac - 0.70).abs() < 1e-9);
+}
+
+#[test] fn fixed_y_frac_override_pins_the_position_regardless_of_face_avoidance() {
+    // Naman's standing rule: the engine has smart defaults, but the AI can always pin exactly what it
+    // wants. fixed_y_frac must win even with face_avoidance on and a face that would otherwise force a
+    // move -- compose() must never call face-avoidance scoring at all on this path.
+    let mut ss = new_proj();
+    let r = call2(&mut ss, "caption_engine_compose", json!({
+        "words": [{"text": "hello", "start": 0.0, "end": 0.3}, {"text": "world", "start": 0.3, "end": 0.6}],
+        "layout": {"face_avoidance": true, "fixed_y_frac": 0.33}
+    }));
+    assert_eq!(r["face_avoidance_fired"].as_u64(), Some(0), "a pinned position must never invoke face-avoidance scoring: {r:?}");
+    let clip = ss.project.tracks.last().unwrap().clips.last().unwrap();
+    let y = clip.props.get("y").expect("the clip must carry a y prop").at(0.0);
+    let expected = (0.33_f64 * 720.0).round(); // project height 720 (new_proj), fixed_y_frac's own convention
+    assert!((y - expected).abs() < 1e-6, "fixed_y_frac must be used exactly: got {y}, want {expected}");
+
+    // And the pure scorer itself must agree: regardless of face_avoidance, place_from_face is simply
+    // never the function compose() calls on the fixed_y_frac path -- there is nothing for an
+    // overlapping face to override. (Covered structurally above; this is the direct unit-level proof
+    // that face_avoidance=false alone, with no pin, also returns the untouched anchor.)
+    let layout = LayoutSpec { face_avoidance: false, ..LayoutSpec::default() };
+    let pl = place_from_face(0.70, true, &layout, Some((0.45, 0.88)));
+    assert!(!pl.moved && !pl.forced_overlap && (pl.y_frac - 0.70).abs() < 1e-9, "face_avoidance:false must leave the anchor untouched even over a face: {pl:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Spec validation
 // ---------------------------------------------------------------------------------------------
 fn call(ss: &mut Session, name: &str, a: serde_json::Value) -> serde_json::Value { dispatch(ss, name, &a).unwrap_or_else(|e| json!({"__err": e})) }

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kimo-core", "crates/kimo-mcp", "crates/kimo-cli"]
 
 [workspace.package]
-version = "8.12.0"
+version = "8.12.1"
 edition = "2021"
 license = "MIT"
 

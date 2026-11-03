@@ -232,8 +232,29 @@ pub struct LayoutSpec { pub position: String, pub platform: String, pub face_avo
     /// convention the renderer's own "y" clip property uses -- 0 is vertical centre, positive moves down),
     /// bypassing safe-area/face-avoidance band placement entirely. For re-expressing legacy styles that
     /// always sat at one fixed offset regardless of what is in frame.
-    pub fixed_y_frac: Option<f64> }
-impl Default for LayoutSpec { fn default() -> Self { LayoutSpec { position: "auto".into(), platform: "none".into(), face_avoidance: true, side_margin_frac: 0.05, fixed_y_frac: None } } }
+    pub fixed_y_frac: Option<f64>,
+    /// V8.12.1: `sample_face_frame`/`sw::skin_band` only ever finds a whole contiguous skin-toned BODY band
+    /// (face, neck, and whatever skin is connected below it -- chest, hands), not a face box. This fraction
+    /// is how much of that band, measured from its own top, we treat as the actual face/head region to keep
+    /// clear. A seated frontal subject's forehead-to-chin reliably sits in the top third of their own skin
+    /// band, so 0.35 is the engine's smart default (a documented rule, not a measurement) -- override it
+    /// per call if a subject's framing is unusual.
+    pub face_region_frac: f64,
+    /// Minimum clear gap, as a fraction of frame height, a caption's own box must keep from the derived
+    /// face/head region before a position counts as clear. Default 0.04 (4% of frame height, matching the
+    /// brief's own example threshold).
+    pub face_margin_frac: f64,
+    /// A caption's own rough vertical footprint (half-height), as a fraction of frame height, used for every
+    /// clearance test below. Default 0.10.
+    pub caption_half_height_frac: f64,
+    /// How far down (fraction of frame height) the "slightly lower" candidate sits below a bottom-side
+    /// preferred anchor (or up, for a top-side one) when the preferred position doesn't clear. Default 0.08.
+    pub lower_nudge_frac: f64,
+    /// Minimum clear gap from the very top edge of the frame, as a fraction of frame height, a top-side
+    /// candidate must keep (independent of face avoidance -- this is just staying on screen). Default 0.02.
+    pub top_safe_frac: f64 }
+impl Default for LayoutSpec { fn default() -> Self { LayoutSpec { position: "auto".into(), platform: "none".into(), face_avoidance: true, side_margin_frac: 0.05, fixed_y_frac: None,
+    face_region_frac: 0.35, face_margin_frac: 0.04, caption_half_height_frac: 0.10, lower_nudge_frac: 0.08, top_safe_frac: 0.02 } } }
 
 /// One media clip visible on the timeline, enough to sample a frame for face/contrast analysis without touching
 /// `auto_captions::Src` (kept file-local and self-contained: the engine depends on nothing private in that file).
@@ -254,6 +275,14 @@ pub(crate) fn visible_media(ss: &Session) -> Vec<VisibleMedia> {
     }
     out
 }
+/// Outcome of per-unit face-avoidance placement: where the caption lands, which band that is, whether
+/// avoidance actually moved it off the preferred anchor, and whether NO candidate could clear the detected
+/// face/head region by the required margin -- in which case the preferred anchor was kept as-is (never
+/// parked at a fixed fallback spot that might be worse than where it started) and the caller should raise
+/// legibility (stroke/shadow/box strength) instead of moving further.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement { pub y_frac: f64, pub band: &'static str, pub moved: bool, pub forced_overlap: bool }
+
 /// The clip (if any) actually on screen at timeline time `t`, for face sampling at a unit's mid-point.
 pub(crate) fn media_at<'a>(media: &'a [VisibleMedia], t: f64) -> Option<&'a VisibleMedia> { media.iter().find(|m| t >= m.timeline_start && m.aspect_ok) }
 
@@ -266,23 +295,81 @@ fn sample_face_frame(path: &str, t_src: f64) -> Option<(f64, f64)> {
     sw::skin_band(&b, 72, 128)
 }
 
+/// V8.12.1: pure face-avoidance scoring, given an already-detected skin/subject band (top, bottom fractions
+/// of frame height) or `None` when nothing was detected. Split out of `place_unit` so the scoring rule is
+/// directly testable with a synthetic face position -- no real frame, no ffmpeg, no Session required.
+///
+/// THE BUG THIS FIXES (V8.12.0): the old logic treated the ENTIRE detected skin/subject band as "the face"
+/// and, the instant the preferred anchor overlapped any part of it (which a seated subject's chest/hands
+/// routinely do), jumped to a fixed fallback spot (0.2, "top") with no check that the fallback itself
+/// cleared anything -- so the caption landed touching or crowding the actual head, which sits near the TOP
+/// of that same wide band. Two fixes, both below: (1) only the derived HEAD region (the band's own top
+/// `face_region_frac`) counts as "the face" for overlap purposes, not the whole band; (2) every candidate,
+/// including the fallback, is scored against that head region before it is chosen -- nothing is picked blind.
+///
+/// Rule: keep the preferred anchor (`default_band`) whenever its own text box already clears the head region
+/// by at least `layout.face_margin_frac` -- real editors keep a lower-third under the chin and only move when
+/// the text would actually cover the face. When it doesn't clear, try candidates in priority order -- a small
+/// nudge further from centre on the SAME side as the preferred anchor ("slightly lower" for a bottom anchor,
+/// "slightly higher" for a top one), then the opposite band entirely -- and take the FIRST one that both
+/// clears the head region by the margin AND stays inside the frame's own safe margins (platform UI clearance
+/// at the bottom via `bottom_clear_frac`, `top_safe_frac` at the top): the smallest move that actually works,
+/// not the biggest jump available. If NONE of the candidates clear, the preferred anchor is kept exactly as
+/// it was (never a spot touching the head) and `forced_overlap` is set so the caller raises contrast/box
+/// strength to compensate instead of moving into a worse spot.
+pub fn place_from_face(default_band: f64, tall: bool, layout: &LayoutSpec, face: Option<(f64, f64)>) -> Placement {
+    let band_name = |y: f64| if y < 0.5 { "top" } else { "bottom" };
+    let keep = |moved: bool, forced: bool| Placement { y_frac: default_band, band: band_name(default_band), moved, forced_overlap: forced };
+    if !layout.face_avoidance { return keep(false, false); }
+    let Some((face_top, face_bottom)) = face else { return keep(false, false) };
+
+    let half = layout.caption_half_height_frac;
+    let margin = layout.face_margin_frac;
+    // The derived head/face region: the top slice of the detected skin/subject band (see `face_region_frac`'s
+    // own doc on `LayoutSpec`) -- not the whole band. This is the actual fix: avoid the FACE, not the body.
+    let head_lo = face_top;
+    let head_hi = face_top + (face_bottom - face_top) * layout.face_region_frac;
+
+    // Positive = this much clear room to spare; negative = this much overlap depth (for diagnostics only --
+    // candidates are accepted strictly on sign, never picked for "least bad" overlap).
+    let clearance = |y: f64| -> f64 {
+        let (lo, hi) = (y - half, y + half);
+        if hi <= head_lo - margin { (head_lo - margin) - hi }
+        else if lo >= head_hi + margin { lo - (head_hi + margin) }
+        else { -((hi.min(head_hi + margin) - lo.max(head_lo - margin)).max(0.0)) }
+    };
+    let low = if tall { 0.70 } else { 0.80 };
+    let bottom_safe = 1.0 - bottom_clear_frac(&layout.platform) - half; // highest a bottom-side candidate may sit
+    let top_safe = layout.top_safe_frac + half; // lowest a top-side candidate may sit
+    let in_bounds = |y: f64| y >= top_safe - 1e-9 && y <= bottom_safe + 1e-9;
+
+    if clearance(default_band) >= 0.0 { return keep(false, false); }
+
+    // Candidate ladder: a same-side nudge away from the preferred anchor, then the opposite band -- never the
+    // opposite band FIRST, so a small move is preferred over a big jump whenever a small move is enough.
+    let candidates: [f64; 2] = if default_band >= 0.5 {
+        [(default_band + layout.lower_nudge_frac).min(bottom_safe), 0.2]
+    } else {
+        [(default_band - layout.lower_nudge_frac).max(top_safe), low]
+    };
+    for y in candidates {
+        if in_bounds(y) && clearance(y) >= 0.0 { return Placement { y_frac: y, band: band_name(y), moved: true, forced_overlap: false }; }
+    }
+    keep(false, true) // nothing clears -- stay put, raise contrast instead of parking somewhere worse
+}
+
 /// Per-unit placement: the group's own default band (today's whole-group `sw::caption_band` logic, unchanged), then
 /// a per-unit override when `face_avoidance` is on and a face is actually detected occupying that band at this
 /// unit's own mid-time -- a real upgrade over the one-shot whole-group check (today's auto_captions samples the
-/// band ONCE for the entire caption group). Returns (y centre fraction, which band, whether avoidance fired).
-pub(crate) fn place_unit(default_band: f64, tall: bool, layout: &LayoutSpec, media: &[VisibleMedia], mid_t: f64) -> (f64, &'static str, bool) {
-    if !layout.face_avoidance { return (default_band, if default_band < 0.5 { "top" } else { "bottom" }, false); }
-    let Some(m) = media_at(media, mid_t) else { return (default_band, if default_band < 0.5 { "top" } else { "bottom" }, false) };
-    let t_src = m.in_point + (mid_t - m.timeline_start) * m.speed;
-    let Some(face) = sample_face_frame(&m.path, t_src.max(0.0)) else { return (default_band, if default_band < 0.5 { "top" } else { "bottom" }, false) };
-    let band_half = 0.10; // a caption's own rough vertical footprint, as a fraction of frame height, for overlap testing
-    let (lo, hi) = (default_band - band_half, default_band + band_half);
-    let overlaps = face.0 < hi && face.1 > lo;
-    if !overlaps { return (default_band, if default_band < 0.5 { "top" } else { "bottom" }, false); }
-    // move to the opposite band, same rule auto_captions' own caption_band uses for the whole group
-    let low = if tall { 0.70 } else { 0.80 };
-    let alt = if default_band >= low - 1e-9 { 0.2 } else { low };
-    (alt, if alt < 0.5 { "top" } else { "bottom" }, true)
+/// band ONCE for the entire caption group). All scoring lives in the pure `place_from_face` above; this wrapper's
+/// only job is sampling the real frame.
+pub(crate) fn place_unit(default_band: f64, tall: bool, layout: &LayoutSpec, media: &[VisibleMedia], mid_t: f64) -> Placement {
+    if !layout.face_avoidance { return place_from_face(default_band, tall, layout, None); }
+    let face = media_at(media, mid_t).and_then(|m| {
+        let t_src = m.in_point + (mid_t - m.timeline_start) * m.speed;
+        sample_face_frame(&m.path, t_src.max(0.0))
+    });
+    place_from_face(default_band, tall, layout, face)
 }
 
 // --- contrast-aware legibility -----------------------------------------------------------------
@@ -531,6 +618,11 @@ fn parse_layout(v: &Value) -> Result<LayoutSpec, String> {
         face_avoidance: get_bool(v, "layout", "face_avoidance", d.face_avoidance)?,
         side_margin_frac: get_f64(v, "layout", "side_margin_frac", d.side_margin_frac, 0.0, 0.3)?,
         fixed_y_frac,
+        face_region_frac: get_f64(v, "layout", "face_region_frac", d.face_region_frac, 0.05, 1.0)?,
+        face_margin_frac: get_f64(v, "layout", "face_margin_frac", d.face_margin_frac, 0.0, 0.3)?,
+        caption_half_height_frac: get_f64(v, "layout", "caption_half_height_frac", d.caption_half_height_frac, 0.01, 0.4)?,
+        lower_nudge_frac: get_f64(v, "layout", "lower_nudge_frac", d.lower_nudge_frac, 0.0, 0.4)?,
+        top_safe_frac: get_f64(v, "layout", "top_safe_frac", d.top_safe_frac, 0.0, 0.3)?,
     })
 }
 fn parse_contrast(v: &Value) -> Result<(ContrastSpec, [bool; 3]), String> {
@@ -754,9 +846,9 @@ fn caption_engine_compose(ss: &mut Session, a: &Value) -> Result<Value, String> 
         let text = apply_case(&raw_text, style_spec.case);
         let dur = (tu.end - tu.start).max(0.05);
         let mid_t = tu.start + dur / 2.0;
-        let (y, band_name) = match layout_spec.fixed_y_frac {
-            Some(f) => (f * h, "fixed".to_string()),
-            None => { let (band_y, band_name, face_moved) = place_unit(default_band, tall, &layout_spec, &media, mid_t); if face_moved { avoided += 1; } ((band_y - 0.5) * h, band_name.to_string()) }
+        let (y, band_name, forced_overlap) = match layout_spec.fixed_y_frac {
+            Some(f) => (f * h, "fixed".to_string(), false),
+            None => { let pl = place_unit(default_band, tall, &layout_spec, &media, mid_t); if pl.moved { avoided += 1; } ((pl.y_frac - 0.5) * h, pl.band.to_string(), pl.forced_overlap) }
         };
 
         let size_basis_px = if style_spec.size_basis == "short_side" { w.min(h) } else { w };
@@ -779,6 +871,17 @@ fn caption_engine_compose(ss: &mut Session, a: &Value) -> Result<Value, String> 
                 if !contrast_explicit[0] && style_spec.stroke_frac > 0.0 { stroke_frac = st; }
                 if !contrast_explicit[1] && style_spec.shadow_blur > 0.0 { shadow_strength = sh; }
                 if !contrast_explicit[2] && fx.bg.is_some() { box_alpha = bx; }
+            }
+            // V8.12.1: face avoidance found no spot that clears the head by the required margin and left the
+            // caption on its preferred anchor anyway (see `place_from_face`'s `forced_overlap`) -- raise
+            // legibility to the spec's own strongest setting to compensate, same as sitting on a bright
+            // background, but never below whatever the background measurement above already asked for, and
+            // never on a field the caller has explicitly pinned.
+            if forced_overlap {
+                let (st_max, sh_max, bx_max) = contrast_strength(1.0, &contrast_spec);
+                if !contrast_explicit[0] && style_spec.stroke_frac > 0.0 { stroke_frac = stroke_frac.max(st_max); }
+                if !contrast_explicit[1] && style_spec.shadow_blur > 0.0 { shadow_strength = shadow_strength.max(sh_max); }
+                if !contrast_explicit[2] && fx.bg.is_some() { box_alpha = box_alpha.max(bx_max); }
             }
         }
         if let Some(c) = fx.bg.as_mut() { c[3] = box_alpha; } fx.shadow_blur = shadow_strength.max(if style_spec.shadow_blur > 0.0 { style_spec.shadow_blur } else { 0.0 }).min(30.0);
@@ -858,13 +961,13 @@ pub fn commands() -> Vec<Command> {
         "items":{"type":"object","properties":{"prop":{"type":"string","enum":["opacity","scale","y","blur"]},"from":{"type":"number"},"to":{"type":"number"},"duration_s":{"type":"number"},"ease":{"type":"string","enum":crate::keyframe::EASE_NAMES.to_vec()}}}});
     vec![
         Command { name: "caption_engine_compose", mutates: true,
-            description: "The Kimo caption ENGINE (V8.12.0): builds word-synced, styled, animated captions from a spec of composable primitives, not a fixed list of named looks. `pop`, `karaoke`, `clean`, `boxed`, `impact`, `subtitle`, `boxed_simple` and `yellow` are reference presets ONLY -- starting points you can take or leave. Every default here (segmentation thresholds, CPS, lead-in, gap bridging, face avoidance, contrast strength, animation curves) is an ordinary field you can override, per call AND per individual word or unit through `overrides`, and free per-word/per-unit keyframes on any property, any time, any easing sit alongside the rule-based primitives and apply last. Nothing is hardcoded against you: if a preset's exact numbers aren't what you want, override the field -- don't pick a different preset name and hope. The engine still owns the hard parts so you don't have to get them right by hand: segmentation (phrase/pause/punctuation boundaries, reading-speed and line-length limits, never an orphan word), timing (snap to word times, lead-in, gap bridging, no overlaps, no sub-minimum flashes, shot-cut aware), layout (safe margins, per-cue face/subject avoidance), and contrast-aware legibility (outline/shadow/box strength raised automatically on a bright background, only where you haven't already said what you want there).",
+            description: "The Kimo caption ENGINE (V8.12.1): builds word-synced, styled, animated captions from a spec of composable primitives, not a fixed list of named looks. `pop`, `karaoke`, `clean`, `boxed`, `impact`, `subtitle`, `boxed_simple` and `yellow` are reference presets ONLY -- starting points you can take or leave. Every default here (segmentation thresholds, CPS, lead-in, gap bridging, face avoidance, contrast strength, animation curves) is an ordinary field you can override, per call AND per individual word or unit through `overrides`, and free per-word/per-unit keyframes on any property, any time, any easing sit alongside the rule-based primitives and apply last. Nothing is hardcoded against you: if a preset's exact numbers aren't what you want, override the field -- don't pick a different preset name and hope. The engine still owns the hard parts so you don't have to get them right by hand: segmentation (phrase/pause/punctuation boundaries, reading-speed and line-length limits, never an orphan word), timing (snap to word times, lead-in, gap bridging, no overlaps, no sub-minimum flashes, shot-cut aware), layout (safe margins, per-cue face/subject avoidance), and contrast-aware legibility (outline/shadow/box strength raised automatically on a bright background, only where you haven't already said what you want there).",
             schema: obj(vec![
                 ("words", json!({"type":"array","description":"required: ASR words in TIMELINE seconds, already timed and in order: [{text, start, end, conf?}]","items":{"type":"object"}})),
                 ("preset", json!({"type":"string","enum":["pop","karaoke","clean","boxed","impact","subtitle","boxed_simple","yellow"],"description":"optional reference starting point; every field below still overrides it"})),
                 ("segment", obj(vec![("max_chars_per_line", n("default 20")), ("max_lines", n("1..3, default 2")), ("max_cps", n("reading speed cap, chars/sec, default 20")), ("pause_break_s", n("pause that forces a break, default 0.45")), ("min_words", n("default 1")), ("max_words_per_line", n("optional: wrap by word count instead of the character budget (1..12)"))], &[])),
                 ("timing", obj(vec![("lead_in_s", n("snap-in lookahead, default 0.04")), ("hold_s", n("post-roll when no bridge, default 0.35")), ("bridge_gap_s", n("gap below which cues snap together, default 0.6")), ("min_duration_s", n("default 0.2")), ("min_gap_s", n("minimum visible gap between cues, default 0.02"))], &[])),
-                ("layout", obj(vec![("position", json!({"type":"string","enum":["auto","bottom","middle","top"]})), ("platform", json!({"type":"string","enum":["none","tiktok","reels","shorts","youtube"]})), ("face_avoidance", json!({"type":"boolean","description":"default true: a cue moves off a detected face/subject at its own on-screen moment"})), ("side_margin_frac", n("default 0.05")), ("fixed_y_frac", json!({"type":"number","description":"optional -1..1: pin the vertical offset to exactly this fraction of frame height (0 = centre, positive = down, the same convention the clip's own y property uses), skipping face-avoidance placement entirely"}))], &[])),
+                ("layout", obj(vec![("position", json!({"type":"string","enum":["auto","bottom","middle","top"]})), ("platform", json!({"type":"string","enum":["none","tiktok","reels","shorts","youtube"]})), ("face_avoidance", json!({"type":"boolean","description":"default true: a cue moves off the detected FACE/HEAD at its own on-screen moment, not off the whole body -- it keeps the preferred lower-third under the chin whenever that clears the face by face_margin_frac, and only moves (smallest clearing nudge first, then the opposite band) when it would not"})), ("side_margin_frac", n("default 0.05")), ("fixed_y_frac", json!({"type":"number","description":"optional -1..1: pin the vertical offset to exactly this fraction of frame height (0 = centre, positive = down, the same convention the clip's own y property uses), skipping face-avoidance placement entirely"})), ("face_region_frac", n("default 0.35: how much of the detected skin/subject band, from its own top, counts as the face/head to avoid (the detector only ever finds a whole body/skin band, not a face box)")), ("face_margin_frac", n("default 0.04: minimum clear gap, as a fraction of frame height, between the caption and the face/head region")), ("caption_half_height_frac", n("default 0.10: the caption's own rough half-height, as a fraction of frame height, used for every clearance test")), ("lower_nudge_frac", n("default 0.08: how far the first fallback candidate moves from the preferred anchor before trying the opposite band")), ("top_safe_frac", n("default 0.02: minimum clear gap from the very top edge of the frame for a top-side candidate"))], &[])),
                 ("contrast", obj(vec![("auto", json!({"type":"boolean","description":"default true: stroke/shadow/box strength is set from measured background luminance under the text"})),
                     ("min_stroke_frac", n("")), ("max_stroke_frac", n("")), ("min_shadow", n("")), ("max_shadow", n("")), ("min_box_alpha", n("")), ("max_box_alpha", n(""))], &[])),
                 ("style", obj(vec![("font", s("font name or .ttf path")), ("weight", n("100..1000")), ("size_frac", n("type size as a fraction of frame width, or of the short side when size_basis is short_side")), ("size_basis", json!({"type":"string","enum":["width","short_side"],"description":"default width"})), ("fill", colr_schema("text colour")),
