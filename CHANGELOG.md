@@ -1,3 +1,79 @@
+## v8.12.0 "the caption engine" (2026-11-03)
+
+A real caption **engine**, not another named preset. Every prior version (including the five looks this
+version re-expresses) hard-coded a style function: fixed segmentation, fixed timing, fixed colours. This
+version is a single new tool, `caption_engine_compose`, that takes a *spec* -- segmentation, timing, layout,
+contrast, style, per-word state deltas, emphasis rules, and free keyframe animation, all data, all overridable,
+all documented -- and composes a caption from it. The five old looks (pop/karaoke/clean/boxed/impact) and the
+three restyle looks (subtitle/boxed/yellow) are now themselves just spec data the new engine reads, not special
+cases baked into the engine's logic. Presets are reference points, not a ceiling: every field they set can be
+overridden per-call, per-word, or replaced with free keyframes on any property.
+
+**New module:** `crates/kimo-core/src/ext/caption_engine.rs`, fully self-contained (zero dependency on
+`auto_captions.rs`'s private internals -- its own `visible_media`/media-sampling/face-detection helpers,
+built only on public `Project`/`Clip`/`Asset` fields, so nothing about the existing preset code path was
+touched or put at risk).
+
+**What the engine owns, that no prior version did:**
+- **Segmentation** -- phrase/clause/pause-aware cuts, a reading-speed (CPS) cap that cuts a cue before it
+  would read too fast (excluding bare punctuation tokens from the count, so a trailing "." riding a word's
+  own timestamp can't inflate the measured rate), a no-orphan pass that never leaves a single word stranded
+  when a merge is actually possible, and balanced line-breaking within a unit.
+- **Timing** -- snaps to the real word boundaries, bridges small gaps between cues so there's no flicker,
+  holds a cue a configurable amount after its last word, enforces a minimum on-screen duration, and pulls a
+  cue's end back before a shot cut rather than straddling it (reporting when it had no room to do so).
+- **Layout** -- safe-area aware by default, with per-unit face/subject avoidance (sampling the actual visible
+  frame at each cue's own midpoint, not one whole-clip guess), or a `fixed_y_frac` pin for styles that always
+  sat at one fixed offset regardless of what's in frame.
+- **Contrast-aware legibility** -- measures the real background luma behind each cue and strengthens stroke/
+  shadow/box only as much as that frame needs, reusing `text_contrast::background_lums`.
+- **Data-driven style primitives** -- per-word active/spoken/upcoming colour and scale deltas, emphasis by
+  explicit word list, by keyword, or by measured audio energy (loudest words, via `speech_words::onsets`),
+  and free per-property keyframe animation with every easing `keyframe::Ease` already supports, layered last
+  over everything else.
+
+**Presets re-expressed as spec data, not special-cased:** pop, karaoke, clean, boxed, impact (the
+`auto_captions` looks) and subtitle, boxed, yellow (the `set_caption_style` restyle looks) are now
+`preset_spec()` entries the engine's own general machinery reads -- no preset-specific code path.
+- `clean` is **byte-identical** to the legacy `auto_captions(style="clean")` output: confirmed by rendering
+  both to 20 frame hashes across a real 8-word fixture and asserting equality (`preset_byte_identity_report`,
+  a permanent regression test).
+- The other seven match the legacy output on every field checked -- segmentation boundaries, word timing,
+  size, colour, stroke width, screen position, and which words get emphasized -- except one real gap: the
+  legacy looks pop each word with a brief scale "kick" timed to its own onset (a transient animation, not a
+  sustained multiplier) and, for `pop` specifically, fade each word in individually as it's spoken (`reveal`).
+  The engine's word-state system doesn't yet reproduce that exact animation curve. This is reported here
+  plainly rather than claimed fixed, and is pinned in the same test so a future claim of "now identical" has
+  to actually be true to pass.
+- Two new, additive spec fields exist specifically because of this work and are documented in the tool
+  schema: `style.size_basis` (`width`, the default matching the create-path looks, or `short_side`, matching
+  the restyle-path looks) and `layout.fixed_y_frac`.
+
+**Schema and freedom:** the tool's own description states plainly that every preset is a reference point, not
+a ceiling, and that the AI calling it has full freedom over every field -- segmentation, timing, layout,
+contrast, style, per-word overrides, and free keyframes -- confirmed by a dedicated wording test
+(`tool_description_states_presets_are_reference_only_and_ai_has_full_freedom`).
+
+**Tests:** `crates/kimo-core/tests/quality_v8120.rs`, 15 tests covering every "hard part" named above --
+no-orphan segmentation, CPS limiting (excluding punctuation from the count), phrase/clause/pause breaks,
+no-dangle line breaks, no-overlap and snap-to-word timing, minimum duration, gap bridging, shot-cut avoidance,
+auto-contrast strength, emphasis by list and by audio energy, spec validation error messages, the tool
+description wording, and the preset byte-identity report above. The full required scoped suite (auto_edit,
+golden_frames, recipes, registry_lint, quality_v893/v8100/v8110/v8120, color_pipeline) plus every existing
+caption-named test file (auto_captions, caption_confidence, caption_legibility, caption_validate,
+director_profile_captions, style_captions_batch, transcript_captions) all pass unchanged -- zero lines of the
+existing preset code paths were touched.
+
+**Golden registry:** `golden_registry.txt` gained one new, legitimate entry for the new tool's schema hash
+(computed by hand, never via `KIMO_UPDATE_GOLDEN`); `golden_frames.txt` and `golden_project.txt` are
+unchanged and confirmed byte-identical by the same test run.
+
+**Before/after and demo:** `files/v7q/captions_v8120.png` (a real talking-head clip, real transcribed speech,
+six panels: the legacy `boxed` look, the engine's byte-identical `clean` preset, a free-spec bold word-by-word
+active highlight, a free-spec audio-energy emphasis look, and a face-avoidance off/on comparison on the same
+frame) and `files/v7q/captions_v8120_demo.mp4` (8.4s, real speech, word-synced active/upcoming/emphasis
+states, face avoidance live throughout).
+
 ## v8.11.1 "keep SDR clips bit-identical under hdr_tonemap (fix V8.11.0 regression)" (2026-11-03)
 
 V8.11.0 shipped with an unintended brightness/colour shift on ordinary SDR footage: frame means on the real
