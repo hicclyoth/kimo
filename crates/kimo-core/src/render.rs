@@ -217,6 +217,77 @@ fn mistagged_hd_source(path: &str) -> bool {
     r
 }
 
+/// V8.11.0 (quality audit #7): detect an HDR-tagged media clip -- HLG (arib-std-b67) or PQ (smpte2084)
+/// transfer, or bt2020 primaries with no recognizable SDR transfer tag (the common phone-camera case when
+/// the transfer itself is missing; HLG is assumed there, the usual default for an untagged bt2020 phone
+/// export). Returns the transfer name to decode with ("arib-std-b67" or "smpte2084"), or None for an
+/// ordinary SDR clip. Cached per path (same pattern as mistagged_hd_source).
+fn hdr_source(path: &str) -> Option<String> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(r) = m.lock().unwrap().get(path) { return r.clone(); }
+    let r = probe_color_tags(path).and_then(|(_h, _space, transfer, primaries)| {
+        if matches!(transfer.as_str(), "arib-std-b67" | "smpte2084") { return Some(transfer); }
+        if primaries.starts_with("bt2020") && !matches!(transfer.as_str(), "bt709" | "iec61966-2-1" | "smpte170m") {
+            return Some("arib-std-b67".to_string());
+        }
+        None
+    });
+    m.lock().unwrap().insert(path.to_string(), r.clone());
+    r
+}
+
+/// V8.11.0 (quality audit #7): the zscale filter chain that decodes one HDR-tagged source to scene-linear
+/// bt709-primaries light (the shared first half of both the measurement pass below and the real decode-time
+/// tonemap in `decode()`). `npl=100` is the nominal-peak-luminance ffmpeg/zimg use to interpret HLG's
+/// relative scene-referred signal (PQ ignores it, already absolute); kept fixed rather than measured, since
+/// what actually needs to vary per clip is the *tonemap* knee (`estimate_hdr_peak` below), not this decode
+/// step.
+fn hdr_linear_filter(transfer: &str) -> String {
+    format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,format=gbrpf32le")
+}
+
+/// V8.11.0 (quality audit #7): measure one HDR clip's actual highlight peak (relative to SDR reference
+/// white = 1.0 in scene-linear bt709), so the tonemap filter's `peak=` parameter reflects what the clip
+/// actually contains instead of ffmpeg's own per-frame auto-detect. Measured directly (CHANGELOG.md
+/// v8.11.0): auto-detected peak on a synthetic HLG clip with no real extended-range content read as high as
+/// 3.0 (saturated near-primary colours overshoot 1.0 in linear light even with no scene highlight involved)
+/// and a tonemap curve parameterized on that reading visibly darkened and flattened footage that needed no
+/// compression at all -- the opposite of the fix this version exists to ship. Samples 2 frames (10%/50% of
+/// duration), decodes each through `hdr_linear_filter`, and returns the 99.9th percentile of all sampled
+/// linear RGB channel values (a high percentile rather than the true max, so one outlier specular pixel
+/// does not set the whole clip's tonemap knee) -- floored at 1.0 (never report a peak below reference
+/// white, which would ask tonemap to compress non-existent headroom). Falls back to 1.0 (tonemap behaves as
+/// a near-identity pass -- the safe default) on any probe/decode failure. Cached per (path, transfer).
+fn estimate_hdr_peak(path: &str, transfer: &str) -> f64 {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), f64>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (path.to_string(), transfer.to_string());
+    if let Some(r) = m.lock().unwrap().get(&key) { return *r; }
+    let peak = (|| -> Option<f64> {
+        let (w, h, dur, _fps) = probe(path).ok()?;
+        let (w, h) = (w as usize, h as usize);
+        if w == 0 || h == 0 { return None; }
+        let vf = hdr_linear_filter(transfer);
+        let n = w.checked_mul(h)?.checked_mul(3)?;
+        let mut vals: Vec<f32> = Vec::new();
+        for frac in [0.1_f64, 0.5] {
+            let t = (dur * frac).max(0.0);
+            let out = Command::new("ffmpeg").args(["-v","error","-ss",&format!("{t}"),"-i",path,"-vf",&vf,"-frames:v","1","-f","rawvideo","-pix_fmt","gbrpf32le","-"]).output().ok()?;
+            if !out.status.success() { continue; }
+            let bytes = out.stdout;
+            if bytes.len() < n.checked_mul(4)? { continue; }
+            vals.extend(bytes[..n * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        }
+        if vals.is_empty() { return None; }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((vals.len() as f64) * 0.999) as usize;
+        Some((vals[idx.min(vals.len() - 1)] as f64).max(1.0))
+    })().unwrap_or(1.0);
+    m.lock().unwrap().insert(key, peak);
+    peak
+}
+
 /// V8.9.3 (quality audit #5): native media fps, cached per path (same pattern as mistagged_hd_source) so
 /// a clip decoded across many windowed calls only ever probes its own file once per process.
 fn native_media_fps(path: &str) -> Option<f64> {
@@ -302,7 +373,20 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     // interpretation via `setparams` BEFORE any scale/format conversion reads the (wrong) tag -- ffmpeg's
     // automatic YUV->RGB matrix selection (inside `scale`/`format`) reads frame-tagged metadata, so
     // overriding the tag here, first in the filter chain, is what actually changes the decoded colour.
-    let color_override = if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) { "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709," } else { "" };
+    // V8.11.0 (quality audit #7): HDR (HLG/PQ) source footage takes priority over the color_tag_sanity
+    // mistag check above -- a clip hdr_source() identifies is never also "mistagged SD" (its color_space is
+    // bt2020nc/bt2020c, excluded from mistagged_hd_source's sd_or_untagged_matrix test), so the two never
+    // actually compete for the same clip; the if/else-if just keeps the override a single string either way.
+    let color_override = if p.hdr_tonemap && !is_img0 {
+        hdr_source(path).map(|transfer| {
+            let peak = estimate_hdr_peak(path, &transfer);
+            format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,tonemap=tonemap=mobius:desat=0:peak={peak},zscale=t=bt709:m=bt709:p=bt709:r=tv:tin=linear:min=bt709:pin=bt709,format=gbrp,")
+        }).unwrap_or_default()
+    } else if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) {
+        "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709,".to_string()
+    } else {
+        String::new()
+    };
     let fps_filter = conform_fps_filter(p, c, path, speed, is_img0, seek_base);
     let vf = format!("{color_override}setpts=PTS/{},{},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),fps_filter,a_rel+n,fitf);
     let is_img = is_still_path(path);
@@ -516,7 +600,7 @@ fn source_frame_h(p: &Project, c: &Clip, lt_in: f64, cache: &Cache) -> (Frame, O
                 let al = if a1 == a2 { a1 } else { a1*(1.0-k)+a2*k };
                 for j in 0..3 { f.d[i+j] = if al > 0.0 { ((c1[j]*a1*(1.0-k)+c2[j]*a2*k)/al) as f32 } else { (c1[j]*(1.0-k)+c2[j]*k) as f32 }; } f.d[i+3]=(al*fa) as f32; } } },
         Source::Adjustment => {}
-        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, adaptive_denoise: p.adaptive_denoise, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
+        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, adaptive_denoise: p.adaptive_denoise, hdr_tonemap: p.hdr_tonemap, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
         Source::Shape { shape, width, height, fill, stroke_width, stroke_color, sides, corner_radius } => {
             let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0); let (hw, hh) = (width / 2.0, height / 2.0);
             // signed distance (negative inside), then shape modifiers (offset/repeater/merge) from shapemods.rs
@@ -1347,7 +1431,7 @@ pub fn render_clip_alone_as(p: &Project, c: &Clip, t: f64, cache: &Cache) -> Opt
     let mut srcs: Vec<std::sync::Arc<Clip>> = vec![];
     for e in c.effects.iter() { let Some(k) = crate::layerfx::source_key(&e.kind) else { continue };
         if let Some(m) = e.strings.get(k).and_then(|id| p.find_clip(id)).filter(|m| m.id != c.id && !srcs.iter().any(|s| s.id == m.id)) { let mut m = m.clone(); m.start += t - crate::pushwipe::luma_time(p, &m, t); srcs.push(std::sync::Arc::new(m)); } }
-    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, adaptive_denoise: p.adaptive_denoise, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
+    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, adaptive_denoise: p.adaptive_denoise, hdr_tonemap: p.hdr_tonemap, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
     MATTE_DEPTH.with(|d| d.set(d.get() + 1)); let r = render_frame_opts(&sub, t, cache, true).ok(); MATTE_DEPTH.with(|d| d.set(d.get() - 1)); r
 }
 

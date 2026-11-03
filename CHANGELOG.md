@@ -1,3 +1,75 @@
+## v8.11.0 "HDR (HLG/PQ) phone footage corrected into the SDR bt709 pipeline" (2026-11-03)
+
+Quality audit #7: modern iPhones and Androids record HDR by default (HLG/arib-std-b67 or PQ/smpte2084, bt2020
+primaries, often 10-bit). `color/pipeline.rs`'s own `inspect()` already documented the gap directly ("No
+automatic camera IDT or file-declared color selection"), and the plain decode path `auto_edit` actually uses
+had no `zscale`/`tonemap` filter anywhere in the tree (grepped clean, confirmed again before this version).
+An HDR clip dropped into the pipeline decoded through `format=rgba` with no transfer-aware conversion at
+all -- the PQ/HLG-coded sample values read as ordinary gamma-encoded bytes. Measured on a synthetic HLG test
+clip: this reads as flat, muddy, significantly lower-contrast colour (contrast/std 37.7 vs the true SDR
+reference's 66.9, see below) -- blown-out/crushed colour relationships, not a crash, exactly the kind of
+silent quality cap the audit named.
+
+**Detection (`hdr_source`, render.rs):** a clip is treated as HDR when ffprobe's `color_transfer` reads
+`arib-std-b67` or `smpte2084`, OR when `color_primaries` is `bt2020*` with no recognizable SDR transfer tag
+(the common phone-camera case when the transfer itself is missing -- HLG is assumed there, the usual default
+for an untagged bt2020 phone export). Cached per path, same pattern as `mistagged_hd_source`/`probe_color_tags`.
+
+**Correction (`decode()`'s `color_override`, same injection point `color_tag_sanity` uses):** `zscale` decodes
+the tagged transfer to scene-linear light (`npl=100`), gamut-maps bt2020 primaries to bt709 (still linear),
+applies ffmpeg's `tonemap` filter, then re-encodes to bt709 gamma/tv-range. `zscale` and `tonemap` were
+confirmed available in this ffmpeg build (`--enable-libzimg`) before committing to the design.
+
+**The one real design finding, caught by measuring rather than assuming:** ffmpeg's `tonemap` filter's own
+per-frame automatic peak detection (`peak=0`) badly over-darkens content with no real extended-range
+highlights. On a synthetic HLG test pattern with saturated near-primary colours (red/green/blue bars) but NO
+genuine scene highlight above SDR white, `tonemap`'s auto-detected peak read as high as 3.0 (isolated
+per-channel overshoot from the saturated colours, not an actual bright highlight) and a curve parameterized
+on that reading crushed mean luma from a correct-decode 127.5 down to 79.8 and contrast/std from 114.8 down
+to 72.3 -- actively worse than doing nothing. Fix: `estimate_hdr_peak` measures each clip's own actual peak
+at analysis time (2 sampled frames, decoded through the same transfer+gamut-to-linear conversion the real
+decode uses, the 99.9th percentile of all sampled linear RGB channel values -- a high percentile rather than
+the true max so one outlier pixel doesn't set the whole clip's tonemap knee -- floored at 1.0) and passes it
+explicitly as `tonemap`'s `peak=` parameter. Measured on the same test pattern with the correct peak (1.35):
+mean 119.5/std 108.1, both close to the uncorrected-but-honest "no tonemap, just correct transfer+gamut"
+result (mean 127.5/std 114.8) and far closer to truth than the auto-detected-peak result. `hable` and
+`mobius` tonemap algorithms were both measured at several peak values; `mobius` was chosen (marginally
+better numbers at both the wrong auto-peak and the correct measured peak, and its documented curve shape --
+identity below a transition point, compression only above it -- matches the intent here better than hable's
+global filmic reshape).
+
+**Gating:** `hdr_tonemap`, new `Project` field (`#[serde(default, skip_serializing_if = "is_false")]`), same
+convention as every prior quality-audit option -- off at the Project level (every existing project and
+`golden_frames.txt`/`recipe_frames.txt`/`golden_project.txt` stay byte-identical: the goldens contain no HDR
+media, so this holds), `auto_edit` turns it on by default like `color_tag_sanity`/`frame_blend_conform`/
+`adaptive_denoise`. Correct HDR handling is arguably a bug fix that should be unconditional, but following
+the established opt-in-via-auto_edit pattern keeps a hand-built project's behaviour exactly as documented
+and keeps this change scoped the same way every other audit item has been.
+
+**TDD (`tests/quality_v8110.rs`, 7 tests):** an SDR clip decodes byte-identical whether `hdr_tonemap` is on
+or off; the field defaults to false and is omitted from saved projects (the byte-identical guarantee); an
+HDR clip (HLG and PQ both) is detected and measurably changes when the gate is on; the key quality check --
+an uncorrected HLG decode measures markedly lower contrast than the SDR reference (confirming the audit's
+predicted defect), the corrected decode lands within a numeric threshold of the reference (mean luma within
+30, contrast at least 70% of the reference's) and has at least 1.3x the contrast of the uncorrected decode;
+a skin-tone swatch's hue (R/G and B/G channel ratios) shifts by less than 0.08 after correction; and the
+bt2020-primaries-with-no-transfer-tag fallback path is exercised and confirmed to still trigger correction
+(fixture built the same way `quality_v881.rs` simulates a mistagged source: `h264_metadata` strips the
+transfer tag from an otherwise-real HLG encode via a bitstream-filter remux, no re-encode).
+
+**Real-footage measurement:** none of the 4 real benchmark clips (`v7q_real/`) are HDR-tagged (all bt709 or,
+for the talking-head track, the pre-existing bt470bg mistag `color_tag_sanity` already handles) -- confirmed
+by ffprobe before rendering. `core_v08.mp4` is therefore the no-op check: rendered with `hdr_tonemap: true`
+active (auto_edit's default), it is BYTE-FOR-BYTE IDENTICAL to `core_v07.mp4` (same sha256), confirming the
+gate correctly does nothing when there is nothing HDR to correct. ffprobe on `core_v08.mp4`: color_transfer/
+color_primaries/color_space all `bt709`, `color_range tv` -- correct, matches every prior version.
+
+**Honest visual verdict (synthetic HLG clip, `/home/user/tab/files/v7q/hdr_v8110.png`, SDR reference | old
+(uncorrected) | new (corrected)):** the uncorrected panel shows exactly the audit's predicted defect --
+muddy olive instead of saturated green, brown instead of red, washed purple instead of magenta. The
+corrected panel recovers vivid, correctly-saturated colour close to the SDR reference. A clear, substantial
+improvement with no new artifact observed on this test pattern.
+
 ## v8.10.0 "content-adaptive denoise + sharpen" (2026-11-03)
 
 Quality audit #6: phone/webcam footage carries real sensor noise that x264 spends bits reproducing instead

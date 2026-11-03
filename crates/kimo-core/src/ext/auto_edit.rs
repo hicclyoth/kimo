@@ -174,6 +174,11 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // adaptive-denoise section below for the actual threshold/strength numbers and the real-footage
     // measurements in CHANGELOG.md v8.10.0.
     let adaptive_denoise_on = a.get("adaptive_denoise").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.11.0 (quality audit #7): decode an HLG/PQ-tagged media clip with a proper transfer+gamut-correct
+    // tonemap to bt709 SDR instead of treating its HDR-coded bytes as ordinary gamma-encoded bt709 (the
+    // untreated result: flat, grey, washed-out -- audit item #7, see render.rs::hdr_source/estimate_hdr_peak
+    // and CHANGELOG.md v8.11.0 for the measured before/after).
+    let hdr_tonemap_on = a.get("hdr_tonemap").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -818,6 +823,10 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if adaptive_denoise_on {
         call(ss, "project_set", &json!({"adaptive_denoise": true}))?;
     }
+    // V8.11.0: see hdr_tonemap_on's comment above.
+    if hdr_tonemap_on {
+        call(ss, "project_set", &json!({"hdr_tonemap": true}))?;
+    }
 
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
@@ -829,6 +838,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         "stabilize_handheld": stabilize_handheld_on,
         "frame_blend_conform": frame_blend_conform_on,
         "adaptive_denoise": adaptive_denoise_on,
+        "hdr_tonemap": hdr_tonemap_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -874,6 +884,7 @@ pub fn commands() -> Vec<Command> {
                 ("stabilize_shake_threshold_px", n("max_correction_px above which a b-roll clip counts as handheld and gets warp-stabilized, default 1.5, clamped 0.1..50 (only read when stabilize_handheld is true)")),
                 ("frame_blend_conform", json!({"type": "boolean", "description": "default true: when a clip's native fps is below the project fps (e.g. 24fps footage in a 30fps project), blend the two nearest source frames (minterpolate mi_mode=blend) instead of duplicating whole frames"})),
                 ("adaptive_denoise", json!({"type": "boolean", "description": "default true: measure each media clip's own noise level (noise_est.rs) at analysis time and add a proportional denoise + mild compensating sharpen only to clips that measure above a measured-clean floor; clean clips and every text/solid/gradient clip get nothing"})),
+                ("hdr_tonemap", json!({"type": "boolean", "description": "default true: decode an HLG/PQ-tagged (or bt2020-primaries, untagged-transfer) media clip with a measured-peak tonemap to bt709 SDR instead of treating its HDR-coded bytes as ordinary gamma-encoded bt709"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }
