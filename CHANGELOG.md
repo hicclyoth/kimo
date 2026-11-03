@@ -1,3 +1,42 @@
+## v8.9.2 "motion-blur visual proof" (2026-11-03)
+
+Quality audit follow-up: V8.9.0's own comparison sheet (`quality_v04_vs_v05.png`) carried no frame where a
+push-in, zoom or whip was actually mid-move, so the shutter-angle blur it wired in was never visually
+proven. Built the real timing instead of guessing: ran the benchmark's own `auto_edit` call and read the
+saved project for the actual push-in clips and transitions -- clip21 (whip_left in, then a push-in ramp
+4.067-6.567s, landing shutter 108 deg) and clip22 (zoom_blur in, then a push-in ramp 6.567-8.4s, shutter
+112 deg).
+
+**Whips/zoom_blur transitions already get blur, confirmed (the brief's ask #2):** both are heavily blurred
+in core_v04 (pre-V8.9.0) AND core_v05 -- `whip_left`/`zoom_blur`'s own directional/radial blur lives in
+`transitions.rs`'s `plan()`, a separate, older mechanism from the new `Clip.motion_blur` shutter system, and
+it was never gated on anything V8.9.0 touched. Nothing missing, nothing to fix.
+
+**The new push-in shutter blur: real, localized, but honestly subtle in a still frame.** Pixel diffs between
+core_v04/core_v05 at the two push-in midpoints are small in mean (0.9-2.0/255, comparable to ordinary
+re-encode noise) but peak exactly where the content actually moves (43/255 at the coffee-cup rim, 94/255 at
+the keyboard edge) and nowhere else -- a real, localized effect, not noise. Investigated whether the
+90-180 deg shutter mapping (reached at 6px/frame) was too conservative: this benchmark's two push-ins only
+ever move ~1.2-1.5 px/frame even at the canvas edge (well under the 6px/frame ceiling trigger). Tried
+retuning the mapping (floor 130 deg, ceiling at 3px/frame); it measured within noise of the original
+(diff-vs-no-blur mean 1.94-1.96/255 either way) because render.rs's blur math (`sh = motion_blur/360/fps`,
+the exposure window) times an already-sub-2px/frame velocity caps the real blur extent at well under 1
+pixel regardless of shutter angle chosen within a physically honest 90-180 deg range -- shutter angle cannot
+invent pixel motion the push doesn't have. Reverted the retune (documented in auto_edit.rs's own comment,
+not silently dropped) rather than ship a cosmetic no-op: the engine is working correctly, auto_edit's
+default 5% Ken Burns push is just genuinely gentle. A meaningfully more visible push-in blur would need a
+faster push (`push_in_zoom`, an editorial preset default, out of scope for a core-engine-only pass).
+
+Sheet: `/home/user/tab/files/v7q/motionblur_v04_vs_v05.png`, 4 rows at 3x zoom crops on the real moving
+content (whip transition, zoom_blur transition, both push-ins), each with the measured numbers and an
+honest verdict per row. Viewed myself at full size.
+
+No code behaviour changed (the shutter-angle mapping is numerically identical to V8.9.0's); scoped suite
+re-run green (golden_frames, recipes, registry_lint, registry_unique, external_refs,
+description_first_sentence, auto_edit(26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, quality_v870/v880/v881/v890, color_pipeline, color_linear), golden_frames.txt /
+recipe_frames.txt / golden_project.txt byte-identical to 10ad62d. Warnings: 34.
+
 ## v8.9.1 "correct output transfer tag" (2026-11-03)
 
 Quality audit follow-up, found by Tab reviewing the 8.7.0-8.9.0 work: `legacy_encoder_command`'s ordinary

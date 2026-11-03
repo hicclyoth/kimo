@@ -351,6 +351,23 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         // (treating the cutaway as roughly canvas-width), and map that to a shutter angle between a 90 deg
         // floor (a real but gentle push should still read as a touch of blur, not nothing) and a 180 deg
         // ceiling (reached once the ramp is moving 6px/frame or faster at the edge).
+        //
+        // V8.9.1 investigation (Tab reviewing V8.9.0's own visual proof, quality audit #3 follow-up): the
+        // sheet this version adds (motionblur_v04_vs_v05.png) found this benchmark's two real push-ins
+        // measure only ~1.2-1.5px/frame of edge displacement (shutter lands at 108/112 deg, barely above
+        // the floor) -- genuinely subtle, confirmed localized in the predicted pixels (max diff 30-43/255
+        // right where the push moves, not noise) but near-invisible in a still frame. Tried raising the
+        // floor to 130 deg and reaching 180 at 3px/frame instead of 6: render.rs's own blur math is
+        // `sh = motion_blur/360/fps` (the exposure WINDOW, in seconds) times the property's actual
+        // per-frame velocity -- so at this clip's real ~1.2-1.5px/frame, even the full 180 deg ceiling only
+        // ever blurs ~0.6-0.75px (half a frame's worth of a sub-2px/frame move), and the retuned mapping
+        // measured within noise of the original (diff-vs-no-blur mean 1.94-1.96/255 either way; see
+        // CHANGELOG.md v8.9.1) -- not a mapping-curve problem. Reverted the mapping to its V8.9.0 values:
+        // shutter angle cannot invent pixel motion that the push itself doesn't have, and there is no
+        // physically-sensible way to get more than a sub-pixel blur out of auto_edit's default 5% Ken
+        // Burns push without either exceeding a real 180 deg shutter (not honest) or raising the push's own
+        // speed (push_in_zoom, an editorial preset choice, out of scope for a core-engine pass). The engine
+        // is working correctly; this specific benchmark's default push is just that gentle.
         if motion_blur_on {
             let (pw, fps) = (ss.project.width as f64, ss.project.fps);
             for cid in &pushed_ids {
