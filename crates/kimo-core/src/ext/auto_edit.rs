@@ -159,6 +159,11 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // V8.8.1 (quality audit #2): decode mistagged/untagged HD source footage as bt709 instead of trusting
     // an incomplete SD tag (see render.rs::color_tag_override and model.rs's color_tag_sanity doc comment).
     let color_tag_sanity_on = a.get("color_tag_sanity").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.9.0 (quality audit #3): shutter-angle motion blur on the push-in Ken Burns ramp (see the push-in
+    // section below for why punch-ins, hard instant cuts with no continuous motion, are untouched). Cheap:
+    // render.rs's own motion-blur gate only pays the temporal-supersampling cost for the frames where a
+    // property is actually moving, so this never slows a render by more than the push-in ramp itself did.
+    let motion_blur_on = a.get("motion_blur").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -263,6 +268,56 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         }
     }
 
+    // 2a3. V8.9.0 (quality audit #3): shake-detect and warp-stabilize handheld b-roll. A full
+    // rolling-shutter-capable warp stabilizer already exists (stabilize.rs / the "stabilize" tool's warp
+    // engine) but nothing in auto_edit ever called it. Scoped to b-roll only (never dialogue): add_punch_ins
+    // below sets the talking-head clips' own "scale" prop directly, and stabilize's write_keys REPLACES
+    // x/y/scale/rotation wholesale -- running it on a dialogue clip would either get clobbered by the punch
+    // right after it, or clobber the punch if ordered the other way, so it is left out of scope here on
+    // purpose rather than guessed at. Runs BEFORE push-in on purpose too: push-in's own candidate filter
+    // already skips any clip whose x/y/scale carries keys, so a clip this stabilizes is naturally excluded
+    // from also being pushed -- no double-write, no extra check needed.
+    // Off by default: measured on this benchmark's real footage, even the cheap (low-feature, position-only)
+    // shake SCAN this uses to decide whether a clip needs correcting costs on the order of 100ms per
+    // decoded frame (there is no cheaper windowed-scan mode in the engine today -- stabilize always reads a
+    // clip's full duration -- so the scan's cost is the clip's own length at that per-frame rate); a
+    // full-quality correction pass on a clip that actually IS shaky costs far more again. On a project with
+    // several b-roll cutaways that is well past the "doesn't tank speed" bar on its own, before any clip
+    // even needs correcting. See CHANGELOG.md v8.9.0 for the measured numbers (locked-off vs handheld
+    // shake, scan cost per clip). Each stabilized clip's measured shake and correction are reported in
+    // stages.stabilize.
+    let stabilize_shake_threshold_px = opt_num(a, "stabilize_shake_threshold_px", 1.5).clamp(0.1, 50.0);
+    let stabilize_handheld_on = a.get("stabilize_handheld").and_then(|v| v.as_bool()).unwrap_or(false);
+    if stabilize_handheld_on && !broll_clip_ids.is_empty() {
+        let mut stabilized = vec![];
+        // Scan via stabilize_clip directly (not the "stabilize" tool, which always calls write_keys as
+        // part of the call): a locked-off clip must come out of this exactly as it went in, so the cheap
+        // scan pass below is read-only, and write_keys only ever runs for a clip that measured over threshold.
+        let scan_opts = match crate::stabilize::opts_from_args(&json!({"method": "position", "max_features": 100})) {
+            Ok(o) => o, Err(e) => { warnings.push(format!("handheld stabilization skipped: {e}")); crate::stabilize::Opts::default() }
+        };
+        for cid in &broll_clip_ids {
+            let dur = ss.project.find_clip(cid).map_or(0.0, |c| c.duration);
+            if dur < 0.3 { continue; } // stabilize_clip needs at least 2 frames; anything this short isn't worth scanning
+            let shake_px = match crate::stabilize::stabilize_clip(&ss.project, cid, &scan_opts) {
+                Ok((_, rep)) => rep.get("max_correction_px").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                Err(e) => { warnings.push(format!("handheld shake scan skipped on clip {cid}: {e}")); continue; }
+            };
+            if shake_px < stabilize_shake_threshold_px {
+                stabilized.push(json!({"clip_id": cid, "shake_px": shake_px, "stabilized": false}));
+                continue; // locked-off (or close enough): left exactly as decoded, nothing written
+            }
+            let full_opts = match crate::stabilize::opts_from_args(&json!({"method": "position_scale_rotation", "framing": "crop", "mode": "smooth_motion", "smoothing": "gaussian"})) {
+                Ok(o) => o, Err(e) => { warnings.push(format!("stabilize skipped on handheld clip {cid}: {e}")); continue; }
+            };
+            match crate::stabilize::stabilize_clip(&ss.project, cid, &full_opts).and_then(|(rows, rep)| crate::stabilize::write_keys(&mut ss.project, cid, &full_opts, &rows).map(|_| rep)) {
+                Ok(rep) => stabilized.push(json!({"clip_id": cid, "shake_px": shake_px, "stabilized": true, "report": rep})),
+                Err(e) => warnings.push(format!("stabilize skipped on handheld clip {cid} (shake {shake_px:.2}px): {e}")),
+            }
+        }
+        if !stabilized.is_empty() { stages.insert("stabilize".into(), json!({"clips": stabilized, "threshold_px": stabilize_shake_threshold_px})); }
+    }
+
     // 2b. Slow push-in (V8.2V, Ken Burns): a gentle, eased push-in on every static b-roll cutaway -- the
     // free "it's not just a photo pasted in" win a raw cutaway never gets. Scoped to b-roll on purpose:
     // the talking head gets its own cut-zoom treatment below (job 2), so a b-roll-only push here never
@@ -275,15 +330,54 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
                 && ["scale", "x", "y"].iter().all(|k| c.props.get(*k).is_none_or(|q| q.keys.is_empty() && q.expr.is_empty())))
         }).cloned().collect();
         let mut pushed = vec![];
+        let mut pushed_ids = vec![];
         for cid in &candidates {
             let dur = ss.project.find_clip(cid).map_or(0.0, |c| c.duration);
             let samples = if dur > 6.0 { 6 } else { 3 };
             match call(ss, "add_smart_punch", &json!({"clip_id": cid, "zoom": push_in_zoom, "samples": samples})) {
-                Ok(v) => pushed.push(v),
+                Ok(v) => { pushed.push(v); pushed_ids.push(cid.clone()); }
                 Err(e) => warnings.push(format!("push-in skipped on clip {cid}: {e}")),
             }
         }
         if !pushed.is_empty() { stages.insert("push_in".into(), json!({"clips": pushed})); }
+        // V8.9.0 (quality audit #3): a push-in is the one ramp auto_edit creates that actually moves a
+        // property continuously within a single clip (ease: 0 punch-ins below are hard, instant cuts --
+        // nothing moves WITHIN either side of the cut, so render.rs's own "did this property actually
+        // move" motion-blur gate (render.rs's `moving` check) would never fire for them even if asked;
+        // motion_blur is left untouched there on purpose). Every successful push-in gets SOME motion blur
+        // by construction (it always ramps scale from 1.0 to push_in_zoom, so it always moves); the amount
+        // is proportional to how fast it actually moves, not a flat constant: sample the written scale
+        // ramp, convert the fastest frame-to-frame scale delta to an approximate edge pixel displacement
+        // (treating the cutaway as roughly canvas-width), and map that to a shutter angle between a 90 deg
+        // floor (a real but gentle push should still read as a touch of blur, not nothing) and a 180 deg
+        // ceiling (reached once the ramp is moving 6px/frame or faster at the edge).
+        if motion_blur_on {
+            let (pw, fps) = (ss.project.width as f64, ss.project.fps);
+            for cid in &pushed_ids {
+                let Some(c) = ss.project.find_clip(cid) else { continue };
+                let dur = c.duration;
+                let Some(scale_prop) = c.props.get("scale").cloned() else { continue };
+                let n = 60usize;
+                let mut max_px_per_frame = 0.0f64;
+                for i in 0..n {
+                    let t0 = dur * i as f64 / n as f64;
+                    let t1 = dur * (i as f64 + 1.0) / n as f64;
+                    let ds = (scale_prop.at(t1) - scale_prop.at(t0)).abs();
+                    // one render frame's worth of this sample-to-sample delta, as a px displacement at the
+                    // canvas edge (scale is a multiplier about the centre, so an edge point moves by
+                    // roughly ds * pw/2 over this span; /fps-interval converts the sampled span to per-frame).
+                    let span_frames = ((t1 - t0) * fps).max(1.0);
+                    let px_per_frame = (ds * pw * 0.5) / span_frames;
+                    max_px_per_frame = max_px_per_frame.max(px_per_frame);
+                }
+                if max_px_per_frame > 1e-6 {
+                    let shutter = (90.0 + max_px_per_frame * 15.0).clamp(90.0, 180.0);
+                    if let Err(e) = call(ss, "set_motion_blur", &json!({"clip_id": cid, "shutter_angle": shutter})) {
+                        warnings.push(format!("motion blur skipped on push-in clip {cid}: {e}"));
+                    }
+                }
+            }
+        }
     }
 
     // 2c. V8.2V job 2 / V8.5.6: force extra splits on any uncovered dialogue stretch that would otherwise sit
@@ -645,6 +739,8 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         "linear_compositing": linear_compositing_on,
         "encoder_quality": encoder_quality_on,
         "color_tag_sanity": color_tag_sanity_on,
+        "motion_blur": motion_blur_on,
+        "stabilize_handheld": stabilize_handheld_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -685,6 +781,9 @@ pub fn commands() -> Vec<Command> {
                 ("linear_compositing", json!({"type": "boolean", "description": "default true: linear-light blend, lanczos fit, dither"})),
                 ("encoder_quality", json!({"type": "boolean", "description": "default true: an explicit x264 preset (slow) for the final export, smaller and higher-SSIM than ffmpeg's own default at the same crf"})),
                 ("color_tag_sanity", json!({"type": "boolean", "description": "default true: decode mistagged/untagged HD source footage as bt709 instead of trusting an incomplete SD tag"})),
+                ("motion_blur", json!({"type": "boolean", "description": "default true: shutter-angle motion blur (90-180 deg) on the push-in Ken Burns ramp, proportional to how fast it actually moves (never on punch-ins: those are hard instant cuts with nothing to blur)"})),
+                ("stabilize_handheld", json!({"type": "boolean", "description": "default FALSE: shake-detect each b-roll cutaway and warp-stabilize it only when measured shake clears stabilize_shake_threshold_px, leaving locked-off shots untouched -- off by default because even the cheap shake scan costs real time per clip (see CHANGELOG.md v8.9.0); never applied to the talking-head track (would fight add_punch_ins for the same x/y/scale props)"})),
+                ("stabilize_shake_threshold_px", n("max_correction_px above which a b-roll clip counts as handheld and gets warp-stabilized, default 1.5, clamped 0.1..50 (only read when stabilize_handheld is true)")),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }

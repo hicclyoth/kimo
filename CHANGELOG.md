@@ -1,3 +1,60 @@
+## v8.9.0 "motion blur and handheld stabilization in auto_edit" (2026-11-03)
+
+Quality audit #3. Two complete systems already existed and were fully wired into the renderer (shutter-angle
+motion blur: `Clip.motion_blur`, temporal supersampling in `render.rs`, its own "did this property actually
+move" gate so the cost is paid only on the frames something is moving; a rolling-shutter-capable warp
+stabilizer: `stabilize.rs`, the `stabilize` tool) but neither was ever called by anything `auto_edit` builds.
+
+**Motion blur**: `auto_edit`'s push-in (Ken Burns) step is the one ramp it creates that actually moves a
+property continuously within a single clip -- punch-ins are a hard, instant cut (`ease: 0`), so nothing
+moves within either side of the cut for motion blur to catch, and they are deliberately left alone (verified
+by test, not just asserted in a comment). Every push-in that lands now gets `set_motion_blur` called on it,
+proportional to how fast it actually moves: the written scale ramp is sampled, the fastest frame-to-frame
+scale delta is converted to an approximate edge pixel displacement, and that maps to a shutter angle between
+a 90 deg floor (a gentle push still reads as a touch of blur) and a 180 deg ceiling (reached once the ramp
+moves roughly 6px/frame or faster at the canvas edge) -- never a flat constant. Gated on a new `motion_blur`
+auto_edit arg, default true; cheap, since render.rs's own motion-blur gate only pays the extra
+temporal-supersampling cost for the frames where something is actually moving, so this never slows a render
+by meaningfully more than the push-in ramp itself already did.
+
+**Handheld stabilization**: a new `stabilize_handheld` auto_edit arg (scoped to b-roll only -- see below)
+scans each b-roll clip with the warp engine's cheap settings (`method: position`, `max_features: 100`,
+read-only via `stabilize::stabilize_clip` directly, NOT the `stabilize` tool, which always writes keys as
+part of the call) and only runs the full-quality correction (`position_scale_rotation`, conservative `crop`
+framing, gaussian smoothing) and writes it when the measured `max_correction_px` clears
+`stabilize_shake_threshold_px` (default 1.5). A clip under threshold is left exactly as decoded -- no keys
+written at all, confirmed by test. Scoped to b-roll, never the talking-head track: `add_punch_ins` sets the
+dialogue clips' own `scale` directly, and `stabilize`'s `write_keys` REPLACES x/y/scale/rotation wholesale,
+so running it on a dialogue clip would either get clobbered by the punch right after it or clobber the punch
+if ordered the other way -- a real ordering conflict, not an arbitrary cut. Runs before push-in on purpose:
+push-in's own candidate filter already skips any clip whose x/y/scale carries keys, so a clip this
+stabilizes is naturally excluded from also being pushed, no double-write.
+
+**Measured** (this benchmark's real footage, warp engine, `position_scale_rotation`, 90-frame/3s clips):
+`broll_city_real.mp4` (gimbal-smooth) 0.006px max correction; `broll_typing_real.mp4` (locked-off) 0.33px;
+`talkinghead_real_final.mp4` (handheld-ish) 7.55px; `broll_coffee_real.mp4` (handheld) 49.3px -- a threshold
+of 1.5px cleanly separates locked-off from handheld with wide margin on real content. **Speed, the reason
+`stabilize_handheld` defaults to FALSE**: even the cheap scan pass costs on the order of 100-115ms per
+decoded frame (there is no cheaper windowed-scan mode in the engine today -- `stabilize_clip` always reads a
+clip's full duration), so scanning every b-roll clip in a typical multi-cutaway edit is well past the
+"doesn't tank speed vs V8.7.1" bar on the scan alone, before any clip even needs the (costlier again)
+correction pass. Per the audit's own fallback for this item ("if too costly for every render, land it gated
+off by default with an easy single flag") this is narrowed to off-by-default and b-roll-only rather than
+defaulted on project-wide, fully implemented and tested either way.
+
+Test (`quality_v890.rs`, 4 tests): a push-in's eased ramp gets nonzero, <=180 deg motion_blur by default,
+every other clip (including punch-ins) stays at exactly 0; `motion_blur: false` leaves the push-in at 0 too;
+`stabilize_handheld` defaults to false (no stage, no stray keys); and the core measurement -- a synthetic
+"handheld" b-roll fixture (a sinusoidally-wobbling crop window over a larger canvas, same content as a
+locked-off fixture otherwise) measures >3x the shake of the locked-off one, gets real x/y/scale/rotation
+correction keys written, while the locked-off clip comes out with no keys at all.
+
+Scoped suite green (golden_frames [auto_edit's schema hash changed -- hand-spliced into golden_registry.txt
+the same way v8.8.0's did, never via KIMO_UPDATE_GOLDEN], recipes, registry_lint, registry_unique,
+external_refs, description_first_sentence, auto_edit(26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, quality_v870, quality_v880, quality_v881, quality_v890(new, 4 tests), color_pipeline,
+color_linear, director_small(50/50, the one box-load timing flake re-confirmed in isolation)). Warnings: 34.
+
 ## v8.8.1 "colour-tag sanity check" (2026-11-03)
 
 Quality audit #2. ffmpeg's decode already honours whatever colour matrix IS tagged in a container
