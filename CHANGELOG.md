@@ -1,3 +1,50 @@
+## v8.9.3 "frame-blend conform for 24→30fps" (2026-11-03)
+
+Quality audit #5: converting a clip whose native fps sits below the project fps (the ordinary case: 24fps
+source footage into a 30fps project at 1x, the shutter-angle and handheld-stabilize code already shipped in
+V8.9.0/V8.9.1 left this one untouched) used ffmpeg's plain `fps=` filter, which hits the target rate by
+repeating whole source frames verbatim. Measured honestly at the internal render level (`render_frame`,
+bypassing any encode noise): a 2s/60-frame slice of a 24fps synthetic clip conformed into a 30fps project
+duplicates 12 of 60 consecutive frame-pairs byte-for-byte -- 20.0%, exactly the 24/30 ratio the audit named.
+
+**Fix:** `frame_blend_conform` (new `Project` field, `#[serde(default, skip_serializing_if)]` so every
+existing saved project is untouched) swaps the fps filter for `minterpolate=mi_mode=blend` -- a cheap
+cross-dissolve of the two nearest source frames, no motion search -- whenever a clip's native fps measurably
+trails the project fps at plain 1x playback (a retimed/speed-ramped clip already has its own deliberate
+frame math and is left alone). Off by default; `auto_edit` turns it on like the other quality options.
+
+**Measured, same internal harness:** duplicate frame-pairs drop from 12/60 (20.0%) to 2/60 (3.3%) -- the
+residual 2 are stream-boundary frames with no neighbour on one side to blend with, not a missed case. 48 of
+60 frames differ pixel-for-pixel from the option-off render (far more than the 12 it merely de-duplicates),
+confirming the blended frames are genuinely new content, not duplicates relabelled under a different hash.
+Speed cost in-process: 314ms -> 358ms over 90 rendered frames (+14%). Full export through the real pipeline
+(640x360, 4s, libx264 crf18 ultrafast) measured 0.82s -> 1.09s (+33%, encode overhead included at this tiny
+size; the proportional cost falls as clip length/resolution grow since the filter cost is per-decoded-frame).
+
+**Honest visual verdict -- ghosting is real and content-dependent.** On the synthetic adversarial case (a
+small, saturated, hard-edged test pattern against a flat field -- the audit's own suggested test), the blend
+option visibly double-exposes the moving block: two overlapping copies at different alpha, a real ghosting
+artifact, worse-looking than the plain duplicate's judder in a paused frame (see
+`/home/user/tab/files/v7q/conform_v893.png`, frames 46/47 and 76/77). On real footage (the benchmark's own
+24fps talking-head source, cropped on the fastest-moving region found by frame-diff -- a raised, gesturing
+hand), the same option produces a much softer effect: a slight doubling at the fingertip edges, closer to
+natural motion blur than to a distinct double image, because real footage already carries sensor noise and
+optical blur that masks the two-copy structure the synthetic test exposes cleanly. Net: for typical camera
+footage this reads as a smoothness improvement; for flat-graphic/animated content with hard edges and fast
+motion it can look worse than duplication, which is a real trade-off to know about, not a bug to silently
+ship past.
+
+**Considered `mi_mode=mci` (motion-compensated interpolation) instead of `mi_mode=blend`:** measured 23x
+slower on the synthetic clip (0.19s vs 4.34s for a 4s/96-frame direct ffmpeg filter run) and, even at that
+cost, still showed a smaller but real residual ghost on the same hard-edge test pattern -- motion search
+doesn't fully resolve a small saturated block against a flat field. Not worth the cost as a core-engine
+default; kept `mi_mode=blend`.
+
+Sheet: `/home/user/tab/files/v7q/conform_v893.png`. Tests: new `quality_v893.rs` (4 tests: duplicate-count
+drop, bit-identical when off, retimed clips untouched, speed cost measured). Scoped suite: auto_edit 26/26,
+golden_frames 3/3 all green; `golden_frames.txt`/`recipe_frames.txt`/`golden_project.txt` byte-identical to
+bb41200. Warnings: 34 (cap 35).
+
 ## v8.9.2 "motion-blur visual proof" (2026-11-03)
 
 Quality audit follow-up: V8.9.0's own comparison sheet (`quality_v04_vs_v05.png`) carried no frame where a

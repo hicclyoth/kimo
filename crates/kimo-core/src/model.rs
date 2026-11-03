@@ -264,6 +264,11 @@ pub struct Project {
     /// existing project) decodes exactly as before: ffmpeg's swscale honours whatever is tagged. See
     /// render.rs::color_tag_override and decode().
     #[serde(default, skip_serializing_if = "is_false")] pub color_tag_sanity: bool,
+    /// V8.9.3 (quality audit #5): when true and a clip's native media fps is lower than the project fps
+    /// (e.g. a 24fps source in a 30fps project), decode uses ffmpeg's `minterpolate=mi_mode=blend` (a
+    /// cheap cross-dissolve of the two nearest source frames, no motion search) instead of the plain
+    /// `fps=` filter's frame duplication. Off by default: existing projects/goldens render byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")] pub frame_blend_conform: bool,
     #[serde(default)] pub camera: BTreeMap<String, crate::keyframe::Prop>,
     /// 3D compositor (comp3d.rs, set_3d_compositor): depth sorting, intersections, shadows, depth of field. None (absent from the
     /// file) or enabled = false renders exactly as before.
@@ -327,7 +332,7 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, x264_preset: None, color_tag_sanity: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
+        Project { links: vec![], proxies: Default::default(), grade_scopes: Default::default(), lights: BTreeMap::new(), materials: BTreeMap::new(), editorial: Default::default(), ocio_view_delivery: None, occluders: BTreeMap::new(), color_pipeline: Default::default(), linear_blend: false, x264_preset: None, color_tag_sanity: false, frame_blend_conform: false, camera: BTreeMap::new(), comp3d: None, hooks: BTreeMap::new(), expr_scripts: vec![], name: "untitled".into(), width: 1280, height: 720, fps: 30.0, assets: BTreeMap::new(), bins: vec![], subclips: BTreeMap::new(), tracks: vec![], next_id: 1, markers: vec![], deps: None, templates: vec![], base_dir: None, master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }
     }
 }
 

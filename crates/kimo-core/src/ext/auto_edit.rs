@@ -164,6 +164,11 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     // render.rs's own motion-blur gate only pays the temporal-supersampling cost for the frames where a
     // property is actually moving, so this never slows a render by more than the push-in ramp itself did.
     let motion_blur_on = a.get("motion_blur").and_then(|v| v.as_bool()).unwrap_or(true);
+    // V8.9.3 (quality audit #5): 24->30fps (and similar) upsamples measured 20% exact-duplicate frames via
+    // plain fps= filter duplication (CHANGELOG.md v8.9.3); minterpolate's mi_mode=blend cross-dissolves the
+    // two nearest source frames instead. Pure decode-time filter string, never touches render_frame, so it
+    // carries no golden_frames.txt/recipe_frames.txt risk -- still gated to auto_edit like the others above.
+    let frame_blend_conform_on = a.get("frame_blend_conform").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let mut stages = serde_json::Map::new();
     let mut warnings: Vec<String> = vec![];
@@ -749,6 +754,10 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
     if color_tag_sanity_on {
         call(ss, "project_set", &json!({"color_tag_sanity": true}))?;
     }
+    // V8.9.3: see frame_blend_conform_on's comment above.
+    if frame_blend_conform_on {
+        call(ss, "project_set", &json!({"frame_blend_conform": true}))?;
+    }
 
     Ok(json!({
         "ok": true, "track_id": track_id, "duration": edit_duration, "total_duration": total_duration, "mix_lufs": audio["mix_lufs"],
@@ -758,6 +767,7 @@ fn auto_edit(ss: &mut Session, a: &Value) -> Result<Value, String> {
         "color_tag_sanity": color_tag_sanity_on,
         "motion_blur": motion_blur_on,
         "stabilize_handheld": stabilize_handheld_on,
+        "frame_blend_conform": frame_blend_conform_on,
         "next": "export when ready; self_review or review_export to look at it first",
     }))
 }
@@ -801,6 +811,7 @@ pub fn commands() -> Vec<Command> {
                 ("motion_blur", json!({"type": "boolean", "description": "default true: shutter-angle motion blur (90-180 deg) on the push-in Ken Burns ramp, proportional to how fast it actually moves (never on punch-ins: those are hard instant cuts with nothing to blur)"})),
                 ("stabilize_handheld", json!({"type": "boolean", "description": "default FALSE: shake-detect each b-roll cutaway and warp-stabilize it only when measured shake clears stabilize_shake_threshold_px, leaving locked-off shots untouched -- off by default because even the cheap shake scan costs real time per clip (see CHANGELOG.md v8.9.0); never applied to the talking-head track (would fight add_punch_ins for the same x/y/scale props)"})),
                 ("stabilize_shake_threshold_px", n("max_correction_px above which a b-roll clip counts as handheld and gets warp-stabilized, default 1.5, clamped 0.1..50 (only read when stabilize_handheld is true)")),
+                ("frame_blend_conform", json!({"type": "boolean", "description": "default true: when a clip's native fps is below the project fps (e.g. 24fps footage in a 30fps project), blend the two nearest source frames (minterpolate mi_mode=blend) instead of duplicating whole frames"})),
             ], &["talking_head_asset_ids"]), run: |ss, a| atomic(ss, a, auto_edit) },
     ]
 }

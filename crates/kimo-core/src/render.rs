@@ -217,6 +217,33 @@ fn mistagged_hd_source(path: &str) -> bool {
     r
 }
 
+/// V8.9.3 (quality audit #5): native media fps, cached per path (same pattern as mistagged_hd_source) so
+/// a clip decoded across many windowed calls only ever probes its own file once per process.
+fn native_media_fps(path: &str) -> Option<f64> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<f64>>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(r) = m.lock().unwrap().get(path) { return *r; }
+    let r = probe(path).ok().map(|(_, _, _, fps)| fps).filter(|f| f.is_finite() && *f > 1.0);
+    m.lock().unwrap().insert(path.to_string(), r);
+    r
+}
+
+/// V8.9.3 (quality audit #5): when `frame_blend_conform` is on and this clip's native fps is measurably
+/// below the project fps (plain unretimed playback, speed 1.0 -- a speed ramp or retime already has its
+/// own deliberate frame math and is left alone), ffmpeg's `fps=` filter -- which just duplicates/drops
+/// whole frames to hit the target rate -- is swapped for `minterpolate=mi_mode=blend`: a cheap cross-
+/// dissolve of the two nearest source frames (no motion search, unlike `mi_mode=mci`), so a 24fps source
+/// conformed to a 30fps project no longer shows a quarter of its frames as exact byte-for-byte repeats.
+fn conform_fps_filter(p: &Project, c: &Clip, path: &str, speed: f64, is_img0: bool, seek_base: Option<(f64, i64)>) -> String {
+    let eligible = p.frame_blend_conform && !is_img0 && seek_base.is_none() && !c.retimed() && (speed - 1.0).abs() < 1e-9;
+    if eligible {
+        if let Some(native) = native_media_fps(path) {
+            if native < p.fps - 0.05 { return format!("minterpolate=fps={}:mi_mode=blend", p.fps); }
+        }
+    }
+    format!("fps={}", p.fps)
+}
+
 /// Decode `n` frames starting at global clip frame `a` (windowed: memory stays bounded for any clip length).
 fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Option<(f64, i64)>) -> Result<Frames, String> {
     let (w, h) = (p.width, p.height);
@@ -276,7 +303,8 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     // automatic YUV->RGB matrix selection (inside `scale`/`format`) reads frame-tagged metadata, so
     // overriding the tag here, first in the filter chain, is what actually changes the decoded colour.
     let color_override = if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) { "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709," } else { "" };
-    let vf = format!("{color_override}setpts=PTS/{},fps={},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),p.fps,a_rel+n,fitf);
+    let fps_filter = conform_fps_filter(p, c, path, speed, is_img0, seek_base);
+    let vf = format!("{color_override}setpts=PTS/{},{},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),fps_filter,a_rel+n,fitf);
     let is_img = is_still_path(path);
     let loop_args: Vec<&str> = if is_img { vec!["-loop", "1"] } else { vec![] };
     let fs = (w * h * 4) as usize;
@@ -288,7 +316,7 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     if estimate>decode_cache_limit(){return Err("decode request exceeds bounded cache; reduce size/duration or use windowed timing".into())}
     crate::guard::reserve(estimate);
     let exr_args:Vec<&str>=if path.to_lowercase().ends_with(".exr"){vec!["-apply_trc","linear"]}else{vec![]};
-    let vf=if native_fit{format!("setpts=PTS/{},fps={},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,format={pix}",speed.max(0.01),p.fps,a_rel+n)}else{vf};
+    let vf=if native_fit{format!("setpts=PTS/{},{},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,format={pix}",speed.max(0.01),fps_filter,a_rel+n)}else{vf};
     let mut command=Command::new("ffmpeg");command.args(["-v","error"]).args(&loop_args).args(&exr_args).args(["-ss",&format!("{in_pt}"),"-t",&format!("{span}"),"-i",path,"-vf",&vf,"-frames:v",&n.max(1).to_string(),"-f","rawvideo","-pix_fmt",pix,"-"]);
     let mut buf=Vec::new();
     let linear_buf=if native_fit{
@@ -488,7 +516,7 @@ fn source_frame_h(p: &Project, c: &Clip, lt_in: f64, cache: &Cache) -> (Frame, O
                 let al = if a1 == a2 { a1 } else { a1*(1.0-k)+a2*k };
                 for j in 0..3 { f.d[i+j] = if al > 0.0 { ((c1[j]*a1*(1.0-k)+c2[j]*a2*k)/al) as f32 } else { (c1[j]*(1.0-k)+c2[j]*k) as f32 }; } f.d[i+3]=(al*fa) as f32; } } },
         Source::Adjustment => {}
-        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
+        Source::Precomp { tracks } => { let mut sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(tracks), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, hooks: Default::default(), expr_scripts: Default::default(), tracks: tracks.clone(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 }; sub.name = c.id.clone(); match render_frame_opts(&sub, lt, cache, true) {Ok(fr)=>f=fr,Err(_)=>f.d.fill(f32::NAN)} }
         Source::Shape { shape, width, height, fill, stroke_width, stroke_color, sides, corner_radius } => {
             let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0); let (hw, hh) = (width / 2.0, height / 2.0);
             // signed distance (negative inside), then shape modifiers (offset/repeater/merge) from shapemods.rs
@@ -1319,7 +1347,7 @@ pub fn render_clip_alone_as(p: &Project, c: &Clip, t: f64, cache: &Cache) -> Opt
     let mut srcs: Vec<std::sync::Arc<Clip>> = vec![];
     for e in c.effects.iter() { let Some(k) = crate::layerfx::source_key(&e.kind) else { continue };
         if let Some(m) = e.strings.get(k).and_then(|id| p.find_clip(id)).filter(|m| m.id != c.id && !srcs.iter().any(|s| s.id == m.id)) { let mut m = m.clone(); m.start += t - crate::pushwipe::luma_time(p, &m, t); srcs.push(std::sync::Arc::new(m)); } }
-    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
+    let sub = Project { links: vec![], proxies: p.proxies.clone(), grade_scopes: p.grade_scopes.subset(&[crate::model::Track{id:"matte".into(),clips:vec![std::sync::Arc::new(c.clone())],locked:false,muted:false,solo:false,name:String::new()}]), lights: p.lights.clone(), materials: p.materials.clone(), editorial: p.editorial.clone(), ocio_view_delivery: None, occluders: p.occluders.clone(), color_pipeline: p.color_pipeline.clone(), linear_blend: p.linear_blend, x264_preset: p.x264_preset.clone(), color_tag_sanity: p.color_tag_sanity, frame_blend_conform: p.frame_blend_conform, hooks: Default::default(), expr_scripts: Default::default(), tracks: std::iter::once(crate::model::Track { id: "matte".into(), clips: vec![std::sync::Arc::new(c)], locked: false, muted: false, solo: false, name: String::new() }).chain((!srcs.is_empty()).then(|| crate::model::Track { id: ALONE_SRC_TRACK.into(), clips: srcs, locked: false, muted: false, solo: false, name: String::new() })).collect(), assets: p.assets.clone(), bins: p.bins.clone(), subclips: p.subclips.clone(), camera: p.camera.clone(), comp3d: p.comp3d.clone(), markers: vec![], name: String::new(), width: p.width, height: p.height, fps: p.fps, next_id: 0, deps: None, templates: vec![], base_dir: p.base_dir.clone(), master_speech_level: 0.0, master_speech_level_scope_end: 0.0 };
     MATTE_DEPTH.with(|d| d.set(d.get() + 1)); let r = render_frame_opts(&sub, t, cache, true).ok(); MATTE_DEPTH.with(|d| d.set(d.get() - 1)); r
 }
 
