@@ -1,3 +1,44 @@
+## v8.9.1 "correct output transfer tag" (2026-11-03)
+
+Quality audit follow-up, found by Tab reviewing the 8.7.0-8.9.0 work: `legacy_encoder_command`'s ordinary
+export path (the one `render::export` and every auto_edit render use) tagged every output's `-color_trc` as
+`iec61966-2-1` (the sRGB OETF curve), not `bt709`. Measured with ffprobe on three real exports --
+`core_v04.mp4`, `real_v62.mp4`, `core_v03.mp4` -- all three read `color_transfer=iec61966-2-1` while
+`color_primaries`/`colorspace`/`color_range` already correctly read `bt709`/`bt709`/`tv`. This was a mistag,
+not a miscode: the pipe never actually applies the sRGB transfer function anywhere between decode and
+encode (it's gamma-space-neutral end to end, confirmed by code read), so the honest tag for what the bytes
+actually carry is `bt709`, which is also what ordinary HD delivery / most players assume absent other
+signals.
+
+**Fix**: `legacy_encoder_command_opts`'s fallback branch (used whenever `color_pipeline` isn't explicitly
+enabled -- the case every auto_edit render and the overwhelming majority of exports hit) now writes
+`bt709` instead of `iec61966-2-1`. The explicit `color_pipeline`-enabled branch is untouched: a caller who
+sets `output_transfer=1` on purpose still gets the literal sRGB tag they asked for. Pure metadata: the
+`-vf scale=...`/pixel path is bit-for-bit unchanged, confirmed by golden_frames.txt/recipe_frames.txt/
+golden_project.txt staying byte-identical to 10ad62d (nothing here touches `render_frame`, which is all
+those goldens hash).
+
+ffprobe before -> after (new unit test `exported_mp4_is_ffprobe_tagged_bt709_transfer_primaries_colorspace_tv_range`,
+a real encoded file, not just the argv string):
+```
+before: color_range=tv color_space=bt709 color_transfer=iec61966-2-1 color_primaries=bt709
+after:  color_range=tv color_space=bt709 color_transfer=bt709        color_primaries=bt709
+```
+Applied for all ordinary exports (not just auto_edit): it moves zero golden frame hashes, since those
+hashes never touch the encoder, only `render_frame`'s raw buffer -- confirmed by `video_delivery.rs`'s
+`ordinary_video_tags_and_709_swatch` (which decodes the actual H.264 bitstream's VUI header via
+`trace_headers`: `transfer_characteristics` now reads `1` (bt709), not `13` (sRGB), alongside
+`colour_primaries=1`/`matrix_coefficients=1`, which were already correct) and the render.rs unit tests
+`ordinary_video_argv_declares_matching_conversion_and_tags` / `x264_preset_none_is_byte_identical_to_before`,
+both updated to expect `bt709`.
+
+Scoped suite green: golden_frames, recipes, registry_lint, registry_unique, external_refs,
+description_first_sentence, auto_edit(26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, quality_v870/v880/v881/v890, color_pipeline, color_linear, video_delivery(2),
+director_small(49/50, the one failure is the already-documented box-load timing flake,
+`two_texts_with_almost_no_gap_are_flagged_as_crowded_not_missed`, clean in isolation), plus the 6 new/updated
+render.rs unit tests. Warnings: 34.
+
 ## v8.9.0 "motion blur and handheld stabilization in auto_edit" (2026-11-03)
 
 Quality audit #3. Two complete systems already existed and were fully wired into the renderer (shutter-angle
