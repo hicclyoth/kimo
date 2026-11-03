@@ -376,12 +376,16 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     // V8.11.0 (quality audit #7): HDR (HLG/PQ) source footage takes priority over the color_tag_sanity
     // mistag check above -- a clip hdr_source() identifies is never also "mistagged SD" (its color_space is
     // bt2020nc/bt2020c, excluded from mistagged_hd_source's sd_or_untagged_matrix test), so the two never
-    // actually compete for the same clip; the if/else-if just keeps the override a single string either way.
-    let color_override = if p.hdr_tonemap && !is_img0 {
-        hdr_source(path).map(|transfer| {
-            let peak = estimate_hdr_peak(path, &transfer);
-            format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,tonemap=tonemap=mobius:desat=0:peak={peak},zscale=t=bt709:m=bt709:p=bt709:r=tv:tin=linear:min=bt709:pin=bt709,format=gbrp,")
-        }).unwrap_or_default()
+    // actually compete for the same clip.
+    // V8.11.1: the HDR branch must only win for a clip hdr_source() actually identifies as HDR -- the
+    // V8.11.0 version keyed this purely on the project-level `p.hdr_tonemap` flag, so once auto_edit turned
+    // that on (default true) EVERY clip took this branch, and a non-HDR clip (hdr_source() -> None) fell
+    // straight to an empty override instead of ever reaching the color_tag_sanity mistag check below --
+    // silently dropping the bt709 retag a mistagged/untagged SD clip (e.g. a bt470bg phone export with no
+    // transfer/primaries tag) depends on. Fixed: only take the HDR path when this specific clip IS HDR.
+    let color_override = if let Some(transfer) = if p.hdr_tonemap && !is_img0 { hdr_source(path) } else { None } {
+        let peak = estimate_hdr_peak(path, &transfer);
+        format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,tonemap=tonemap=mobius:desat=0:peak={peak},zscale=t=bt709:m=bt709:p=bt709:r=tv:tin=linear:min=bt709:pin=bt709,format=gbrp,")
     } else if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) {
         "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709,".to_string()
     } else {

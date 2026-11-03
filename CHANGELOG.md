@@ -1,3 +1,44 @@
+## v8.11.1 "keep SDR clips bit-identical under hdr_tonemap (fix V8.11.0 regression)" (2026-11-03)
+
+V8.11.0 shipped with an unintended brightness/colour shift on ordinary SDR footage: frame means on the real
+benchmark came out about 2 levels brighter in R/G and 0.6 in B on EVERY clip, average PSNR 40.3 dB against
+the V8.10.0 render (min 37.6), visually invisible but real and systematic.
+
+**Root cause (`decode()`'s `color_override`, render.rs):** the V8.11.0 branch read `if p.hdr_tonemap {...}
+else if p.color_tag_sanity {...}`, keyed purely on the project-level `hdr_tonemap` flag. Since `auto_edit`
+turns `hdr_tonemap` on by default, that first branch was taken for EVERY clip once a project went through
+`auto_edit`, regardless of whether a given clip was actually HDR. For a non-HDR clip, `hdr_source(path)`
+correctly returned `None`, but `.unwrap_or_default()` just produced an empty override -- the code never fell
+through to the `color_tag_sanity` mistag check in the `else if`, which it would have reached had
+`hdr_tonemap` been off. The real casualty: `talkinghead_real_final.mp4` (bt470bg, no primaries/transfer tag,
+the audit #2 fixture's own real-world shape) used to get `color_tag_sanity`'s "decode as bt709" correction;
+under V8.11.0 that correction was silently dropped, so the clip decoded through ffmpeg's own auto-detected
+colour matrix instead -- the source of the shift. (The three b-roll clips are correctly tagged bt709 and
+were never "mistagged", so they were already unaffected by this specific clip's mistag logic; the project-
+wide brightness delta the previous check measured came from the mistagged clip's share of the benchmark.)
+
+**Fix:** the HDR branch now only wins when `hdr_source(path)` actually returns `Some(transfer)` for THAT
+clip -- `if let Some(transfer) = if p.hdr_tonemap && !is_img0 { hdr_source(path) } else { None } { ... } else
+if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) { ... }`. A non-HDR clip now always falls
+through to the `color_tag_sanity` check exactly as it did before V8.11.0; an HDR clip still gets the tonemap.
+Nothing else changed -- the tonemap filter chain, peak estimation and detection logic are untouched.
+
+**Verified:** re-rendered the real benchmark with the rebuilt binary (hdr_tonemap at its normal auto_edit
+default, `true`) -- video-stream md5 is now `e31b6789e10c3fbd43c754f09f90f14f`, byte-identical to the
+V8.10.0 (core_v07) render. Re-ran the HDR before/after measurement on the synthetic HLG clip to confirm the
+fix didn't touch the tonemap path itself: uncorrected mean_luma 99.4/std 37.8/mean_sat 160.4, corrected
+118.7/61.2/240.4, SDR reference 125.0/66.7/245.8 -- unchanged from V8.11.0's own numbers within measurement
+noise.
+
+**New regression coverage (`tests/quality_v8110.rs`):** the existing "SDR untouched" test only ever toggled
+`hdr_tonemap` while leaving `color_tag_sanity` at the raw `Session` default of `false` -- it could never have
+hit this bug, because the mistag branch it would have protected was never reachable in that test's own
+setup. Two new tests render a plain bt709 clip and an untagged/bt470bg-mistagged clip (the real
+talkinghead_real_final.mp4 shape) with BOTH `color_tag_sanity` and `hdr_tonemap` on, matching `auto_edit`'s
+actual defaults, and assert the output is pixel-identical whether `hdr_tonemap` is on or off. Confirmed these
+tests actually catch the regression: run against the unpatched V8.11.0 render.rs, the mistagged-clip test
+fails with a measurable pixel diff; against the fix, both pass.
+
 ## v8.11.0 "HDR (HLG/PQ) phone footage corrected into the SDR bt709 pipeline" (2026-11-03)
 
 Quality audit #7: modern iPhones and Androids record HDR by default (HLG/arib-std-b67 or PQ/smpte2084, bt2020

@@ -232,3 +232,97 @@ fn bt2020_primaries_with_no_transfer_tag_is_still_treated_as_hdr() {
     let on = decode_frame(untagged, true);
     assert_ne!(off, on, "a bt2020-primaries clip with no transfer tag should still be treated as HDR and corrected");
 }
+
+// ---------------------------------------------------------------------------------------------
+// V8.11.1 regression test (fixes the V8.11.0 brightness-shift bug): auto_edit turns BOTH
+// color_tag_sanity and hdr_tonemap on by default, so the real-world gate combination to test is
+// both flags on together, not hdr_tonemap in isolation against a Session that leaves
+// color_tag_sanity at its own raw-Session default of false (which is what every test above this
+// point does, and is exactly why none of them caught the bug: with color_tag_sanity off there was
+// never a mistag-correction for hdr_tonemap's old buggy priority to clobber). The V8.11.0 bug:
+// decode()'s color_override picked the HDR branch whenever the PROJECT flag `p.hdr_tonemap` was
+// on, for every clip, regardless of whether that specific clip was actually HDR -- so a non-HDR
+// clip's hdr_source() correctly returning None fell to an empty override instead of ever reaching
+// the color_tag_sanity mistag check below it, silently losing the bt709 retag a mistagged/
+// untagged HD source (e.g. bt470bg with no primaries/transfer, the real talkinghead_real_final.mp4
+// shape) depends on.
+fn mistagged_720p_fixture() -> String {
+    let dir = fixture_dir();
+    let truth = dir.join("q8110_regress_truth.mp4");
+    let mistagged = dir.join("q8110_regress_mistagged.mp4");
+    if !truth.exists() {
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:d=0.2:r=25",
+            "-vf", "scale=out_color_matrix=bt709:out_range=tv", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-color_range", "tv", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+            truth.to_str().unwrap()]);
+    }
+    if !mistagged.exists() {
+        ffmpeg(&["-i", truth.to_str().unwrap(), "-c:v", "copy",
+            "-bsf:v", "h264_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients=5",
+            mistagged.to_str().unwrap()]);
+    }
+    mistagged.to_string_lossy().into_owned()
+}
+
+fn correctly_tagged_720p_fixture() -> String {
+    let dir = fixture_dir();
+    let p = dir.join("q8110_regress_truth.mp4"); // built as a side effect of mistagged_720p_fixture, but
+    if !p.exists() {                              // build it directly too so this fn works standalone.
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:d=0.2:r=25",
+            "-vf", "scale=out_color_matrix=bt709:out_range=tv", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-color_range", "tv", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+            p.to_str().unwrap()]);
+    }
+    p.to_string_lossy().into_owned()
+}
+
+/// decode_frame above hardcodes color_tag_sanity off (the Session default); this variant sets both flags,
+/// matching how auto_edit actually configures a project (both default true).
+fn decode_frame_auto_edit_style(path: &str, w: u32, h: u32, hdr_tonemap: bool) -> Vec<u8> {
+    let mut s = Session::new();
+    dispatch(&mut s, "project_set", &json!({"width": w, "height": h, "fps": 25, "color_tag_sanity": true, "hdr_tonemap": hdr_tonemap})).unwrap();
+    let t = dispatch(&mut s, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
+    let a = dispatch(&mut s, "import_media", &json!({"path": path})).unwrap()["asset_id"].as_str().unwrap().to_string();
+    dispatch(&mut s, "add_clip", &json!({"track_id": t, "source_type": "media", "asset_id": a, "start": 0.0, "duration": 0.16, "in_point": 0.0, "fit": "stretch"})).unwrap();
+    let mut cache = render::Cache::new();
+    render::prepare_at(&s.project, &mut cache, Some(0.08)).unwrap();
+    render::export_frame_rgba8(&s.project, 0.08, &cache).unwrap()
+}
+
+/// The actual regression: a correctly-tagged plain bt709 clip, decoded auto_edit-style (color_tag_sanity
+/// AND hdr_tonemap both on, as auto_edit sets by default), must be pixel-identical whether hdr_tonemap is
+/// on or off -- nothing HDR here, so the flag must be a no-op for this clip either way.
+#[test]
+fn auto_edit_style_bt709_clip_is_pixel_identical_regardless_of_hdr_tonemap() {
+    let clip = correctly_tagged_720p_fixture();
+    let off = decode_frame_auto_edit_style(&clip, 1280, 720, false);
+    let on = decode_frame_auto_edit_style(&clip, 1280, 720, true);
+    assert_eq!(off, on, "a plain bt709 clip must decode identically under auto_edit's settings whether hdr_tonemap is on or off");
+}
+
+/// The actual regression, the shape that broke: an untagged/mistagged (bt470bg, no primaries/transfer)
+/// HD clip -- not HDR, but exactly the real-world shape color_tag_sanity exists to correct -- decoded
+/// auto_edit-style, must be pixel-identical whether hdr_tonemap is on or off. Before the V8.11.1 fix this
+/// failed: hdr_tonemap=true silently suppressed color_tag_sanity's bt709 retag for this clip, producing a
+/// measurably different (brighter / wrong-matrix) decode than hdr_tonemap=false, even though the clip is
+/// not HDR at all.
+#[test]
+fn auto_edit_style_mistagged_clip_is_pixel_identical_regardless_of_hdr_tonemap() {
+    let clip = mistagged_720p_fixture();
+    let off = decode_frame_auto_edit_style(&clip, 1280, 720, false);
+    let on = decode_frame_auto_edit_style(&clip, 1280, 720, true);
+    assert_eq!(off, on, "an untagged/mistagged bt470bg clip (not HDR) must decode identically under auto_edit's settings whether hdr_tonemap is on or off -- hdr_tonemap must never suppress color_tag_sanity's correction for a clip that isn't actually HDR");
+
+    // And both must actually show the color_tag_sanity correction (i.e. not accidentally equal to the
+    // untreated bt470bg-trusting decode) -- proves the fix didn't just disable color_tag_sanity instead.
+    let truth = correctly_tagged_720p_fixture();
+    let truth_rgba = decode_frame_auto_edit_style(&truth, 1280, 720, true);
+    let mean_abs_diff = |a: &[u8], b: &[u8]| -> f64 {
+        let n = a.len().min(b.len());
+        let sum: f64 = (0..n).step_by(4).flat_map(|i| (0..3).map(move |j| i + j)).map(|i| (a[i] as f64 - b[i] as f64).abs()).sum();
+        sum / (n / 4 * 3) as f64
+    };
+    let shift = mean_abs_diff(&truth_rgba, &on);
+    eprintln!("regression check: hdr_tonemap-on mistagged decode vs truth mean abs diff = {shift:.2}/255 (must be small -- color_tag_sanity still corrected it)");
+    assert!(shift <= 2.0, "color_tag_sanity's correction must still apply when hdr_tonemap is also on: mean abs diff vs truth = {shift:.2}/255");
+}
