@@ -1,3 +1,43 @@
+## v8.8.1 "colour-tag sanity check" (2026-11-03)
+
+Quality audit #2. ffmpeg's decode already honours whatever colour matrix IS tagged in a container
+(measured correct in the phase-3 audit -- not a Kimo bug), but Kimo had no sanity check for a source whose
+tag is itself incomplete or wrong for its resolution: the audit's own measured case,
+`talkinghead_real_final.mp4` (1280x720, `color_space=bt470bg`, `color_transfer`/`color_primaries` both
+absent) -- an SD-era matrix with no primaries/transfer tag at all on genuinely HD content, common on real
+phone exports and re-encoded social media footage.
+
+**Change**: `decode()` now checks (`mistagged_hd_source`, cached per path for the process's life, same
+pattern as `check_decodable`'s SEEN cache) whether a source is >=720 lines, tagged with a non-bt709/2020
+matrix, AND has no primaries/transfer tag -- a strong signal of a bad upstream tag, the convention most
+NLEs use for untagged/inconsistently-tagged HD media. When all three hold AND `project.color_tag_sanity` is
+on, the decode's `-vf` chain is prefixed with `setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709,`
+(first in the chain, before any scale/format conversion reads the tag), forcing bt709 interpretation instead
+of trusting the incomplete tag, and logs one warning per path naming the file and its tag. Off by default
+(`color_tag_sanity: bool`, `#[serde(default, skip_serializing_if = "is_false")]` -- already landed in
+v8.8.0's project_set/model.rs schema bump alongside `x264_preset`); `auto_edit` turns it on as its own last
+step (`color_tag_sanity` arg, default true, same opt-in-for-auto_edit pattern as `linear_blend`).
+
+**Test** (`quality_v881.rs`): built a real fixture pair with byte-identical H.264 bitstreams -- one encoded
+and correctly tagged bt709 start to finish ("truth"), the other a `-c:v copy` remux of the exact same
+encoded bytes with only its VUI colour tag rewritten via the `h264_metadata` bitstream filter
+(`colour_primaries=2:transfer_characteristics=2:matrix_coefficients=5`, i.e. bt470bg matrix, primaries/
+transfer both unspecified -- ffprobe reports `color_transfer=unknown`/`color_primaries=unknown` on it, the
+exact shape of the real measured source). Any decoded RGB difference between the two is caused ONLY by the
+tag Kimo reads, never by a different encode. **Measured**: decoding the mistagged file with
+`color_tag_sanity` off (today's/every-existing-project's behaviour, trusting the bad tag) shows a mean
+absolute RGB shift of 6.76/255 against the truly-tagged truth; with `color_tag_sanity` on, 0.00/255 (8-bit
+rounding only). A correctly-tagged source decodes identically either way
+(`color_tag_sanity_does_not_touch_a_correctly_tagged_source`). `color_tag_sanity` defaults to false and is
+omitted from saved projects (`color_tag_sanity_defaults_to_false_and_is_omitted_from_saved_projects`), so
+golden_frames.txt, recipe_frames.txt and golden_project.txt are all untouched by this commit (no schema
+change here either -- `project_set`'s `color_tag_sanity` field was already added in v8.8.0).
+
+Scoped suite green (golden_frames, recipes, registry_lint, registry_unique, external_refs,
+description_first_sentence, auto_edit(26), transition_raw, whip_transition, overlap_pipeline,
+vfx_look_library, quality_v870, quality_v880, quality_v881(new), color_pipeline, color_linear,
+director_small(50/50, the one box-load timing flake re-confirmed in isolation)). Warnings: 34.
+
 ## v8.8.0 "explicit x264 preset" (2026-11-03)
 
 Quality audit #1 (`/home/user/tab/work/kimo_quality_audit.md`, phase 3). `legacy_encoder_command_opts`

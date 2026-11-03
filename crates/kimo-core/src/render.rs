@@ -180,6 +180,43 @@ pub fn clip_fit_filter(w: u32, h: u32, fit: f64, lanczos: bool) -> String {
     else { format!("scale={w}:{h}:force_original_aspect_ratio=decrease{flags},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0") }
 }
 
+/// V8.8.1 (quality audit #2): ffprobe's reported color tags for one source, cached per path for the life
+/// of the process (same pattern as `check_decodable`'s SEEN cache -- decode() calls this once per window
+/// and ffprobe is not free). None on any probe failure (missing ffprobe, no video stream, etc).
+fn probe_color_tags(path: &str) -> Option<(u32, String, String, String)> {
+    let out = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","stream=height,color_space,color_transfer,color_primaries","-of","json",path]).output().ok()?;
+    if !out.status.success() { return None; }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let st = v.get("streams")?.as_array()?.first()?;
+    let get = |k: &str| st.get(k).and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+    Some((st.get("height")?.as_u64()? as u32, get("color_space"), get("color_transfer"), get("color_primaries")))
+}
+
+/// V8.8.1 (quality audit #2): HD (>=720 lines) content tagged with an SD matrix (bt470bg, smpte170m, or no
+/// tag at all) and no primaries/transfer tag either is a strong signal of a bad upstream tag -- common on
+/// real phone exports and re-encoded social media footage (the audit's own measured case:
+/// talkinghead_real_final.mp4, 1280x720, color_space=bt470bg, color_transfer/color_primaries both absent).
+/// ffmpeg's own decode already honours whatever IS tagged (measured correct, not a Kimo bug) -- this is
+/// Kimo's own sanity layer on top, the convention most NLEs use for untagged/inconsistently-tagged HD
+/// media: treat it as bt709 rather than trust a lone incomplete SD tag. Cached per path (see
+/// `probe_color_tags`); logs one warning per path the first time it overrides.
+fn mistagged_hd_source(path: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, bool>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(r) = m.lock().unwrap().get(path) { return *r; }
+    let r = probe_color_tags(path).map(|(h, space, transfer, primaries)| {
+        let sd_or_untagged_matrix = !matches!(space.as_str(), "bt709" | "bt2020nc" | "bt2020c" | "smpte2085");
+        let untagged = matches!(transfer.as_str(), "unknown" | "") && matches!(primaries.as_str(), "unknown" | "");
+        let mistagged = h >= 720 && sd_or_untagged_matrix && untagged;
+        if mistagged {
+            eprintln!("color_tag_sanity: {path} is {h}p but tagged color_space={space} with no primaries/transfer -- decoding as bt709 instead of trusting the incomplete tag.");
+        }
+        mistagged
+    }).unwrap_or(false);
+    m.lock().unwrap().insert(path.to_string(), r);
+    r
+}
+
 /// Decode `n` frames starting at global clip frame `a` (windowed: memory stays bounded for any clip length).
 fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Option<(f64, i64)>) -> Result<Frames, String> {
     let (w, h) = (p.width, p.height);
@@ -234,7 +271,12 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     let float_source=p.color_pipeline.enabled&&[".exr",".pfm"].iter().any(|ext|path.to_lowercase().ends_with(ext));
     let native_fit=float_source||(p.color_pipeline.enabled&&p.color_pipeline.linear_resample);
     let pix=if float_source{"gbrapf32le"}else if p.color_pipeline.enabled{"rgba64le"}else{"rgba"};
-    let vf = format!("setpts=PTS/{},fps={},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),p.fps,a_rel+n,fitf);
+    // V8.8.1: when color_tag_sanity is on and this source is a mistagged/untagged HD clip, force bt709
+    // interpretation via `setparams` BEFORE any scale/format conversion reads the (wrong) tag -- ffmpeg's
+    // automatic YUV->RGB matrix selection (inside `scale`/`format`) reads frame-tagged metadata, so
+    // overriding the tag here, first in the filter chain, is what actually changes the decoded colour.
+    let color_override = if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) { "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709," } else { "" };
+    let vf = format!("{color_override}setpts=PTS/{},fps={},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),p.fps,a_rel+n,fitf);
     let is_img = is_still_path(path);
     let loop_args: Vec<&str> = if is_img { vec!["-loop", "1"] } else { vec![] };
     let fs = (w * h * 4) as usize;
