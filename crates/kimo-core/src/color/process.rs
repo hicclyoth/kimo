@@ -29,13 +29,24 @@ impl DecodeStream{
  pub(crate) fn new(cmd:&mut Command,frame_bytes:usize,frames:usize,timeout:Duration)->Result<Self,String>{
   if frame_bytes==0||frames==0||timeout.is_zero()||frame_bytes.checked_mul(frames).filter(|n|*n<=256*1024*1024).is_none(){return Err("invalid native stream bounds".into())}
   let deadline=Instant::now().checked_add(timeout).ok_or("native deadline overflow")?;
+  Self::spawn(cmd,frame_bytes,frames,deadline)
+ }
+ /// Long-lived decoder read in order across many calls: no total-size cap (only one frame is queued at a time) and each read is bounded with `next_within`.
+ pub(crate) fn persistent(cmd:&mut Command,frame_bytes:usize)->Result<Self,String>{
+  if frame_bytes==0||frame_bytes>256*1024*1024{return Err("invalid native stream bounds".into())}
+  let deadline=Instant::now().checked_add(Duration::from_secs(24*3600)).ok_or("native deadline overflow")?;
+  Self::spawn(cmd,frame_bytes,usize::MAX,deadline)
+ }
+ fn spawn(cmd:&mut Command,frame_bytes:usize,frames:usize,deadline:Instant)->Result<Self,String>{
   crate::guard::reserve(frame_bytes.checked_mul(2).ok_or("native queue allocation overflow")?);
   let mut child=cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e|e.to_string())?;
   let mut output=child.stdout.take().ok_or("native stdout missing")?;let(tx,rx)=mpsc::sync_channel(0);
   let reader=crate::guard::spawn_with_token(move||{for _ in 0..frames{let mut frame=vec![0u8;frame_bytes];let mut have=0;while have<frame_bytes{match output.read(&mut frame[have..]){Ok(0)=>break,Ok(n)=>have+=n,Err(e)=>{let _=tx.send(Err(e.to_string()));return}}}if have==0{let _=tx.send(Ok(None));return}if have!=frame_bytes{let _=tx.send(Err("truncated native decode".into()));return}if tx.send(Ok(Some(frame))).is_err(){return}}let _=tx.send(Ok(None));});
   Ok(Self{child,rx:Some(rx),reader:Some(reader),deadline})
  }
- pub(crate) fn next(&mut self)->Result<Option<Vec<u8>>,String>{loop{crate::guard::check();let remaining=self.deadline.saturating_duration_since(Instant::now());if remaining.is_zero(){return Err("native decode deadline exceeded".into())}match self.rx.as_ref().ok_or("native reader closed")?.recv_timeout(remaining.min(Duration::from_millis(100))){Ok(v)=>return v,Err(mpsc::RecvTimeoutError::Timeout)=>continue,Err(_)=>return Err("native reader disconnected".into())}}}
+ pub(crate) fn next_within(&mut self,timeout:Duration)->Result<Option<Vec<u8>>,String>{let limit=Instant::now().checked_add(timeout).unwrap_or(self.deadline);self.next_until(limit.min(self.deadline))}
+ pub(crate) fn next(&mut self)->Result<Option<Vec<u8>>,String>{self.next_until(self.deadline)}
+ fn next_until(&mut self,deadline:Instant)->Result<Option<Vec<u8>>,String>{loop{crate::guard::check();let remaining=deadline.saturating_duration_since(Instant::now());if remaining.is_zero(){return Err("native decode deadline exceeded".into())}match self.rx.as_ref().ok_or("native reader closed")?.recv_timeout(remaining.min(Duration::from_millis(100))){Ok(v)=>return v,Err(mpsc::RecvTimeoutError::Timeout)=>continue,Err(_)=>return Err("native reader disconnected".into())}}}
  pub(crate) fn finish(&mut self)->Result<(),String>{self.rx.take();loop{crate::guard::check();if let Some(status)=self.child.try_wait().map_err(|e|e.to_string())?{return if status.success(){Ok(())}else{Err("native media decode failed".into())}}let remaining=self.deadline.saturating_duration_since(Instant::now());if remaining.is_zero(){return Err("native decode deadline exceeded after stdout".into())}thread::sleep(remaining.min(Duration::from_millis(20)));}}
 }
 impl Drop for DecodeStream{fn drop(&mut self){self.rx.take();let _=self.child.kill();let _=self.child.wait();if let Some(reader)=self.reader.take(){let _=reader.join();}}}

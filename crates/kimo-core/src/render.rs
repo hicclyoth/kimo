@@ -18,15 +18,20 @@ impl Frames {
 impl std::ops::Index<usize> for Frames { type Output = [u8]; fn index(&self, i: usize) -> &[u8] { self.get(self.first+i).expect("no decoded frame") } }
 pub struct Cache { frames: HashMap<String, (String, std::sync::Arc<Frames>)>, /// Code clip frames per clip id: (signature, last slot asked for, slot -> canvas-size RGBA8). See codeclip.rs.
     code: HashMap<String, CodeSlots>, pub size: (u32, u32, f64), /// Export-only static layer cache (project is immutable for the cache's lifetime).
-    pub export_mode: bool, proxy_clips: std::collections::BTreeMap<String,String>, statics: std::sync::RwLock<HashMap<String, std::sync::Arc<StaticCrop>>> }
+    pub export_mode: bool, proxy_clips: std::collections::BTreeMap<String,String>, statics: std::sync::RwLock<HashMap<String, std::sync::Arc<StaticCrop>>>,
+    /// Export only: one long-lived ffmpeg decoder per plain media clip (see `decode_streamed`). The Mutex keeps Cache Sync (a stream holds a Receiver).
+    streams: std::sync::Mutex<HashMap<String, ClipStream>> }
+/// A clip's running decoder: `next` is the clip frame index its next frame will be.
+struct ClipStream { sig: String, next: usize, stream: crate::color::process::DecodeStream }
 /// Rendered frames of one code clip: (signature, last slot prepared, slot -> canvas-size straight-alpha RGBA8).
 type CodeSlots = (String, usize, std::collections::BTreeMap<usize, std::sync::Arc<Vec<u8>>>);
 pub struct StaticCrop { x0: usize, y0: usize, x1: usize, y1: usize, d: Vec<f32> }
-impl Cache { pub fn new() -> Self { Cache { frames: HashMap::new(), code: HashMap::new(), size: (0, 0, 0.0), export_mode: false, proxy_clips: Default::default(), statics: std::sync::RwLock::new(HashMap::new()) } } pub fn new_export() -> Self { let mut c = Cache::new(); c.export_mode = true; c } pub fn frames_of(&self, id: &str) -> Option<&Frames> { self.frames.get(id).map(|x| x.1.as_ref()) }
+impl Cache { pub fn new() -> Self { Cache { frames: HashMap::new(), code: HashMap::new(), size: (0, 0, 0.0), export_mode: false, proxy_clips: Default::default(), statics: std::sync::RwLock::new(HashMap::new()), streams: Default::default() } } pub fn new_export() -> Self { let mut c = Cache::new(); c.export_mode = true; c } pub fn frames_of(&self, id: &str) -> Option<&Frames> { self.frames.get(id).map(|x| x.1.as_ref()) }
     /// A cheap point-in-time copy for overlapping export: shares every decoded frame/code-slot buffer by
     /// Arc (no pixel data is duplicated), so a prefetch thread can decode the next window into its own
     /// `Cache` instance without aliasing the one the current batch's compose threads are reading.
-    pub fn snapshot(&self) -> Cache { Cache { frames: self.frames.clone(), code: self.code.clone(), size: self.size, export_mode: self.export_mode, proxy_clips: self.proxy_clips.clone(), statics: std::sync::RwLock::new(self.statics.read().map(|g| g.clone()).unwrap_or_default()) } }
+    /// The running clip decoders move to the snapshot (the copy that goes on decoding); the original is only read for compose.
+    pub fn snapshot(&self) -> Cache { Cache { frames: self.frames.clone(), code: self.code.clone(), size: self.size, export_mode: self.export_mode, proxy_clips: self.proxy_clips.clone(), statics: std::sync::RwLock::new(self.statics.read().map(|g| g.clone()).unwrap_or_default()), streams: std::sync::Mutex::new(self.streams.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()) } }
 }
 
 /// Still-image extensions the decoder holds as one looped frame (ffmpeg `-loop 1`). One list, read by
@@ -315,6 +320,18 @@ fn conform_fps_filter(p: &Project, c: &Clip, path: &str, speed: f64, is_img0: bo
     format!("fps={}", p.fps)
 }
 
+/// The HDR tone-map or bt709 re-tag that `decode` puts first in a source's filter chain (see the V8.8.1/V8.11.x notes in `decode`).
+fn color_override_filter(p: &Project, path: &str, is_img0: bool) -> String {
+    if let Some(transfer) = if p.hdr_tonemap && !is_img0 { hdr_source(path) } else { None } {
+        let peak = estimate_hdr_peak(path, &transfer);
+        format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,tonemap=tonemap=mobius:desat=0:peak={peak},zscale=t=bt709:m=bt709:p=bt709:r=tv:tin=linear:min=bt709:pin=bt709,format=gbrp,")
+    } else if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) {
+        "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709,".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Decode `n` frames starting at global clip frame `a` (windowed: memory stays bounded for any clip length).
 fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Option<(f64, i64)>) -> Result<Frames, String> {
     let (w, h) = (p.width, p.height);
@@ -383,14 +400,7 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     // straight to an empty override instead of ever reaching the color_tag_sanity mistag check below --
     // silently dropping the bt709 retag a mistagged/untagged SD clip (e.g. a bt470bg phone export with no
     // transfer/primaries tag) depends on. Fixed: only take the HDR path when this specific clip IS HDR.
-    let color_override = if let Some(transfer) = if p.hdr_tonemap && !is_img0 { hdr_source(path) } else { None } {
-        let peak = estimate_hdr_peak(path, &transfer);
-        format!("zscale=t=linear:npl=100:tin={transfer}:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709:t=linear:m=bt709:tin=linear:min=bt709:pin=bt2020,tonemap=tonemap=mobius:desat=0:peak={peak},zscale=t=bt709:m=bt709:p=bt709:r=tv:tin=linear:min=bt709:pin=bt709,format=gbrp,")
-    } else if p.color_tag_sanity && !is_img0 && mistagged_hd_source(path) {
-        "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709,".to_string()
-    } else {
-        String::new()
-    };
+    let color_override = color_override_filter(p, path, is_img0);
     let fps_filter = conform_fps_filter(p, c, path, speed, is_img0, seek_base);
     let vf = format!("{color_override}setpts=PTS/{},{},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,{},format={pix}",speed.max(0.01),fps_filter,a_rel+n,fitf);
     let is_img = is_still_path(path);
@@ -431,6 +441,46 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     };
     let k = buf.len() / fs; buf.truncate(k * fs);
     Ok(Frames { still:is_img,working_linear:native_fit,quantized:Default::default(),linear_buf, buf, fs, first: a })
+}
+
+/// Export-only fast path for `decode`: `decode` starts a new ffmpeg per window and decodes the clip from its in-point up to the window's end,
+/// so a clip's total decode work grows with the square of its length. Here one ffmpeg per clip runs with the same filter graph and is read in order;
+/// a window that does not continue the stream (first use, seek back, changed clip) starts a new one at that frame. Returns None, so the caller
+/// uses `decode`, for anything `decode` treats specially (stills, colour pipeline, retimed or reframed clips, frame-blend conform) and on any stream error.
+fn decode_streamed(p: &Project, c: &Clip, path: &str, a: usize, n: usize, sig: &str, streams: &mut HashMap<String, ClipStream>, prev: Option<&Frames>) -> Option<Frames> {
+    let lower = path.to_lowercase();
+    if p.color_pipeline.enabled || c.retimed() || crate::reframe::active(c) || is_still_path(path) || [".kimopx", ".exr", ".pfm", ".tif", ".tiff"].iter().any(|e| lower.ends_with(e)) || check_decodable(path).is_err() { return None; }
+    let (w, h) = (p.width, p.height); let fs = (w * h * 4) as usize;
+    // The previous window usually overlaps this one (lookahead is wider than the batch step), so frames the stream
+    // already produced are taken from it and only the rest is read: the stream continues instead of restarting.
+    let overlap = match streams.get(&c.id) {
+        Some(s) if s.sig == sig && s.next == a => Some(0),
+        Some(s) if s.sig == sig && s.next > a && s.next <= a + n => prev.filter(|f| f.fs == fs && f.first <= a && f.first + f.buf.len() / fs >= s.next).map(|_| s.next - a),
+        _ => None,
+    };
+    let overlap = match overlap {
+        Some(o) => o,
+        None => {
+            streams.remove(&c.id);
+            let fps_filter = conform_fps_filter(p, c, path, c.speed, false, None);
+            if !fps_filter.starts_with("fps=") { return None; }
+            let fit = c.props.get("fit").map(|q| q.at(0.0)).unwrap_or(0.0);
+            let vf = format!("{}setpts=PTS/{},{},trim=start_frame={a},setpts=PTS-STARTPTS,{},format=rgba", color_override_filter(p, path, false), c.speed.max(0.01), fps_filter, clip_fit_filter(w, h, fit, p.linear_blend));
+            let mut command = Command::new("ffmpeg"); command.args(["-v", "error", "-ss", &format!("{}", c.in_point), "-i", path, "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+            let stream = crate::color::process::DecodeStream::persistent(&mut command, fs).ok()?;
+            streams.insert(c.id.clone(), ClipStream { sig: sig.to_string(), next: a, stream });
+            0
+        }
+    };
+    let s = streams.get_mut(&c.id)?;
+    let mut buf = Vec::new(); buf.try_reserve_exact(fs.checked_mul(n)?).ok()?;
+    if overlap > 0 { let pf = prev?; let o = (a - pf.first) * fs; buf.extend_from_slice(&pf.buf[o..o + overlap * fs]); }
+    let (mut got, mut failed) = (0, false); 
+    while overlap + got < n { match s.stream.next_within(crate::color::process::decode_deadline(n)) { Ok(Some(f)) => { buf.extend_from_slice(&f); got += 1; } Ok(None) => break, Err(_) => { failed = true; break } } }
+    s.next += got;
+    if overlap + got < n { streams.remove(&c.id); }
+    if failed || overlap + got == 0 { return None; }
+    Some(Frames { still: false, working_linear: false, quantized: Default::default(), linear_buf: None, buf, fs, first: a })
 }
 
 fn media_index(c:&Clip,lt:f64,fps:f64)->usize{if let Some((a,_,_))=c.remap_pos(lt.max(0.),fps){return a}if c.speed_curve.is_some(){return c.source_index(lt,fps)}(lt.max(0.)*fps+1e-6).floor() as usize}
@@ -491,7 +541,7 @@ fn prepare_window(p: &Project, cache: &mut Cache, t0: f64, t1: f64, window:usize
     let mut pw_ext: std::collections::HashMap<String, Clip> = std::collections::HashMap::new();
     for c in flat.iter().filter(|c| all || active.contains(&c.id)) { if c.transition_in.as_ref().is_some_and(|tr| crate::pushwipe::KINDS.contains(&tr.kind.as_str()) && (all || t0 < c.start + tr.duration)) { if let Some(x) = crate::pushwipe::outgoing_clip(p, c) { if crate::pushwipe::handle_secs(p, c) > 0.0 { pw_ext.insert(x.id.clone(), x); } } } }
     for k in morph_t.keys() { active.insert(k.clone()); }
-    if !all { cache.frames.retain(|k, _| active.contains(k)); cache.code.retain(|k, _| active.contains(k)); }
+    if !all { cache.frames.retain(|k, _| active.contains(k)); cache.code.retain(|k, _| active.contains(k)); cache.streams.get_mut().unwrap().retain(|k, _| active.contains(k)); }
     let media_count=flat.iter().filter(|c|active.contains(&c.id)&&matches!(c.source,Source::Media{..})&&c.props.get("audio_only").map(|q|q.at(0.)).unwrap_or(0.)<0.5).count().max(1);
     if !all{let budget=decode_cache_limit()/media_count;cache.frames.retain(|_,(_,fr)|fr.buf.len()+fr.linear_buf.as_ref().map(|b|b.len()*5).unwrap_or(0)<=budget);}
     for c in &flat {
@@ -535,9 +585,10 @@ fn prepare_window(p: &Project, cache: &mut Cache, t0: f64, t1: f64, window:usize
         let (start, count) = if all { (0, total) } else { (ia, (ib - ia + 1).max(window).min(total - ia)) };
         let mut count=count;
         if !all{let native=p.color_pipeline.enabled&&p.color_pipeline.linear_resample;let pixels=if native{let(dw,dh,_,_)=probe(&apath)?;(dw as usize*dh as usize).max(p.width as usize*p.height as usize)}else{p.width as usize*p.height as usize};let per=pixels*4*if p.color_pipeline.enabled{8}else{1};count=count.min((decode_cache_limit()/media_count/per.max(1)).max(1));if count<ib-ia+1{return Err("active decode range exceeds cache budget".into())}}
-        cache.frames.remove(&c.id);
+        let prev = cache.frames.remove(&c.id);
         let seek_base = if using_analysis_proxy { analysis_proxy.as_ref().and_then(|ap| crate::analysis_proxy::seek_base_for(ap, c, start)) } else { None };
-        let (fr,sig) = match decode(p,c,&apath,start,count,seek_base) {
+        let streamed = if cache.export_mode && seek_base.is_none() && selected.is_none() { decode_streamed(p,c,&apath,start,count,&sig,cache.streams.get_mut().unwrap(),prev.as_ref().filter(|(s,_)|*s==sig).map(|(_,f)|f.as_ref())) } else { None };
+        let (fr,sig) = match streamed.map(Ok).unwrap_or_else(|| decode(p,c,&apath,start,count,seek_base)) {
             Ok(fr) if selected.is_some() && !fr.covers(ia,ib)=>{if using_preview_proxy{cache.proxy_clips.remove(&c.id);}(decode(p,c,&original_path,start,count,None)?,format!("{sig}|original-fallback"))},
             Ok(fr)=>(fr,sig),
             Err(_) if selected.is_some()=>{if using_preview_proxy{cache.proxy_clips.remove(&c.id);}(decode(p,c,&original_path,start,count,None)?,format!("{sig}|original-fallback"))},
@@ -1320,13 +1371,13 @@ pub fn export_range_opts(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f6
 /// Decode the batch starting at local index `i` into `cache`, exactly as the old single-threaded export
 /// loop did: start at a batch of `batch` frames and halve it on a cache-budget error (resetting `cache`,
 /// which only ever happens on that rare fallback path). Returns the batch's actual end (exclusive).
-fn decode_batch(p: &Project, cache: &mut Cache, f0: usize, i: usize, n: usize, batch: usize) -> Result<usize, String> {
-    let mut end = (i + batch).min(n);
+fn decode_batch(p: &Project, cache: &mut Cache, f0: usize, i: usize, n: usize, batch: &std::sync::atomic::AtomicUsize) -> Result<usize, String> {
+    let mut end = (i + batch.load(std::sync::atomic::Ordering::Relaxed)).min(n);
     loop {
         let last = (f0 + end - 1) as f64 / p.fps;
         match prepare_export_range(p, cache, (f0 + i) as f64 / p.fps, last) {
             Ok(()) => return Ok(end),
-            Err(e) if end - i > 1 && (e.contains("cache budget") || e.contains("memory cap") || e.contains("bounded cache")) => { end = i + (end - i).div_ceil(2); *cache = Cache::new_export(); }
+            Err(e) if end - i > 1 && (e.contains("cache budget") || e.contains("memory cap") || e.contains("bounded cache")) => { end = i + (end - i).div_ceil(2); batch.store(end - i, std::sync::atomic::Ordering::Relaxed); *cache = Cache::new_export(); }
             Err(e) => return Err(e),
         }
     }
@@ -1348,7 +1399,7 @@ pub(crate) fn export_range_cmd(p: &Project, path: &str, f0: usize, f1: usize, mu
     let frame_bytes=(p.width as usize).checked_mul(p.height as usize).and_then(|v|v.checked_mul(4)).ok_or("legacy encoder frame overflow")?;
     let encoder=crate::color::process::EncodeStream::new(&mut command,frame_bytes,crate::color::process::encode_deadline(n))?;
     let nt = crate::guard::export_threads_n(p.width, p.height, std::thread::available_parallelism().map(|x| x.get()).unwrap_or(2).max(1), frame_buffers(p));
-    let batch = nt * 4;
+    let batch = nt * 4; let batch_now = std::sync::atomic::AtomicUsize::new(batch);
 
     // Encoder-writer thread: owns `encoder`, drains a bounded channel. EncodeStream::write() already
     // waits on its own internal writer's ack per call (unchanged, see color/process.rs), but that wait now
@@ -1363,16 +1414,17 @@ pub(crate) fn export_range_cmd(p: &Project, path: &str, f0: usize, f1: usize, mu
     crate::telemetry::progress_frames(0, n, "frames");
     let loop_result: Result<(), String> = (|| {
         let mut i = 0usize;
-        let mut end = decode_batch(p, &mut cache, f0, i, n, batch)?;
+        let mut end = decode_batch(p, &mut cache, f0, i, n, &batch_now)?;
         while i < n {
             crate::guard::check();
             let mut carried: Option<(Cache, usize)> = None;
             std::thread::scope(|osc| -> Result<(), String> {
                 // Kick off the NEXT batch's decode now, on a cache snapshot, before composing this one.
+                let batch_now_ref = &batch_now;
                 let prefetch = (end < n).then(|| {
                     let mut snap = cache.snapshot();
                     let next_i = end;
-                    crate::guard::scope_spawn(osc, move || decode_batch(p, &mut snap, f0, next_i, n, batch).map(|e| (snap, e)))
+                    crate::guard::scope_spawn(osc, move || decode_batch(p, &mut snap, f0, next_i, n, batch_now_ref).map(|e| (snap, e)))
                 });
                 // work queue: nt workers pull frame indices, so one slow frame (shards) no longer idles the other cores
                 let next = std::sync::atomic::AtomicUsize::new(i); let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>, String>>>> = (i..end).map(|_| std::sync::Mutex::new(None)).collect();
