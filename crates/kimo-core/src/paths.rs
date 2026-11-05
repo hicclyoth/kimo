@@ -3,7 +3,9 @@
 //! (trim, offset, merge, repeater, gradient stroke) work on any path. Coordinates are pixels relative to the canvas center.
 pub const MAX_SEGMENTS: usize = 6000;
 #[derive(Clone, Debug)]
-pub struct Path { pub segs: Vec<[f64; 4]>, pub cum: Vec<f64>, pub total: f64, pub bbox: [f64; 4], pub evenodd: bool, pub subpaths: usize }
+/// `segs` are the edges that were drawn; `closers` are the implicit edges that close an open subpath for the fill only, as in SVG:
+/// strokes, trim and arc length never see them.
+pub struct Path { pub segs: Vec<[f64; 4]>, pub closers: Vec<[f64; 4]>, pub cum: Vec<f64>, pub total: f64, pub bbox: [f64; 4], pub evenodd: bool, pub subpaths: usize }
 
 fn tokens(d: &str) -> Result<Vec<(char, Vec<f64>)>, String> {
     let b: Vec<char> = d.chars().collect(); let (mut i, mut out): (usize, Vec<(char, Vec<f64>)>) = (0, vec![]);
@@ -31,18 +33,18 @@ impl Path {
     pub fn from_tokens(toks: &[(char, Vec<f64>)], evenodd: bool) -> Result<Path, String> {
         let toks = toks.to_vec(); if toks.is_empty() { return Err("empty path".into()); }
         if toks[0].0.to_ascii_uppercase() != 'M' { return Err("path must start with M (moveto)".into()); }
-        let mut segs: Vec<[f64; 4]> = vec![]; let (mut cx, mut cy, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64); let (mut lcx, mut lcy) = (0.0f64, 0.0f64); let mut last = ' '; let mut subs = 0usize; let mut open = false;
+        let mut segs: Vec<[f64; 4]> = vec![]; let mut closers: Vec<[f64; 4]> = vec![]; let (mut cx, mut cy, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64); let (mut lcx, mut lcy) = (0.0f64, 0.0f64); let mut last = ' '; let mut subs = 0usize; let mut open = false;
         let mut line = |segs: &mut Vec<[f64; 4]>, x0: f64, y0: f64, x1: f64, y1: f64| segs.push([x0, y0, x1, y1]);
-        macro_rules! close { () => { if open && ((cx - sx).abs() > 1e-9 || (cy - sy).abs() > 1e-9) { line(&mut segs, cx, cy, sx, sy); } cx = sx; cy = sy; open = false; } }
+        macro_rules! close { ($drawn:expr) => { if open && ((cx - sx).abs() > 1e-9 || (cy - sy).abs() > 1e-9) { if $drawn { line(&mut segs, cx, cy, sx, sy); } else { closers.push([cx, cy, sx, sy]); } } cx = sx; cy = sy; open = false; } }
         for (cmd, a) in &toks {
             let rel = cmd.is_lowercase(); let up = cmd.to_ascii_uppercase();
             let need = match up { 'M' | 'L' | 'T' => 2, 'H' | 'V' => 1, 'C' => 6, 'S' | 'Q' => 4, 'A' => 7, _ => 0 };
-            if up == 'Z' { if !a.is_empty() { return Err("Z takes no numbers".into()); } close!(); last = 'Z'; continue; }
+            if up == 'Z' { if !a.is_empty() { return Err("Z takes no numbers".into()); } close!(true); last = 'Z'; continue; }
             if a.is_empty() || a.len() % need != 0 { return Err(format!("command '{cmd}' needs groups of {need} numbers, got {}", a.len())); }
             for (gi, g) in a.chunks(need).enumerate() {
                 let (ox, oy) = if rel { (cx, cy) } else { (0.0, 0.0) };
                 match up {
-                    'M' => { if gi == 0 { close!(); } let (x, y) = (g[0] + ox, g[1] + oy); if gi == 0 { sx = x; sy = y; cx = x; cy = y; subs += 1; open = true; } else { line(&mut segs, cx, cy, x, y); cx = x; cy = y; } last = if gi == 0 { 'M' } else { 'L' }; }
+                    'M' => { if gi == 0 { close!(false); } let (x, y) = (g[0] + ox, g[1] + oy); if gi == 0 { sx = x; sy = y; cx = x; cy = y; subs += 1; open = true; } else { line(&mut segs, cx, cy, x, y); cx = x; cy = y; } last = if gi == 0 { 'M' } else { 'L' }; }
                     'L' => { let (x, y) = (g[0] + ox, g[1] + oy); line(&mut segs, cx, cy, x, y); cx = x; cy = y; last = 'L'; }
                     'H' => { let x = g[0] + ox; line(&mut segs, cx, cy, x, cy); cx = x; last = 'L'; }
                     'V' => { let y = g[0] + oy; line(&mut segs, cx, cy, cx, y); cy = y; last = 'L'; }
@@ -78,11 +80,11 @@ impl Path {
                 if segs.len() > MAX_SEGMENTS { return Err(format!("path too complex (> {MAX_SEGMENTS} flattened segments)")); }
             }
         }
-        close!(); segs.retain(|s| (s[2] - s[0]).hypot(s[3] - s[1]) > 1e-12);
+        close!(false); segs.retain(|s| (s[2] - s[0]).hypot(s[3] - s[1]) > 1e-12);
         if segs.is_empty() { return Err("path has no drawable segments".into()); }
         let (mut cum, mut tot) = (Vec::with_capacity(segs.len()), 0.0); let mut bb = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
         for s in &segs { cum.push(tot); tot += (s[2] - s[0]).hypot(s[3] - s[1]); for (x, y) in [(s[0], s[1]), (s[2], s[3])] { bb[0] = bb[0].min(x); bb[1] = bb[1].min(y); bb[2] = bb[2].max(x); bb[3] = bb[3].max(y); } }
-        Ok(Path { segs, cum, total: tot, bbox: bb, evenodd, subpaths: subs })
+        Ok(Path { segs, closers, cum, total: tot, bbox: bb, evenodd, subpaths: subs })
     }
     /// Unsigned distance and arc-length fraction (0..1 over the whole path) of the nearest point.
     pub fn nearest(&self, px: f64, py: f64) -> (f64, f64) {
@@ -92,14 +94,19 @@ impl Path {
         (best.sqrt(), bu)
     }
     pub fn winding(&self, px: f64, py: f64) -> i32 {
-        let mut w = 0; for s in &self.segs { let (x0, y0, x1, y1) = (s[0], s[1], s[2], s[3]);
+        let mut w = 0; for s in self.segs.iter().chain(&self.closers) { let (x0, y0, x1, y1) = (s[0], s[1], s[2], s[3]);
             if (y0 <= py) != (y1 <= py) { let t = (py - y0) / (y1 - y0); if x0 + t * (x1 - x0) > px { w += if y1 > y0 { 1 } else { -1 }; } } } w
     }
     /// Signed distance, negative inside.
     pub fn sd(&self, px: f64, py: f64) -> f64 {
         // far-field cull: beyond CULL px of the bbox the exact distance is not needed (shapes, strokes and offsets reach < CULL px)
         const CULL: f64 = 256.0; let b = &self.bbox; let (ex, ey) = ((b[0] - px).max(px - b[2]).max(0.0), (b[1] - py).max(py - b[3]).max(0.0)); let bd = ex.hypot(ey); if bd > CULL { return bd; }
-        let (d, _) = self.nearest(px, py); let w = self.winding(px, py); let inside = if self.evenodd { w % 2 != 0 } else { w != 0 }; if inside { -d } else { d }
+        let d = self.closers.iter().fold(self.nearest(px, py).0, |d, s| { let (dx, dy) = (s[2] - s[0], s[3] - s[1]); let t = (((px - s[0]) * dx + (py - s[1]) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0); d.min((px - s[0] - dx * t).hypot(py - s[1] - dy * t)) }); let w = self.winding(px, py); let inside = if self.evenodd { w % 2 != 0 } else { w != 0 }; if inside { -d } else { d }
+    }
+    /// Unsigned distance to the drawn edges only, for the stroke of an open path; same far-field cull as `sd`.
+    pub fn stroke_dist(&self, px: f64, py: f64) -> f64 {
+        const CULL: f64 = 256.0; let b = &self.bbox; let (ex, ey) = ((b[0] - px).max(px - b[2]).max(0.0), (b[1] - py).max(py - b[3]).max(0.0)); let bd = ex.hypot(ey); if bd > CULL { return bd; }
+        self.nearest(px, py).0
     }
 }
 

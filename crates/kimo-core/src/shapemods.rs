@@ -62,7 +62,8 @@ impl Stack<'_> {
         let (s, e) = (s.clamp(0.0, 1.0), e.clamp(0.0, 1.0)); if e - s >= 0.9999 && off == 0.0 { return 1.0; }
         // exact arc length on Bezier paths; angle around the center on primitives
         let u0 = match &self.path { Some(p) => p.nearest(px, py).1, None => (py.atan2(px) + PI) / TAU };
-        let u = (u0 - off).rem_euclid(1.0); if u >= s && u <= e { 1.0 } else { 0.0 }
+        // with no offset nothing wraps: 1.0 is the far end of an open path, not its start
+        let u = if off == 0.0 { u0 } else { (u0 - off).rem_euclid(1.0) }; if u >= s && u <= e { 1.0 } else { 0.0 }
     }
     pub fn stroke_color(&self, px: f64, py: f64, w: f64, h: f64, base: [f64; 3]) -> [f64; 3] {
         let Some((c1, c2, a)) = self.grad else { return base };
