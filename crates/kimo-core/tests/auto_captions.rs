@@ -172,6 +172,7 @@ fn with_clip(start: f64) -> Session {
     call(&mut ss, "add_clip", json!({"track_id": t, "source_type": "media", "asset_id": asset, "start": start, "duration": 2.0})); ss
 }
 
+#[cfg(unix)] // the recognizer here is a sh shim
 #[test] fn recognized_words_land_on_the_timeline_snapped_to_the_audio() { let _env_guard = env_guard();
     let (bin, log) = stub("en"); let model = dir().join("ggml-small-q5_1.bin"); std::fs::write(&model, b"stub").unwrap();
     let mut ss = with_clip(2.0);
@@ -182,6 +183,7 @@ fn with_clip(start: f64) -> Session {
     for (got, want) in st.iter().zip([2.55, 3.05, 3.60]) { assert!((got - want).abs() <= 0.04, "word start {got:.3} vs burst onset {want} (raw DTW was 250 ms late): {st:?}"); }
 }
 
+#[cfg(unix)] // the recognizer here is a sh shim
 #[test] fn hindi_speech_is_captioned_as_roman_hinglish() { let _env_guard = env_guard();
     let (bin, log) = stub("hi"); let model = dir().join("ggml-small-q5_1.bin"); std::fs::write(&model, b"stub").unwrap();
     let mut ss = with_clip(0.0);
@@ -191,6 +193,7 @@ fn with_clip(start: f64) -> Session {
     assert_eq!(lines.len(), 2, "detect, then a Roman-script pass: {args}"); assert!(lines[0].contains("-l auto") && lines[0].contains("-dl"), "language id only: {args}"); assert!(lines[1].contains("-l en") && lines[1].contains("Haan toh") && lines[1].contains("Kimo"), "{args}");
 }
 
+#[cfg(unix)] // the recognizer here is a sh shim
 #[test] fn a_turbo_model_writes_hinglish_from_a_hindi_pass_not_an_english_one() { let _env_guard = env_guard();
     // large-v3-turbo given -l en (plus the Roman prompt) on Hindi speech translates it into English (Naman's clips: 62.7% WER);
     // -l hi then romanize keeps the words that were said (49.7% strict / 37.9% ignoring spelling).
@@ -217,6 +220,7 @@ fn stub_said(tag: &str, said: &[&str]) -> PathBuf {
     std::fs::write(&bin, script).unwrap(); Command::new("chmod").arg("+x").arg(&bin).status().unwrap(); bin
 }
 
+#[cfg(unix)] // the recognizer here is a sh shim
 #[test] fn hinglish_variants_are_written_one_way_and_english_is_left_alone() { let _env_guard = env_guard();
     // the recognizer spells the same Hinglish word several ways (bahut / bohat / bohot, pani / paani, ek dum / ekdum);
     // Hinglish captions get one spelling, keeping the speaker's capitals and punctuation; English mode is untouched
@@ -250,6 +254,7 @@ fn stub_said(tag: &str, said: &[&str]) -> PathBuf {
     assert_eq!(romanize("हमेशा"), "hamesha"); assert_eq!(romanize("I love it"), "I love it");
 }
 
+#[cfg(unix)] // symlinks a one-tool PATH
 #[test] fn no_recognizer_at_all_names_the_real_situation_and_a_real_fallback() { let _env_guard = env_guard();
     // The real no-setup-box scenario: no whisper-cli anywhere, no model, nothing overridden --
     // the exact shape director_mode.md's own small model hits when it calls auto_captions with no

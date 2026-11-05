@@ -137,6 +137,9 @@ pub fn ensure(p: &Project, asset_id: &str, original_path: &str) -> Option<Analys
         // Stale/corrupt sidecar for this key: fall through and rebuild cleanly.
     }
     let asset = p.assets.get(asset_id)?;
+    if asset.width == 0 {
+        return None; // audio only: nothing to proxy, and ffmpeg would fail on every frame
+    }
     let gap = max_keyframe_gap(original_path, asset.duration).ok()?;
     if gap <= MIN_GAP_SECONDS {
         return None; // already cheap to seek on the original; a proxy would only cost disk and time

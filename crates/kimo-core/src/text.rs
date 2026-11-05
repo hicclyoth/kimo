@@ -19,7 +19,7 @@ fn font_fallback_warning(name: &str) -> Option<String> {
     let set = WARNED_FONTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let mut g = set.lock().unwrap();
     if g.insert(name.to_string()) {
-        Some(format!("kimo: font '{name}' was not found, so text using it is drawn with a fallback system font -- set KIMO_FONTS to the folder holding the preset fonts, or run `bash fonts/fetch.sh` in the repo to fetch them"))
+        Some(format!("kimo: font '{name}' was not found, so text using it is drawn with a fallback system font -- set KIMO_FONTS to the folder holding the preset fonts, or run `bash fonts/fetch.sh` (Windows: `powershell -ExecutionPolicy Bypass -File fonts/fetch.ps1`) in the repo to fetch them"))
     } else {
         None
     }
@@ -41,7 +41,13 @@ pub fn resolve_font_info(name: &str) -> (String, bool) { if std::path::Path::new
     // One clear stderr line per distinct missing font name says so at the moment it actually happens.
     if let Some(msg) = font_fallback_warning(name) { eprintln!("{msg}"); }
     if let Some((_, p)) = fonts.iter().find(|(s, _)| norm(s) == "montserrat") { return (p.to_string_lossy().into(), true); }
-    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(), true) }
+    (fallback_font(), true) }
+/// The font drawn when a family is missing: the first of this OS's stock fonts that exists.
+pub fn fallback_font() -> String {
+    let c: Vec<String> = if cfg!(windows) { let w = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into()); ["arial.ttf", "segoeui.ttf", "tahoma.ttf"].iter().map(|f| format!(r"{w}\Fonts\{f}")).collect() }
+        else if cfg!(target_os = "macos") { vec!["/System/Library/Fonts/Supplemental/Arial.ttf".into(), "/Library/Fonts/Arial.ttf".into()] }
+        else { vec!["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()] };
+    c.iter().find(|p| std::path::Path::new(p).is_file()).unwrap_or(&c[0]).clone() }
 pub fn resolve_font(name: &str) -> String { resolve_font_info(name).0 }
 
 fn font(name: &str, weight: f64) -> Result<std::sync::Arc<FontVec>, String> {

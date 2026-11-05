@@ -170,9 +170,9 @@ fn import(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let hash = crate::deps::sha256_hex(&audio_raw::bytes(&s));
     let wav = audio_raw::wav(&s)?;
     let (path, store) = store_audio(ss, &hash, s.rate, s.planes.len(), &wav)?;
-    let absolute = path
+    let absolute = crate::deps::plain_path(path
         .canonicalize()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?)
         .to_string_lossy()
         .into_owned();
     let id = ss

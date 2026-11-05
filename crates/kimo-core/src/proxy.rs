@@ -336,9 +336,9 @@ pub fn generate(
         .parent()
         .filter(|x| !x.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let parent = parent
+    let parent = crate::deps::plain_path(parent
         .canonicalize()
-        .map_err(|e| format!("proxy parent directory must exist: {e}"))?;
+        .map_err(|e| format!("proxy parent directory must exist: {e}"))?);
     let dest = parent.join(dest.file_name().ok_or("invalid proxy path")?);
     let deadline = std::time::Instant::now()
         .checked_add(timeout)

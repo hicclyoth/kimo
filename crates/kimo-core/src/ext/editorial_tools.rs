@@ -131,7 +131,7 @@ fn add_captions_inner(ss: &mut Session, a: &Value) -> Result<Value, String> {
     let result = existing(
         ss,
         "import_srt",
-        &json!({"track_id":tid,"path":path,"font":a.get("font").cloned().unwrap_or(json!("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))}),
+        &json!({"track_id":tid,"path":path,"font":a.get("font").cloned().unwrap_or(json!(crate::text::fallback_font()))}),
     )?;
     let clips: Vec<String> = result["clip_ids"]
         .as_array()

@@ -7,6 +7,7 @@ fn scene() -> Session {
     let mut ss = Session::new(); c(&mut ss, "project_set", json!({"width": 160, "height": 90, "fps": 25})); let t = c(&mut ss, "add_track", json!({}))["track_id"].as_str().unwrap().to_string();
     for i in 0..3 { c(&mut ss, "add_shape", json!({"track_id": t, "shape": "rect", "width": 20 + i * 3, "height": 20, "start": i as f64 * 2.0, "duration": 2.0})); } ss
 }
+#[cfg(unix)] // ffmpeg is a sh shim here
 #[test] fn encoder_failure_and_disk_full_are_classified_keep_finished_chunks_and_resume_completes() {
     use kimo_core::ext::export_job::classify;
     assert!(classify("write failed: No space left on device (os error 28)").starts_with("disk_full:")); assert!(classify("ffmpeg exited with status 1").starts_with("encoder_failed:")); assert_eq!(classify("cancelled"), "cancelled");

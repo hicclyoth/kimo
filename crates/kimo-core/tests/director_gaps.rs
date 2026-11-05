@@ -90,7 +90,7 @@ fn apply_fix(ss: &mut Session, f: &Value) { let fx = &f["fix"]; call(ss, fx["too
     let set = |k: &str, v: &std::path::Path| std::env::set_var(k, v);
     // nothing installed: no whisper binary or model, no preset fonts
     set("KIMO_FONTS", &fonts); set("KIMO_MODELS", &models); set("KIMO_WHISPER_BIN", &d.join("no_such_whisper_cli")); set("KIMO_WHISPER_MODEL", &d.join("no_such_model.bin"));
-    let old_path = std::env::var_os("PATH"); std::env::set_var("PATH", format!("{}:/usr/bin:/bin", d.join("nopath").display()));
+    let old_path = std::env::var_os("PATH"); std::env::set_var("PATH", std::env::join_paths(std::iter::once(d.join("nopath")).chain(std::env::split_paths(old_path.as_deref().unwrap_or_default()))).unwrap());
     let mut ss = Session::new(); let r = call(&mut ss, "check_environment", json!({}));
     assert_eq!(r["ffmpeg"]["available"], true, "{r}"); assert!(!r["ffmpeg"]["version"].as_str().unwrap_or("").is_empty(), "{r}");
     assert_eq!(r["ffmpeg"]["libx264"], true, "export needs libx264: {r}");
@@ -100,13 +100,13 @@ fn apply_fix(ss: &mut Session, f: &Value) { let fx = &f["fix"]; call(ss, fx["too
     assert!(fixes.iter().any(|f| f.contains("tools/whisper/fetch.sh")), "a missing whisper must name its fix: {fixes:?}");
     let fonts_state = r["fonts"]["presets"].as_array().unwrap();
     for f in ["Anton", "BebasNeue", "Montserrat"] { let e = fonts_state.iter().find(|x| x["font"] == f).unwrap_or_else(|| panic!("{f} not checked: {r}"));
-        if e["found"] == false { assert!(fixes.iter().any(|x| x.contains("fonts/fetch.sh") && x.contains("KIMO_FONTS")), "missing fonts must name the fix: {fixes:?}"); } }
+        if e["found"] == false { assert!(fixes.iter().any(|x| x.contains("fonts/fetch") && x.contains("KIMO_FONTS")), "missing fonts must name the fix: {fixes:?}"); } }
     // everything present
     let bin = models.join("bin/whisper-cli"); std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
-    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap(); }
     std::fs::write(models.join("ggml-small-q5_1.bin"), vec![7u8; 4096]).unwrap();
-    let dejavu = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-    for f in ["Anton-Regular", "BebasNeue-Regular", "CormorantGaramond-Var", "Montserrat-Var", "Syne-Var"] { std::fs::copy(dejavu, fonts.join(format!("{f}.ttf"))).unwrap(); }
+    let stock = kimo_core::text::fallback_font();
+    for f in ["Anton-Regular", "BebasNeue-Regular", "CormorantGaramond-Var", "Montserrat-Var", "Syne-Var"] { std::fs::copy(&stock, fonts.join(format!("{f}.ttf"))).unwrap(); }
     std::env::remove_var("KIMO_WHISPER_BIN"); std::env::remove_var("KIMO_WHISPER_MODEL");
     let r = call(&mut ss, "check_environment", json!({}));
     assert_eq!(r["whisper"]["binary"]["present"], true, "{r}"); assert_eq!(r["whisper"]["model"]["present"], true, "{r}");

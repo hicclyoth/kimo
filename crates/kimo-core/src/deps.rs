@@ -167,7 +167,9 @@ pub fn base_dir() -> Option<std::sync::Arc<PathBuf>> { BASE_DIR.read().unwrap_or
 /// Resolve a stored path for a reader without a `&Project` (see BASE_DIR). Absolute paths and sequence patterns stay themselves.
 pub fn resolve_str(stored: &str) -> String { let d = base_dir(); resolve_path(d.as_deref().map(|p| p.as_path()), stored).path.to_string_lossy().into_owned() }
 /// Canonical directory of a project file path (None when it cannot be resolved, e.g. the directory does not exist yet).
-pub fn dir_of(project_file: &str) -> Option<PathBuf> { let p = Path::new(project_file); let d = match p.parent() { Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(), _ => PathBuf::from(".") }; std::fs::canonicalize(d).ok() }
+pub fn dir_of(project_file: &str) -> Option<PathBuf> { let p = Path::new(project_file); let d = match p.parent() { Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(), _ => PathBuf::from(".") }; std::fs::canonicalize(d).ok().map(plain_path) }
+/// canonicalize gives `\\?\W:\x` on Windows, and ffmpeg cannot open that form. No-op elsewhere.
+pub fn plain_path(p: PathBuf) -> PathBuf { let s = p.to_string_lossy(); if let Some(r) = s.strip_prefix(r"\\?\UNC\") { return PathBuf::from(format!(r"\\{r}")); } if let Some(r) = s.strip_prefix(r"\\?\") { return PathBuf::from(r); } p }
 
 /// One recorded dependency (written by collect_project, read by list_dependencies to report `changed`).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]

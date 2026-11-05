@@ -42,7 +42,7 @@ pub fn commands() -> Vec<Command> {
                 let mut q=p.proxies.entries.get(&id).ok_or("no registered proxy for asset")?.clone();
                 let asset=p.assets.get(&id).ok_or("no such asset")?;
                 let source=crate::proxy::fingerprint(std::path::Path::new(&p.resolve(&asset.path)))?;
-                let path=std::path::PathBuf::from(p.resolve(str_arg(a,"path")?)).canonicalize().map_err(|e| e.to_string())?;
+                let path=crate::deps::plain_path(std::path::PathBuf::from(p.resolve(str_arg(a,"path")?)).canonicalize().map_err(|e| e.to_string())?);
                 if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")) { return Err("proxy replacement must retain the .mp4 extension".into()); } let proxy=crate::proxy::fingerprint(&path)?;
                 if source.sha256!=q.source.sha256 || proxy.sha256!=q.proxy.sha256 { return Err("proxy_relink requires byte-identical source and proxy media; regenerate for changed footage".into()); }
                 q.source=source; q.proxy=proxy; q.path=path.to_string_lossy().into_owned(); ss.project.proxies.entries.insert(id.clone(),q);

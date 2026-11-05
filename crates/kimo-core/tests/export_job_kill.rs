@@ -1,5 +1,6 @@
 //! RV-20 (f): real SIGKILL tests. The test binary re-runs itself as a child process that owns the job (ffmpeg is a slow shim in the child's PATH so a kill
 //! reliably lands mid-encode or mid-join); the parent kills the whole process group with SIGKILL, then a fresh process (this one) resumes.
+#![cfg(unix)] // needs sh shims and process-group SIGKILL
 use kimo_core::commands::{dispatch, Session};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
