@@ -11,7 +11,7 @@ Plug it into Claude Code, Codex, Cursor or any MCP client and watch the edit hap
 
 <a href="https://getkimo.tech"><img alt="Website" src="https://img.shields.io/badge/getkimo.tech-FF5C28?style=for-the-badge&labelColor=0E0E12"></a>
 <a href="https://github.com/naman-sharma12345/kimo/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/naman-sharma12345/kimo?style=for-the-badge&label=download&labelColor=0E0E12&color=F4F0E8"></a>
-<a href="#-connect-your-ai"><img alt="MCP" src="https://img.shields.io/badge/MCP-452%20tools-F4F0E8?style=for-the-badge&labelColor=0E0E12"></a>
+<a href="#-connect-your-ai"><img alt="MCP" src="https://img.shields.io/badge/MCP-537%20tools-F4F0E8?style=for-the-badge&labelColor=0E0E12"></a>
 
 <a href="https://github.com/naman-sharma12345/kimo/actions/workflows/kimo-validation.yml"><img alt="CI" src="https://github.com/naman-sharma12345/kimo/actions/workflows/kimo-validation.yml/badge.svg"></a>
 <a href="https://github.com/naman-sharma12345/kimo/actions/workflows/release.yml"><img alt="release build" src="https://github.com/naman-sharma12345/kimo/actions/workflows/release.yml/badge.svg"></a>
@@ -424,7 +424,7 @@ Set it like this: `claude mcp add --transport stdio --env KIMO_TOOLS=core kimo -
 
 ## ✦ What it can do
 
-**452 tools in 14 groups.** 438 are live in the default build; 16 more are feature-gated (OCIO, mesh import) and answer with a clear refusal until built in.
+**537 tools in 14 groups.** Some are feature-gated (OCIO, mesh import, gpu3d) and answer with a clear refusal until built in.
 
 | Area | Groups | Examples |
 |---|---|---|
@@ -439,7 +439,7 @@ Set it like this: `claude mcp add --transport stdio --env KIMO_TOOLS=core kimo -
 | Output | `output` | frame and video export, chunked export jobs, GIF, EXR, manifests, frame lint, contact sheets, PSNR / SSIM / MS-SSIM comparisons, edit checks (changed regions inside / outside allowed rects), saliency maps (where the eye goes, mass inside given rects), frozen-frame runs over a range (start, end, length, largest pixel difference), near-black runs over a range (whole frame near-black, start, end, length, brightest pixel), sharpness per frame (Laplacian variance and Sobel gradient of luma, whole frame and rects) |
 
 <details>
-<summary><b>📋 Full tool listing (all 452)</b></summary>
+<summary><b>📋 Full tool listing (all 537)</b></summary>
 
 <br>
 
@@ -615,7 +615,7 @@ and carry no reason. Details: `crates/kimo-mcp/src/preview.rs` ("Headless skips"
 
 <br>
 
-- Registry: 452 tools (`crates/kimo-core/tests/golden/golden_registry.txt`, 452 lines). A default-feature `kimo-mcp` lists 454 entries in `flat` mode: those 452 plus `search_tools` and `kimo_describe`. Of the 454, 438/454 live in the default build + 16 feature-gated (8 native-ocio, 8 mesh-import/material-textures/flat-sah).
+- Registry: 537 tools (`crates/kimo-core/tests/golden/golden_registry.txt`, 537 lines). A default-feature `kimo-mcp` lists 539 entries in `flat` mode: those 537 plus `search_tools` and `kimo_describe`. Some are feature-gated (OCIO, mesh import, gpu3d) and answer with a clear refusal until built in.
 - `flash_series` on the jaja ad (v6, unreleased): the 30.542 s luminance stamp is a slow fall (0.894 to 0.794 as the logo fades in), not a hard cut. Under rule (a) a transition is stamped at the first frame whose luminance has moved 0.1 from the swing start, so this stamp is expected behaviour, not a bug.
 - Fuzz: 6497 calls, 0 failures, as recorded in the v3 notes at 327 tools. Not re-run for this README.
 - Linux spectator installers (`.deb`, `.AppImage`): built on CI runners (dry run at `ca0334f`, then version `0.1.0`; the `5.0.0` files come from the same steps in the `v5.0.0` tag build), downloaded and smoke-tested on Debian 12 x86_64 on 2026-10-17: sha256 matches, the `.deb` installs (`Depends: libwebkit2gtk-4.1-0, libgtk-3-0`) and uninstalls cleanly, and both the `.deb` and the AppImage (`--appimage-extract-and-run`) launch under Xvfb, listen on 127.0.0.1:7421 and draw the `frame_rendered` frames a real `kimo-mcp` (commit `af615ca`) sends after `project_set`, `add_track`, `add_text`. Unsigned draft; other distributions not tested.
