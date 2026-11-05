@@ -68,7 +68,7 @@ fn mutates(name: &str, args: &Value) -> bool {
 }
 
 struct Parsed { pos: Vec<String>, flags: Vec<(String, Option<String>)> }
-const VALUE_FLAGS: &[&str] = &["--args", "--project", "--preset", "--range", "--start", "--end", "--crf", "--limit", "--out-json", "--port", "--bind"];
+const VALUE_FLAGS: &[&str] = &["--args", "--project", "--preset", "--range", "--start", "--end", "--crf", "--encoder", "--limit", "--out-json", "--port", "--bind"];
 fn parse(args: &[String]) -> Result<Parsed, Fail> {
     let (mut pos, mut flags) = (vec![], vec![]); let mut i = 0;
     while i < args.len() {
@@ -134,6 +134,7 @@ fn run(p: Parsed, o: &Opts) -> Result<(i32, Value), Fail> {
             if let Some(r) = p.val("--range") { let (s, e) = r.split_once(':').ok_or_else(|| usage_err("--range wants start:end seconds"))?; if !s.is_empty() { a["start"] = json!(num("--range start", s)?); } if !e.is_empty() { a["end"] = json!(num("--range end", e)?); } }
             if let Some(s) = p.val("--start") { a["start"] = json!(num("--start", &s)?); }
             if let Some(s) = p.val("--end") { a["end"] = json!(num("--end", &s)?); }
+            if let Some(e) = p.val("--encoder") { a["encoder"] = json!(e); }
             let tool = if let Some(pr) = p.val("--preset") { a["preset"] = json!(pr); "export_preset" } else { if let Some(c) = p.val("--crf") { a["crf"] = json!(num("--crf", &c)?); } "export" };
             if p.has("--crf") && tool == "export_preset" { return Err(usage_err("--crf cannot be combined with --preset")); }
             if !std::path::Path::new(proj).exists() { return Err(Fail { code: EXIT_TOOL, body: json!({"code":"io_error","message":format!("cannot read '{proj}': no such file")}) }); }

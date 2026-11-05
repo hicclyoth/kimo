@@ -1360,13 +1360,33 @@ pub fn export(p: &Project, path: &str, crf: u32) -> Result<f64, String> { export
 pub fn export_opts(p: &Project, path: &str, crf: u32, low_memory: bool) -> Result<f64, String> { export_range_opts(p, path, crf, 0.0, p.duration(), low_memory, true) }
 /// Export [t_in, t_out) seconds. Frame k renders at t_in + k/fps (absolute time, so frames equal the same frames of a full export).
 pub fn export_range(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f64) -> Result<f64, String> { export_range_opts(p, path, crf, t_in, t_out, false, true) }
-pub fn export_range_opts(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f64, low_memory: bool, with_audio: bool) -> Result<f64, String> {
+pub fn export_range_opts(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f64, low_memory: bool, with_audio: bool) -> Result<f64, String> { export_range_enc(p, path, crf, t_in, t_out, low_memory, with_audio, None) }
+/// What `encoder` asks for on this machine: (the NVENC encoder to use, or None for the software one; why a request fell back).
+/// One tiny test encode decides, so a GPU that cannot do it costs a second, not a failed render.
+pub fn resolve_encoder(requested: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+    let Some(e) = requested else { return Ok((None, None)) };
+    match e { "libx264" => return Ok((None, None)), "h264_nvenc" | "hevc_nvenc" => {} _ => return Err(format!("unknown encoder '{e}'. Valid: libx264, h264_nvenc, hevc_nvenc")) }
+    let ok = Command::new("ffmpeg").args(["-v", "error", "-f", "lavfi", "-i", "color=s=320x240:r=25:d=0.2", "-pix_fmt", "yuv420p", "-c:v", e, "-f", "null", "-"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    Ok(if ok { (Some(e.to_string()), None) } else { (None, Some(format!("{e} is not available on this machine; used the software encoder"))) })
+}
+/// The same ffmpeg command with its software encoder swapped for NVENC. `-crf` becomes `-cq` on the same scale; x264/x265 tuning is dropped.
+pub(crate) fn with_encoder(cmd: Command, enc: Option<&str>) -> Command {
+    let Some(enc) = enc else { return cmd }; let a: Vec<String> = cmd.get_args().map(|v| v.to_string_lossy().into_owned()).collect(); let mut o = Command::new(cmd.get_program()); let mut i = 0;
+    while i < a.len() { match a[i].as_str() {
+        "-c:v" => { o.args(["-c:v", enc, "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-b:v", "0"]); if enc == "hevc_nvenc" { o.args(["-tag:v", "hvc1"]); } i += 2; }
+        "-preset" | "-x264-params" | "-x265-params" | "-tag:v" => i += 2,
+        "-profile:v" if enc == "hevc_nvenc" => i += 2,
+        "-crf" => { o.args(["-cq", &a[i + 1].parse::<u32>().unwrap_or(18).clamp(1, 51).to_string()]); i += 2; }
+        _ => { o.arg(&a[i]); i += 1; } } }
+    o
+}
+pub fn export_range_enc(p: &Project, path: &str, crf: u32, t_in: f64, t_out: f64, low_memory: bool, with_audio: bool, enc: Option<&str>) -> Result<f64, String> {
     if !t_in.is_finite() || !t_out.is_finite() || t_in < 0.0 || t_out <= t_in { return Err("range must satisfy 0 <= start < end".into()); }
     let t_out = t_out.min(p.duration()); if t_in >= t_out { return Err("range starts after the end of the timeline".into()); }
     let f0 = (t_in * p.fps).round() as usize; let f1 = ((t_out * p.fps).round() as usize).max(f0 + 1);
     if p.color_pipeline.enabled && [6,7].contains(&p.color_pipeline.output_transfer) { return Err("HDR delivery requires export_high_bit; legacy export is 8-bit SDR".into()); }
     let (_workers, low_memory) = crate::guard::export_plan_n(p.width, p.height, std::thread::available_parallelism().map(|x| x.get()).unwrap_or(2), low_memory, frame_buffers(p))?;
-    let command=legacy_encoder_command_opts(p,path,crf,low_memory)?;
+    let command=with_encoder(legacy_encoder_command_opts(p,path,crf,low_memory)?,enc);
     export_range_cmd(p, path, f0, f1, command, false, with_audio)
 }
 
